@@ -1,0 +1,20 @@
+/bin/
+/.env
+/.dev/
+*.test
+*.out
+.DS_Store
+
+# IDEs
+/.idea/
+/.vscode/
+
+# Benchmark inputs (downloadable, longmemeval_s.json is ~278MB)
+/data/
+
+# Benchmark run artifacts
+/out/
+
+# Python
+__pycache__/
+*.pyc
