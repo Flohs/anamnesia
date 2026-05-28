@@ -12,13 +12,16 @@ import (
 
 // openAIEmbedder calls the OpenAI-compatible embeddings endpoint at
 // {baseURL}/embeddings. baseURL is configurable so users can point this
-// at OpenRouter, vLLM, Azure OpenAI, Ollama, etc.
+// at OpenRouter, vLLM, Azure OpenAI, Ollama, etc. extraHeaders are
+// added verbatim on every request — used by the openrouter alias to
+// attach attribution headers.
 type openAIEmbedder struct {
-	baseURL string
-	apiKey  string
-	model   string
-	dims    int
-	hc      *http.Client
+	baseURL      string
+	apiKey       string
+	model        string
+	dims         int
+	extraHeaders map[string]string
+	hc           *http.Client
 }
 
 func (o *openAIEmbedder) Dims() int     { return o.dims }
@@ -86,6 +89,9 @@ func (o *openAIEmbedder) Embed(ctx context.Context, texts []string) ([][]float32
 	}
 	req.Header.Set("Authorization", "Bearer "+o.apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	for k, v := range o.extraHeaders {
+		req.Header.Set(k, v)
+	}
 
 	res, err := o.client().Do(req)
 	if err != nil {
@@ -115,7 +121,8 @@ func (o *openAIEmbedder) Embed(ctx context.Context, texts []string) ([][]float32
 
 func isMRLModel(m string) bool {
 	switch m {
-	case "text-embedding-3-small", "text-embedding-3-large":
+	case "text-embedding-3-small", "text-embedding-3-large",
+		"openai/text-embedding-3-small", "openai/text-embedding-3-large":
 		return true
 	}
 	return false

@@ -9,6 +9,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+
+	"github.com/flohs/anamnesia-open-source/internal/llm"
 )
 
 // Embedder converts a batch of strings into float32 vectors.
@@ -30,6 +32,17 @@ func New(provider, model, baseURL, apiKey string, dims int) (Embedder, error) {
 			apiKey:  apiKey,
 			model:   model,
 			dims:    dims,
+		}, nil
+	case "openrouter":
+		if apiKey == "" {
+			return nil, errors.New("openrouter embedder: OPENROUTER_API_KEY required")
+		}
+		return &openAIEmbedder{
+			baseURL:      llm.OpenRouterBaseURL,
+			apiKey:       apiKey,
+			model:        model,
+			dims:         dims,
+			extraHeaders: llm.OpenRouterHeaders(),
 		}, nil
 	case "stub", "":
 		return &stubEmbedder{model: "stub", dims: dims}, nil

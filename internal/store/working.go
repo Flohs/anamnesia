@@ -174,6 +174,42 @@ func (s *Store) AuditTail(ctx context.Context, scope anamnesia.Scope, n int) ([]
 	return out, rows.Err()
 }
 
+// AuditForSubject returns audit_log rows whose target/target_id match,
+// newest first. `kind` is e.g. "fact" | "experience" | "entity" |
+// "commitment"; `id` is the row's primary key. Powers the per-subject
+// provenance view (where did this fact come from, who changed it).
+func (s *Store) AuditForSubject(ctx context.Context, kind string, id uuid.UUID, n int) ([]*anamnesia.AuditEntry, error) {
+	if n <= 0 {
+		n = 50
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id, at, user_id, project_id, op, target, target_id, actor, payload
+		FROM audit_log
+		WHERE target = $1 AND target_id = $2
+		ORDER BY at DESC
+		LIMIT $3`, kind, id, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*anamnesia.AuditEntry
+	for rows.Next() {
+		var (
+			e   anamnesia.AuditEntry
+			pay []byte
+		)
+		if err := rows.Scan(&e.ID, &e.At, &e.UserID, &e.ProjectID, &e.Op, &e.Target,
+			&e.TargetID, &e.Actor, &pay); err != nil {
+			return nil, err
+		}
+		if len(pay) > 0 {
+			_ = json.Unmarshal(pay, &e.Payload)
+		}
+		out = append(out, &e)
+	}
+	return out, rows.Err()
+}
+
 func actorOrSystem(a string) string {
 	if a == "" {
 		return "system"

@@ -25,69 +25,70 @@ Memory model — five typed domains:
 Retrieval: pgvector ANN + tsvector lexical, RRF-fused, optional Cohere rerank,
 decay-aware scoring on experiences (`relevance` recomputed hourly).
 
-## Layout
+## Behavioral guidelines
 
+Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+## 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+## 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
 ```
-cmd/anamnesia/        single-binary entry: serve | hook | install | init | doctor | up | down | migrate
-internal/
-  config/             env-driven config
-  store/              Postgres + pgvector; migrations 0001..0003
-  embed/              OpenAI-compatible + stub embedders
-  llm/                Anthropic + OpenAI + stub LLM (Complete / Distill / Extract)
-  retrieval/          hybrid search + optional Cohere reranker
-  pii/                regex + Presidio (tag or redact)
-  decay/              relevance recompute + compaction
-  extract/            ingest → surprise gate → LLM → ADD/UPDATE/DELETE ops
-  jobs/               worker loops (embed, forget, decay, consolidate, extract, purge-sources)
-  httpapi/            /v1/health, /sessions/start, /retrieve, /capture, /sessions/end, /ingest
-  mcp/                MCP tools at /mcp (facts, experiences, skills, working, graph, audit, ingest)
-pkg/anamnesia/        public domain types
-docker-compose.yml    pgvector/postgres + anamnesia container
-Dockerfile            multi-stage build of the binary
-Makefile              build, test, up, down, migrate
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
 ```
 
-## Common tasks
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
-```bash
-make build                                              # ./bin/anamnesia
-make test                                               # unit tests
-ANAMNESIA_TEST_DATABASE_URL=postgres://… make test      # integration tests (extract_test hits real DB)
-make up    / make down                                  # docker compose lifecycle
-make logs                                               # tail the anamnesia container
-```
+---
 
-## Conventions
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
 
-- **One binary, one go.mod.** Don't split packages by deployment role; the
-  server and the host CLI are the same binary picking different subcommands.
-- **Schema changes live in `internal/store/migrations/`** as goose-format
-  `.sql` files. Always add a new numbered file; never edit a shipped one.
-- **No multitenancy.** Single owner; multi-user via the `users` table for
-  small teams. Don't reintroduce `tenant_id`.
-- **Auth is optional.** `ANAMNESIA_SERVER_TOKEN` enforces a shared secret
-  for `/v1` + `/mcp`. Loopback-only stacks leave it empty.
-- **PII before persist.** Every text path that writes to facts/experiences
-  goes through `pii.Detector.Scrub` (configurable `tag` vs `redact`).
-- **Hooks are best-effort.** Failures in `anamnesia hook …` are swallowed —
-  Claude is never blocked on memory work.
 
-## Configuration knobs
-
-LLM (`ANAMNESIA_LLM_PROVIDER`): `stub` | `anthropic` | `openai`. The latter
-two need `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`. OpenAI provider works
-against any OpenAI-compatible endpoint via `OPENAI_BASE_URL` (OpenRouter,
-vLLM, Ollama, Azure). Default models pick themselves per provider.
-
-Embeddings (`ANAMNESIA_EMBED_PROVIDER`): `stub` | `openai` (reuses
-`OPENAI_API_KEY`/`OPENAI_BASE_URL`).
-
-Rerank (`ANAMNESIA_RERANK_PROVIDER`): `none` | `cohere` (+ `COHERE_API_KEY`).
-
-PII (`ANAMNESIA_PII_PROVIDER`): `none` | `regex` | `presidio`;
-`ANAMNESIA_PII_MODE` is `tag` (default) or `redact`.
-
-Worker cadences (Go duration strings) — `ANAMNESIA_{EMBED_BACKFILL,
-FORGET_EVERY, DECAY_EVERY, CONSOLIDATE_EVERY, EXTRACT_EVERY}`.
-
-Full list in `.env.example`.

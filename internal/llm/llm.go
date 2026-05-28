@@ -1,7 +1,9 @@
-// Package llm wraps a chat-completions style LLM. Three implementations:
+// Package llm wraps a chat-completions style LLM. Four implementations:
 // anthropic (Claude), openai (any OpenAI-compatible chat endpoint —
-// OpenAI, OpenRouter, vLLM, Ollama, Azure), and stub (deterministic).
-// The consolidation and extraction workers both use this surface.
+// OpenAI, vLLM, Ollama, Azure), openrouter (OpenAI-compatible alias
+// for openrouter.ai with attribution headers preset), and stub
+// (deterministic). The consolidation and extraction workers both use
+// this surface.
 package llm
 
 import (
@@ -12,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -73,6 +76,16 @@ func New(cfg Config) (Client, error) {
 			baseURL = "https://api.openai.com/v1"
 		}
 		return &openaiLLM{apiKey: cfg.APIKey, baseURL: baseURL, model: cfg.Model}, nil
+	case "openrouter":
+		if cfg.APIKey == "" {
+			return nil, errors.New("openrouter: OPENROUTER_API_KEY required")
+		}
+		return &openaiLLM{
+			apiKey:       cfg.APIKey,
+			baseURL:      OpenRouterBaseURL,
+			model:        cfg.Model,
+			extraHeaders: OpenRouterHeaders(),
+		}, nil
 	case "stub", "":
 		return &stubLLM{model: "stub"}, nil
 	default:
@@ -127,7 +140,7 @@ func (a *anthropic) Model() string { return a.model }
 
 func (a *anthropic) client() *http.Client {
 	if a.hc == nil {
-		a.hc = &http.Client{Timeout: 120 * time.Second}
+		a.hc = &http.Client{Timeout: clientTimeout()}
 	}
 	return a.hc
 }
@@ -225,20 +238,49 @@ func (a *anthropic) Extract(ctx context.Context, in DistillInput, out any) error
 // OpenAI (with the right deployment name). The base URL is provided by
 // config so the same code paths cover all four.
 
+// OpenRouterBaseURL is the OpenAI-compatible base URL for openrouter.ai.
+// Exported so the embed and rerank backends can share it.
+const OpenRouterBaseURL = "https://openrouter.ai/api/v1"
+
+// OpenRouterHeaders returns the optional attribution headers OpenRouter
+// uses to bucket app traffic on its public leaderboard. Safe to send on
+// every request; harmless on other OpenAI-compatible endpoints (they
+// ignore unknown headers).
+func OpenRouterHeaders() map[string]string {
+	return map[string]string{
+		"HTTP-Referer": "https://github.com/flohs/anamnesia-open-source",
+		"X-Title":      "Anamnesia",
+	}
+}
+
 type openaiLLM struct {
-	apiKey  string
-	baseURL string
-	model   string
-	hc      *http.Client
+	apiKey       string
+	baseURL      string
+	model        string
+	extraHeaders map[string]string
+	hc           *http.Client
 }
 
 func (o *openaiLLM) Model() string { return o.model }
 
 func (o *openaiLLM) client() *http.Client {
 	if o.hc == nil {
-		o.hc = &http.Client{Timeout: 120 * time.Second}
+		o.hc = &http.Client{Timeout: clientTimeout()}
 	}
 	return o.hc
+}
+
+// clientTimeout returns the per-request HTTP timeout. Default 120s is
+// enough for hosted APIs; local Ollama with a cold model can take much
+// longer on the first call. Bump via ANAMNESIA_LLM_HTTP_TIMEOUT (e.g.
+// "600s") when running against a CPU-bound local model.
+func clientTimeout() time.Duration {
+	if s := os.Getenv("ANAMNESIA_LLM_HTTP_TIMEOUT"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 120 * time.Second
 }
 
 type oaiMsg struct {
@@ -308,6 +350,9 @@ func (o *openaiLLM) chat(ctx context.Context, messages []oaiMsg, maxTok int, sch
 		}
 		req.Header.Set("Authorization", "Bearer "+o.apiKey)
 		req.Header.Set("Content-Type", "application/json")
+		for k, v := range o.extraHeaders {
+			req.Header.Set(k, v)
+		}
 		return req, nil
 	}, 5)
 	if err != nil {

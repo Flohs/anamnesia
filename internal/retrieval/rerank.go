@@ -11,6 +11,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/flohs/anamnesia-open-source/internal/llm"
 	"github.com/flohs/anamnesia-open-source/pkg/anamnesia"
 )
 
@@ -31,38 +32,67 @@ func NewReranker(provider, apiKey, model string) (Reranker, error) {
 			return nil, errors.New("cohere: api key required")
 		}
 		return NewCohere(apiKey, model), nil
+	case "openrouter":
+		if apiKey == "" {
+			return nil, errors.New("openrouter: api key required")
+		}
+		return NewOpenRouter(apiKey, model), nil
 	default:
 		return nil, errors.New("rerank: unknown provider " + provider)
 	}
 }
 
-// CohereReranker calls Cohere's Rerank v3 endpoint over a candidate list.
-type CohereReranker struct {
-	APIKey string
-	Model  string // e.g. "rerank-english-v3.0"
-	HTTP   *http.Client
+// apiReranker calls a Cohere-shaped rerank endpoint. Both Cohere's own
+// API and OpenRouter's /rerank proxy speak the same request/response
+// shape, so we parameterize URL + auth + optional headers and share
+// one implementation.
+type apiReranker struct {
+	URL          string
+	APIKey       string
+	Model        string
+	Label        string // prefix used in error messages, e.g. "cohere rerank"
+	ExtraHeaders map[string]string
+	HTTP         *http.Client
 }
 
-// NewCohere returns a Cohere reranker with sensible defaults.
-func NewCohere(key, model string) *CohereReranker {
+// NewCohere returns a reranker that talks to Cohere's Rerank v3 endpoint.
+func NewCohere(key, model string) Reranker {
 	if model == "" {
 		model = "rerank-english-v3.0"
 	}
-	return &CohereReranker{
+	return &apiReranker{
+		URL:    "https://api.cohere.ai/v1/rerank",
 		APIKey: key,
 		Model:  model,
+		Label:  "cohere rerank",
 		HTTP:   &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
-type cohereReq struct {
+// NewOpenRouter returns a reranker that talks to OpenRouter's /rerank
+// proxy. Model slugs are vendor-prefixed (e.g. "cohere/rerank-v3.5").
+func NewOpenRouter(key, model string) Reranker {
+	if model == "" {
+		model = "cohere/rerank-v3.5"
+	}
+	return &apiReranker{
+		URL:          llm.OpenRouterBaseURL + "/rerank",
+		APIKey:       key,
+		Model:        model,
+		Label:        "openrouter rerank",
+		ExtraHeaders: llm.OpenRouterHeaders(),
+		HTTP:         &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+type rerankReq struct {
 	Query     string   `json:"query"`
 	Documents []string `json:"documents"`
 	Model     string   `json:"model"`
 	TopN      int      `json:"top_n"`
 }
 
-type cohereResp struct {
+type rerankResp struct {
 	Results []struct {
 		Index          int     `json:"index"`
 		RelevanceScore float64 `json:"relevance_score"`
@@ -72,7 +102,7 @@ type cohereResp struct {
 // Rerank scores each candidate against the query and returns them sorted
 // by relevance_score descending. The original RRF score is replaced; the
 // new ordering wins.
-func (c *CohereReranker) Rerank(ctx context.Context, query string, hits []anamnesia.SearchHit) ([]anamnesia.SearchHit, error) {
+func (c *apiReranker) Rerank(ctx context.Context, query string, hits []anamnesia.SearchHit) ([]anamnesia.SearchHit, error) {
 	if len(hits) == 0 {
 		return hits, nil
 	}
@@ -80,19 +110,21 @@ func (c *CohereReranker) Rerank(ctx context.Context, query string, hits []anamne
 	for i, h := range hits {
 		docs[i] = h.Body()
 	}
-	body, err := json.Marshal(cohereReq{
+	body, err := json.Marshal(rerankReq{
 		Query: query, Documents: docs, Model: c.Model, TopN: len(docs),
 	})
 	if err != nil {
 		return hits, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"https://api.cohere.ai/v1/rerank", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL, bytes.NewReader(body))
 	if err != nil {
 		return hits, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	req.Header.Set("Content-Type", "application/json")
+	for k, v := range c.ExtraHeaders {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -101,9 +133,9 @@ func (c *CohereReranker) Rerank(ctx context.Context, query string, hits []anamne
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		return hits, fmt.Errorf("cohere rerank: %s: %s", resp.Status, raw)
+		return hits, fmt.Errorf("%s: %s: %s", c.Label, resp.Status, raw)
 	}
-	var out cohereResp
+	var out rerankResp
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return hits, err
 	}

@@ -6,8 +6,9 @@
 //	GET  /v1/health          health probe (no auth)
 //	POST /v1/sessions/start  SessionStart hook
 //	POST /v1/retrieve        UserPromptSubmit hook (hybrid search)
-//	POST /v1/capture         PostToolUse hook (append working memory)
-//	POST /v1/sessions/end    Stop hook (fold session → experience)
+//	POST /v1/ingest          Stop / PreCompact hook + generic write (async extraction)
+//	POST /v1/experience      direct experience write (RAG mode — bypass extractor)
+//	GET  /v1/queue/pending   pending counts for one user (extract + embed)
 //	POST /mcp                MCP transport (streamable-http)
 //
 // Auth is optional: if Config.ServerToken is set, every request must
@@ -27,6 +28,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/flohs/anamnesia-open-source/internal/jobs"
 	"github.com/flohs/anamnesia-open-source/internal/pii"
 	"github.com/flohs/anamnesia-open-source/internal/retrieval"
 	"github.com/flohs/anamnesia-open-source/internal/store"
@@ -38,7 +40,8 @@ type Deps struct {
 	Store          *store.Store
 	Retrieval      *retrieval.Engine
 	PII            pii.Detector
-	MCPHandler     http.Handler // mounted at /mcp
+	Briefer        *jobs.Briefer // nil-safe; nil falls back to a stub summary
+	MCPHandler     http.Handler  // mounted at /mcp
 	DefaultUser    string
 	DefaultProject string
 	ServerToken    string // empty = no auth required
@@ -55,9 +58,16 @@ func NewServer(addr string, d Deps) *http.Server {
 
 	mux.Handle("/v1/sessions/start", d.protect(http.HandlerFunc(d.handleSessionStart)))
 	mux.Handle("/v1/retrieve", d.protect(http.HandlerFunc(d.handleRetrieve)))
-	mux.Handle("/v1/capture", d.protect(http.HandlerFunc(d.handleCapture)))
-	mux.Handle("/v1/sessions/end", d.protect(http.HandlerFunc(d.handleSessionEnd)))
 	mux.Handle("/v1/ingest", d.protect(http.HandlerFunc(d.handleIngest)))
+	mux.Handle("/v1/queue/pending", d.protect(http.HandlerFunc(d.handleQueuePending)))
+	mux.Handle("/v1/experience", d.protect(http.HandlerFunc(d.handleExperience)))
+	mux.Handle("/v1/identity", d.protect(http.HandlerFunc(d.handleIdentity)))
+	mux.Handle("/v1/briefing", d.protect(http.HandlerFunc(d.handleBriefing)))
+	mux.Handle("/v1/people", d.protect(http.HandlerFunc(d.handlePeople)))
+	mux.Handle("/v1/capabilities", d.protect(http.HandlerFunc(d.handleCapabilities)))
+	mux.Handle("/v1/commitments", d.protect(http.HandlerFunc(d.handleCommitments)))
+	mux.Handle("/v1/commitments/resolve", d.protect(http.HandlerFunc(d.handleCommitmentResolve)))
+	mux.Handle("/v1/audit", d.protect(http.HandlerFunc(d.handleAudit)))
 
 	if d.MCPHandler != nil {
 		mux.Handle("/mcp", d.protect(d.MCPHandler))
@@ -117,17 +127,18 @@ func (s *statusRecorder) WriteHeader(c int) { s.status = c; s.ResponseWriter.Wri
 // HookEvent is the union payload the CLI sends for any hook. Empty
 // fields are common; each handler picks out what it needs.
 type HookEvent struct {
-	SessionID      string         `json:"session_id,omitempty"`
-	CWD            string         `json:"cwd,omitempty"`
-	Project        string         `json:"project,omitempty"`
-	User           string         `json:"user,omitempty"`
-	Prompt         string         `json:"prompt,omitempty"`
-	ToolName       string         `json:"tool_name,omitempty"`
-	ToolInput      map[string]any `json:"tool_input,omitempty"`
-	ToolResponse   map[string]any `json:"tool_response,omitempty"`
-	MaxFacts       int            `json:"max_facts,omitempty"`
-	MaxExperiences int            `json:"max_experiences,omitempty"`
-	K              int            `json:"k,omitempty"`
+	SessionID      string `json:"session_id,omitempty"`
+	CWD            string `json:"cwd,omitempty"`
+	Project        string `json:"project,omitempty"`
+	User           string `json:"user,omitempty"`
+	Prompt         string `json:"prompt,omitempty"`
+	MaxFacts       int    `json:"max_facts,omitempty"`
+	MaxExperiences int    `json:"max_experiences,omitempty"`
+	K              int    `json:"k,omitempty"`
+	// OnlyRaw on /v1/retrieve restricts experience hits to abstraction=0
+	// (verbatim sources). Set by benchmarks / citation flows; leave
+	// false for context injection where summaries are useful.
+	OnlyRaw bool `json:"only_raw,omitempty"`
 }
 
 func (d Deps) resolveScope(ctx context.Context, ev *HookEvent) (anamnesia.Scope, error) {
@@ -160,9 +171,10 @@ func (d Deps) resolveScope(ctx context.Context, ev *HookEvent) (anamnesia.Scope,
 // SessionStartResp is the markdown / structured payload Claude Code
 // receives at SessionStart.
 type SessionStartResp struct {
-	Facts       []*anamnesia.Fact       `json:"facts"`
-	Experiences []*anamnesia.Experience `json:"experiences"`
-	Hint        string                  `json:"hint,omitempty"`
+	Facts        []*anamnesia.Fact       `json:"facts"`
+	Experiences  []*anamnesia.Experience `json:"experiences"`
+	PersonaBlock string                  `json:"persona_block,omitempty"`
+	Hint         string                  `json:"hint,omitempty"`
 }
 
 func (d Deps) handleSessionStart(w http.ResponseWriter, r *http.Request) {
@@ -192,13 +204,67 @@ func (d Deps) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, SessionStartResp{Facts: facts, Experiences: exps})
+	id, err := d.Store.GetIdentity(r.Context(), scope)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, SessionStartResp{
+		Facts: facts, Experiences: exps, PersonaBlock: id.SystemPrompt,
+	})
 }
 
-// RetrieveResp is returned for the UserPromptSubmit hook.
-type RetrieveResp struct {
-	Hits []anamnesia.SearchHit `json:"hits"`
+// ─── identity ────────────────────────────────────────────────────────
+
+func (d Deps) handleIdentity(w http.ResponseWriter, r *http.Request) {
+	ev := HookEvent{
+		User:    r.URL.Query().Get("user"),
+		Project: r.URL.Query().Get("project"),
+	}
+	scope, err := d.resolveScope(r.Context(), &ev)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	id, err := d.Store.GetIdentity(r.Context(), scope)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, id)
 }
+
+// RetrieveResp is returned for the UserPromptSubmit hook. Hits are the
+// primary, current-project results. CrossProject is a small, separately
+// rendered set of hits from the user's *other* projects that match the
+// prompt — the "wait, you touched this elsewhere" surface. It is only
+// populated when a current project is set.
+type RetrieveResp struct {
+	Hits         []anamnesia.SearchHit `json:"hits"`
+	CrossProject []CrossProjectHit     `json:"cross_project,omitempty"`
+}
+
+// CrossProjectHit is a prompt-matching memory from a project other than
+// the one the user is currently in, labelled with that project's slug
+// and how recently it happened.
+type CrossProjectHit struct {
+	Domain  string `json:"domain"`
+	Title   string `json:"title"`
+	Project string `json:"project"`
+	Recency string `json:"recency,omitempty"`
+}
+
+// crossProjectMax caps how many other-project hits we surface per prompt.
+// Kept tight on purpose: this fires on every submit, so noise control
+// matters more than recall here.
+const crossProjectMax = 2
+
+// crossProjectMinScore is the relevance floor for surfacing an
+// other-project hit. It only applies when a reranker ran (RerankerRank>0),
+// because then SearchHit.Score is the reranker's absolute relevance
+// (0..1, see retrieval/rerank.go). Without a reranker, Score is a tiny
+// RRF value that can't be thresholded, so we fall back to the cap alone.
+const crossProjectMinScore = 0.5
 
 func (d Deps) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 	var ev HookEvent
@@ -220,67 +286,125 @@ func (d Deps) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 		k = 10
 	}
 	hits, err := d.Retrieval.Search(r.Context(), retrieval.Query{
-		Scope: scope, Text: ev.Prompt, K: k,
+		Scope: scope, Text: ev.Prompt, K: k, OnlyRaw: ev.OnlyRaw,
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, RetrieveResp{Hits: hits})
+	resp := RetrieveResp{Hits: hits}
+	// Only contrast against other projects when there's a current project
+	// to contrast with.
+	if scope.ProjectID != nil {
+		resp.CrossProject = d.crossProjectHits(r.Context(), scope, ev.Prompt, ev.OnlyRaw)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
-func (d Deps) handleCapture(w http.ResponseWriter, r *http.Request) {
-	var ev HookEvent
-	if err := readJSON(r, &ev); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if isReadOnlyTool(ev.ToolName) {
-		writeJSON(w, http.StatusOK, map[string]any{"skipped": "read-only tool"})
-		return
-	}
-	scope, err := d.resolveScope(r.Context(), &ev)
+// crossProjectHits runs a second, user-wide search (no project filter)
+// and keeps the top matches that belong to a project *other* than the
+// current one. User-level (project-null) hits are excluded — those
+// already surface in the primary results.
+func (d Deps) crossProjectHits(ctx context.Context, scope anamnesia.Scope, prompt string, onlyRaw bool) []CrossProjectHit {
+	userScope := anamnesia.Scope{UserID: scope.UserID} // ProjectID nil → all projects
+	hits, err := d.Retrieval.Search(ctx, retrieval.Query{
+		Scope: userScope, Text: prompt, K: 8, OnlyRaw: onlyRaw,
+	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil
 	}
-	sid, err := uuid.Parse(ev.SessionID)
-	if err != nil {
-		sid = uuid.New()
-	}
-	body := summariseToolUse(ev.ToolName, ev.ToolInput, ev.ToolResponse)
-	// PII scrub before we persist. Tags land in meta so they're visible
-	// to retrieval but don't pollute the body column.
-	var piiTags []string
-	if d.PII != nil {
-		cleaned, tags, err := d.PII.Scrub(r.Context(), body)
-		if err == nil {
-			body = cleaned
-			piiTags = tags
+	now := time.Now().UTC()
+	slugCache := map[uuid.UUID]string{}
+	var out []CrossProjectHit
+	for _, h := range hits {
+		// Relevance floor — only when the reranker assigned an absolute
+		// score. This is what keeps unrelated other-project memories from
+		// leaking onto every prompt.
+		if h.RerankerRank > 0 && h.Score < crossProjectMinScore {
+			continue
+		}
+		pid, title, when, ok := crossFields(h)
+		if !ok || pid == nil {
+			continue // unsupported domain or user-level fact
+		}
+		if scope.ProjectID != nil && *pid == *scope.ProjectID {
+			continue // same project as primary
+		}
+		slug, cached := slugCache[*pid]
+		if !cached {
+			s, err := d.Store.LookupProjectSlug(ctx, *pid)
+			if err != nil {
+				continue
+			}
+			slug = s
+			slugCache[*pid] = s
+		}
+		out = append(out, CrossProjectHit{
+			Domain:  string(h.Domain),
+			Title:   title,
+			Project: slug,
+			Recency: humanRecency(when, now),
+		})
+		if len(out) >= crossProjectMax {
+			break
 		}
 	}
-	meta := map[string]any{
-		"tool":  ev.ToolName,
-		"input": ev.ToolInput,
+	return out
+}
+
+// crossFields pulls the (projectID, title, when) needed to label a
+// cross-project hit. Returns ok=false for domains we don't surface here
+// (skills carry no useful recency for this view).
+func crossFields(h anamnesia.SearchHit) (pid *uuid.UUID, title string, when time.Time, ok bool) {
+	switch h.Domain {
+	case anamnesia.DomainFact:
+		if h.Fact != nil {
+			return h.Fact.Scope.ProjectID, h.Fact.Key, h.Fact.IngestedAt, true
+		}
+	case anamnesia.DomainExperience:
+		if h.Experience != nil {
+			w := h.Experience.IngestedAt
+			if h.Experience.OccurredAt != nil {
+				w = *h.Experience.OccurredAt
+			}
+			t := h.Experience.Title
+			if t == "" {
+				t = firstLineN(h.Experience.Body, 80)
+			}
+			return h.Experience.Scope.ProjectID, t, w, true
+		}
 	}
-	if len(piiTags) > 0 {
-		meta["pii_tags"] = piiTags
+	return nil, "", time.Time{}, false
+}
+
+// humanRecency renders a coarse, human-friendly "when" for a hit.
+func humanRecency(t, now time.Time) string {
+	if t.IsZero() {
+		return ""
 	}
-	entry := &anamnesia.WorkingEntry{
-		Scope:     scope,
-		SessionID: sid,
-		Role:      anamnesia.WorkingToolOutput,
-		Body:      body,
-		Meta:      meta,
+	days := int(now.Sub(t).Hours() / 24)
+	switch {
+	case days <= 0:
+		return "today"
+	case days == 1:
+		return "yesterday"
+	case days < 7:
+		return fmt.Sprintf("%d days ago", days)
+	case days < 14:
+		return "last week"
+	default:
+		return t.Format("2006-01-02")
 	}
-	if err := d.Store.AppendWorking(r.Context(), entry); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+}
+
+func firstLineN(s string, n int) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":       entry.ID,
-		"position": entry.Position,
-	})
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 // IngestRequest is the body shape of POST /v1/ingest. Source-kind is a
@@ -361,74 +485,350 @@ func (d Deps) handleIngest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (d Deps) handleSessionEnd(w http.ResponseWriter, r *http.Request) {
-	var ev HookEvent
-	if err := readJSON(r, &ev); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+// QueuePendingResponse reports how much background work is still in
+// flight for one user. `extract_pending` is the number of sources still
+// waiting for the extractor; `embed_pending` is the number of facts +
+// experiences + entities still missing an embedding. Callers
+// (benchmarks, batch jobs) poll this between an /ingest burst and a
+// /retrieve to know retrieval is fully warm.
+type QueuePendingResponse struct {
+	ExtractPending int `json:"extract_pending"`
+	EmbedPending   int `json:"embed_pending"`
+}
+
+func (d Deps) handleQueuePending(w http.ResponseWriter, r *http.Request) {
+	ev := HookEvent{
+		User:    r.URL.Query().Get("user"),
+		Project: r.URL.Query().Get("project"),
 	}
 	scope, err := d.resolveScope(r.Context(), &ev)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	sid, err := uuid.Parse(ev.SessionID)
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"folded_entries": 0, "skipped": "no session id"})
-		return
-	}
-	entries, err := d.Store.RecallWorking(r.Context(), scope, sid, 0)
+	extract, embed, err := d.Store.QueuePending(r.Context(), scope.UserID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if len(entries) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"folded_entries": 0})
+	writeJSON(w, http.StatusOK, QueuePendingResponse{
+		ExtractPending: extract,
+		EmbedPending:   embed,
+	})
+}
+
+// ExperienceRequest writes one experience row directly, bypassing the
+// extractor. Used by RAG-style benchmarks that want the source content
+// itself in memory rather than LLM-distilled facts. Body is embedded
+// inline (one embed call) before insert so retrieval is warm the
+// instant this returns — there is no extract worker, no embed
+// backfill wait.
+type ExperienceRequest struct {
+	User         string         `json:"user,omitempty"`
+	Project      string         `json:"project,omitempty"`
+	Title        string         `json:"title,omitempty"`
+	Body         string         `json:"body"`
+	Kind         string         `json:"kind,omitempty"`        // case | strategy | hybrid (default: case)
+	Topic        string         `json:"topic,omitempty"`
+	Participants []string       `json:"participants,omitempty"`
+	OccurredAt   *time.Time     `json:"occurred_at,omitempty"`
+	Importance   float32        `json:"importance,omitempty"`
+	Meta         map[string]any `json:"meta,omitempty"`
+}
+
+type ExperienceResponse struct {
+	ExperienceID uuid.UUID `json:"experience_id"`
+}
+
+func (d Deps) handleExperience(w http.ResponseWriter, r *http.Request) {
+	var req ExperienceRequest
+	if err := readJSON(r, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	var sb strings.Builder
-	for i, e := range entries {
-		if i > 0 {
-			sb.WriteString("\n\n")
-		}
-		sb.WriteString(string(e.Role))
-		sb.WriteString(": ")
-		sb.WriteString(e.Body)
+	if strings.TrimSpace(req.Body) == "" {
+		http.Error(w, "body required", http.StatusBadRequest)
+		return
 	}
-	expBody := sb.String()
-	var expPII []string
+	scope, err := d.resolveScope(r.Context(), &HookEvent{User: req.User, Project: req.Project})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	body := req.Body
+	var piiTags []string
 	if d.PII != nil {
-		cleaned, tags, err := d.PII.Scrub(r.Context(), expBody)
+		cleaned, tags, err := d.PII.Scrub(r.Context(), body)
 		if err == nil {
-			expBody = cleaned
-			expPII = tags
+			body = cleaned
+			piiTags = tags
 		}
 	}
 	exp := &anamnesia.Experience{
-		Scope:       scope,
-		Kind:        anamnesia.ExperienceCase,
-		Abstraction: 0,
-		Body:        expBody,
-		PIITags:     expPII,
-		Meta: map[string]any{
-			"session_id":  sid,
-			"entry_count": len(entries),
-			"folded_at":   time.Now().UTC(),
-		},
+		Scope:        scope,
+		Kind:         anamnesia.ExperienceKind(req.Kind),
+		Title:        req.Title,
+		Body:         body,
+		Topic:        req.Topic,
+		Participants: req.Participants,
+		OccurredAt:   req.OccurredAt,
+		Importance:   req.Importance,
+		Meta:         req.Meta,
+		PIITags:      piiTags,
+	}
+	if d.Retrieval != nil && d.Retrieval.Embedder != nil {
+		vecs, err := d.Retrieval.Embedder.Embed(r.Context(), []string{body})
+		if err == nil && len(vecs) == 1 && len(vecs[0]) > 0 {
+			exp.Embedding = vecs[0]
+			exp.EmbedModel = d.Retrieval.Embedder.Model()
+		} else if err != nil && d.Log != nil {
+			d.Log.Warn("experience: inline embed failed (will be backfilled)", "err", err)
+		}
 	}
 	if err := d.Store.RecordExperience(r.Context(), exp); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	n, err := d.Store.FoldWorking(r.Context(), scope, sid, exp.ID)
+	writeJSON(w, http.StatusCreated, ExperienceResponse{ExperienceID: exp.ID})
+}
+
+// ─── audit ───────────────────────────────────────────────────────────
+
+func (d Deps) handleAudit(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		fmt.Sscanf(v, "%d", &limit)
+	}
+	if subject := r.URL.Query().Get("subject"); subject != "" {
+		parts := strings.SplitN(subject, ":", 2)
+		if len(parts) != 2 {
+			http.Error(w, `subject must be "<kind>:<uuid>"`, http.StatusBadRequest)
+			return
+		}
+		id, err := uuid.Parse(parts[1])
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		out, err := d.Store.AuditForSubject(r.Context(), parts[0], id, limit)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	ev := HookEvent{User: r.URL.Query().Get("user"), Project: r.URL.Query().Get("project")}
+	scope, err := d.resolveScope(r.Context(), &ev)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"folded_entries": n,
-		"experience_id":  exp.ID,
-	})
+	out, err := d.Store.AuditTail(r.Context(), scope, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// ─── commitments ─────────────────────────────────────────────────────
+
+type commitmentReq struct {
+	User        string     `json:"user,omitempty"`
+	Project     string     `json:"project,omitempty"`
+	Owner       string     `json:"owner,omitempty"`
+	Beneficiary string     `json:"beneficiary,omitempty"`
+	Body        string     `json:"body"`
+	DueAt       *time.Time `json:"due_at,omitempty"`
+}
+
+func (d Deps) handleCommitments(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		ev := HookEvent{User: r.URL.Query().Get("user"), Project: r.URL.Query().Get("project")}
+		scope, err := d.resolveScope(r.Context(), &ev)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		status := anamnesia.CommitmentStatus(r.URL.Query().Get("status"))
+		limit := 50
+		if v := r.URL.Query().Get("limit"); v != "" {
+			fmt.Sscanf(v, "%d", &limit)
+		}
+		out, err := d.Store.ListCommitments(r.Context(), scope, status, limit)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	case http.MethodPost:
+		var req commitmentReq
+		if err := readJSON(r, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Body == "" {
+			http.Error(w, "body required", http.StatusBadRequest)
+			return
+		}
+		scope, err := d.resolveScope(r.Context(), &HookEvent{User: req.User, Project: req.Project})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		c := &anamnesia.Commitment{
+			Scope: scope, Owner: req.Owner, Beneficiary: req.Beneficiary,
+			Body: req.Body, DueAt: req.DueAt, Status: anamnesia.CommitmentOpen,
+		}
+		if err := d.Store.RecordCommitment(r.Context(), c); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusCreated, c)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+type resolveReq struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+}
+
+func (d Deps) handleCommitmentResolve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req resolveReq
+	if err := readJSON(r, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	id, err := uuid.Parse(req.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := d.Store.ResolveCommitment(r.Context(), id, anamnesia.CommitmentStatus(req.Status)); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ─── capabilities ────────────────────────────────────────────────────
+
+func (d Deps) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	ev := HookEvent{User: r.URL.Query().Get("user"), Project: r.URL.Query().Get("project")}
+	scope, err := d.resolveScope(r.Context(), &ev)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		fmt.Sscanf(v, "%d", &limit)
+	}
+	out, err := d.Store.ListCapabilities(r.Context(), scope, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// ─── people ──────────────────────────────────────────────────────────
+
+func (d Deps) handlePeople(w http.ResponseWriter, r *http.Request) {
+	ev := HookEvent{
+		User: r.URL.Query().Get("user"), Project: r.URL.Query().Get("project"),
+	}
+	scope, err := d.resolveScope(r.Context(), &ev)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		fmt.Sscanf(v, "%d", &limit)
+	}
+	people, err := d.Store.ListPeople(r.Context(), scope, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, people)
+}
+
+// ─── briefing ────────────────────────────────────────────────────────
+
+type briefingReq struct {
+	User        string    `json:"user,omitempty"`
+	Project     string    `json:"project,omitempty"`
+	Since       time.Time `json:"since"`
+	Until       time.Time `json:"until,omitempty"`
+	Topic       string    `json:"topic,omitempty"`
+	MaxAdjacent int       `json:"max_adjacent,omitempty"`
+}
+
+func (d Deps) handleBriefing(w http.ResponseWriter, r *http.Request) {
+	var req briefingReq
+	if err := readJSON(r, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Since.IsZero() {
+		http.Error(w, "since required", http.StatusBadRequest)
+		return
+	}
+	ev := HookEvent{User: req.User, Project: req.Project}
+	scope, err := d.resolveScope(r.Context(), &ev)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	inWin, err := d.Store.ListExperiencesInWindow(r.Context(), scope, req.Since, req.Until, req.Topic, 200)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	flankSince := req.Since.AddDate(0, 0, -14)
+	flankUntil := req.Until
+	if flankUntil.IsZero() {
+		flankUntil = time.Now().UTC()
+	}
+	flankUntil = flankUntil.AddDate(0, 0, 14)
+	adj, err := d.Store.ListExperiencesInWindow(r.Context(), scope, flankSince, flankUntil, req.Topic, 50)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	inSet := map[uuid.UUID]bool{}
+	for _, e := range inWin {
+		inSet[e.ID] = true
+	}
+	adjOut := adj[:0]
+	for _, e := range adj {
+		if !inSet[e.ID] {
+			adjOut = append(adjOut, e)
+		}
+	}
+	var briefer jobs.Briefer
+	if d.Briefer != nil {
+		briefer = *d.Briefer
+	}
+	resp, err := briefer.Brief(r.Context(), anamnesia.BriefingRequest{
+		Scope: scope, Since: req.Since, Until: req.Until,
+		Topic: req.Topic, MaxAdjacent: req.MaxAdjacent,
+	}, inWin, adjOut)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────
@@ -452,46 +852,3 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// isReadOnlyTool reports whether tool is one we don't bother capturing.
-var readOnlyTools = map[string]bool{
-	"Read":     true,
-	"LS":       true,
-	"Glob":     true,
-	"Grep":     true,
-	"TodoWrite": true,
-}
-
-func isReadOnlyTool(name string) bool { return readOnlyTools[name] }
-
-// summariseToolUse produces a short text body for the working-memory
-// entry. We deliberately don't store the full input/response — that'd
-// be very large and noisy for things like Bash output. Callers can
-// recover detail from Meta.
-func summariseToolUse(tool string, input, response map[string]any) string {
-	if tool == "" {
-		tool = "unknown"
-	}
-	switch tool {
-	case "Bash":
-		if cmd, _ := input["command"].(string); cmd != "" {
-			return "Bash: " + truncate(cmd, 240)
-		}
-	case "Edit", "Write":
-		if p, _ := input["file_path"].(string); p != "" {
-			return tool + ": " + p
-		}
-	}
-	if response != nil {
-		if msg, _ := response["error"].(string); msg != "" {
-			return tool + " (error): " + truncate(msg, 240)
-		}
-	}
-	return tool
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
-}

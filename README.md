@@ -11,10 +11,10 @@ You'll need:
 
 1. **Docker** (for Postgres + the server container).
 2. **Claude Code** (the client; hooks + MCP wiring is what Anamnesia patches).
-3. **An Anthropic API key** if you want real extraction. Without one the
-   pipeline runs end-to-end but every ingest is a no-op (stub LLM).
-4. **Optionally an OpenAI key** for real embeddings instead of the
-   deterministic stub. Recommended.
+3. **One API key** for the LLM + embeddings + rerank. Easiest path is
+   **OpenRouter** — a single `OPENROUTER_API_KEY` fronts all three and
+   lets you pick models from any provider on their platform. Direct
+   Anthropic / OpenAI / Cohere keys still work if you prefer.
 
 Five steps:
 
@@ -27,13 +27,19 @@ make build                              # ./bin/anamnesia
 # 2. configure
 cp .env.example .env
 # Edit .env. For real memory you need an LLM provider + an embed provider.
-# Pick ONE LLM:
+# Simplest: one key fronts everything.
+#   OPENROUTER_API_KEY=sk-or-v1-…
+# Auto-lights-up chat (anthropic/claude-sonnet-4.6), embeddings
+# (openai/text-embedding-3-small), and rerank (cohere/rerank-v3.5).
+# Override any model with ANAMNESIA_{LLM,EMBED,RERANK}_MODEL.
+#
+# Or use direct provider keys instead:
 #   ANAMNESIA_LLM_PROVIDER=anthropic     ANTHROPIC_API_KEY=sk-ant-…
-# or
-#   ANAMNESIA_LLM_PROVIDER=openai        OPENAI_API_KEY=sk-…
-# Embeddings (reuses OPENAI_API_KEY; OPENAI_BASE_URL works for OpenRouter/vLLM/Ollama):
-#   ANAMNESIA_EMBED_PROVIDER=openai
-# Leave both as `stub` if you just want to kick the tyres.
+#   ANAMNESIA_EMBED_PROVIDER=openai      OPENAI_API_KEY=sk-…
+#   ANAMNESIA_RERANK_PROVIDER=cohere     COHERE_API_KEY=…
+#
+# Leave everything unset if you just want to kick the tyres (stub LLM,
+# stub embedder, no rerank).
 
 # 3. start the local stack (postgres + server)
 ./bin/anamnesia up                      # docker compose up -d --build
@@ -58,11 +64,12 @@ ones you'll actually touch:
 
 | Variable | Default | Why |
 |---|---|---|
-| `ANAMNESIA_LLM_PROVIDER` | `stub` | `anthropic`, `openai`, or `stub`. The extractor + consolidation workers use this. |
+| `OPENROUTER_API_KEY` | _unset_ | One key fronts chat + embeddings + rerank via [openrouter.ai](https://openrouter.ai). When set, all three providers auto-default to `openrouter` (override individually with the matching `ANAMNESIA_*_PROVIDER` var). |
+| `ANAMNESIA_LLM_PROVIDER` | `stub` (or `openrouter` if `OPENROUTER_API_KEY` is set) | `anthropic`, `openai`, `openrouter`, or `stub`. The extractor + consolidation workers use this. |
 | `ANTHROPIC_API_KEY` | _unset_ | Required if `anthropic`. Default model: `claude-sonnet-4-6`. |
-| `OPENAI_API_KEY` | _unset_ | Required if `openai` (LLM and/or embeddings). Default LLM model: `gpt-4o-mini`. Works against OpenAI, OpenRouter, vLLM, Ollama, Azure via `OPENAI_BASE_URL`. |
-| `ANAMNESIA_EMBED_PROVIDER` | `stub` | Set to `openai` for real semantic retrieval. Reuses `OPENAI_API_KEY` / `OPENAI_BASE_URL`. |
-| `ANAMNESIA_RERANK_PROVIDER` | `none` | Set to `cohere` + `COHERE_API_KEY` for higher-quality top-K. |
+| `OPENAI_API_KEY` | _unset_ | Required if `openai` (LLM and/or embeddings). Default LLM model: `gpt-4o-mini`. Works against OpenAI, vLLM, Ollama, Azure via `OPENAI_BASE_URL`. |
+| `ANAMNESIA_EMBED_PROVIDER` | `stub` (or `openrouter` if `OPENROUTER_API_KEY` is set) | `openai`, `openrouter`, or `stub`. |
+| `ANAMNESIA_RERANK_PROVIDER` | `none` (or `openrouter` if `OPENROUTER_API_KEY` is set) | `cohere` + `COHERE_API_KEY`, or `openrouter`, for higher-quality top-K. |
 | `ANAMNESIA_PII_PROVIDER` | `regex` | In-process scrub. Set to `presidio` for the production sidecar. |
 | `ANAMNESIA_PII_MODE` | `tag` | `redact` rewrites matches as `[EMAIL]` etc. before persisting. |
 | `ANAMNESIA_SERVER_TOKEN` | _unset_ | Optional shared secret. Required when serving outside loopback. |

@@ -120,6 +120,27 @@ func (s *Store) MarkFailed(ctx context.Context, id uuid.UUID, errMsg string) err
 	return err
 }
 
+// QueuePending returns the number of sources awaiting extraction
+// (extraction_state='pending') and the number of facts + experiences +
+// entities still missing an embedding, both scoped to userID. A caller
+// can poll this between ingest and retrieve to know when retrieval is
+// fully warm: extract pending → facts are written, embed pending →
+// vector retrieval ranking is meaningful.
+func (s *Store) QueuePending(ctx context.Context, userID uuid.UUID) (extract, embed int, err error) {
+	err = s.Pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM sources
+			  WHERE user_id = $1 AND extraction_state = 'pending'),
+			(SELECT count(*) FROM facts
+			  WHERE user_id = $1 AND embedding IS NULL AND deleted_at IS NULL)
+			+ (SELECT count(*) FROM experiences
+			  WHERE user_id = $1 AND embedding IS NULL AND deleted_at IS NULL)
+			+ (SELECT count(*) FROM entities
+			  WHERE user_id = $1 AND embedding IS NULL)
+	`, userID).Scan(&extract, &embed)
+	return extract, embed, err
+}
+
 // PurgeExpiredSourceContent nulls out raw_content on sources past their
 // TTL (preserve_raw=true rows are exempt). Returns the count nulled.
 func (s *Store) PurgeExpiredSourceContent(ctx context.Context) (int, error) {

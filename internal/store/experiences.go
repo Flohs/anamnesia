@@ -188,6 +188,60 @@ func (s *Store) SetExperienceEmbedding(ctx context.Context, id uuid.UUID, vec []
 	return err
 }
 
+// ListExperiencesInWindow returns non-deleted experiences whose
+// occurred_at falls in [since, until]. ProjectID, if set on scope,
+// filters further. Topic, if set, prefix-matches title or topic.
+// Built for the briefing primitive — mirrors ListSourcesInWindow on
+// the experiences table.
+func (s *Store) ListExperiencesInWindow(
+	ctx context.Context,
+	scope anamnesia.Scope,
+	since, until time.Time,
+	topic string,
+	limit int,
+) ([]*anamnesia.Experience, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	if until.IsZero() {
+		until = time.Now().UTC()
+	}
+	args := []any{scope.UserID, since, until}
+	where := []string{
+		"user_id = $1",
+		"deleted_at IS NULL",
+		"invalidated_at IS NULL",
+		"occurred_at >= $2",
+		"occurred_at <= $3",
+	}
+	if scope.ProjectID != nil {
+		args = append(args, *scope.ProjectID)
+		where = append(where, fmt.Sprintf("project_id = $%d", len(args)))
+	}
+	if topic != "" {
+		args = append(args, topic+"%")
+		where = append(where, fmt.Sprintf("(title ILIKE $%d OR topic ILIKE $%d)",
+			len(args), len(args)))
+	}
+	args = append(args, limit)
+	q := fmt.Sprintf(expSelectCols+` FROM experiences WHERE %s ORDER BY occurred_at ASC LIMIT $%d`,
+		strings.Join(where, " AND "), len(args))
+	rows, err := s.Pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*anamnesia.Experience
+	for rows.Next() {
+		e, err := scanExperience(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 const expSelectCols = `SELECT id, user_id, project_id, source_id, kind, abstraction, title, body, outcome, meta,
 		trust, importance, relevance, pii_tags, use_count, last_used_at, embed_model,
 		valid_from, valid_to, ingested_at, invalidated_at, superseded_by, deleted_at,

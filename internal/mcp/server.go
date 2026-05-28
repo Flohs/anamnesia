@@ -13,11 +13,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/flohs/anamnesia-open-source/internal/jobs"
 	"github.com/flohs/anamnesia-open-source/internal/pii"
 	"github.com/flohs/anamnesia-open-source/internal/retrieval"
 	"github.com/flohs/anamnesia-open-source/internal/store"
@@ -29,6 +32,7 @@ type Deps struct {
 	Store          *store.Store
 	Retrieval      *retrieval.Engine
 	PII            pii.Detector
+	Briefer        *jobs.Briefer // nil-safe
 	DefaultUser    string
 	DefaultProject string
 }
@@ -120,6 +124,73 @@ func registerTools(s *server.MCPServer, d Deps) {
 	)
 
 	s.AddTool(
+		mcp.NewTool("anamnesia_identity",
+			mcp.WithDescription("Return the user's identity: persona + profile + a rendered system_prompt block. Dock-on agents call this at boot."),
+			mcp.WithString("user"), mcp.WithString("project"),
+		),
+		d.identity,
+	)
+
+	s.AddTool(
+		mcp.NewTool("anamnesia_commitments_record",
+			mcp.WithDescription("Record an open commitment (something owed by/to the user). Status defaults to 'open'."),
+			mcp.WithString("body", mcp.Required()),
+			mcp.WithString("owner", mcp.Description("party owing — default 'user'")),
+			mcp.WithString("beneficiary", mcp.Description("party owed — default 'user'")),
+			mcp.WithString("due_at", mcp.Description("RFC3339; optional")),
+			mcp.WithString("user"), mcp.WithString("project"),
+		),
+		d.commitmentRecord,
+	)
+	s.AddTool(
+		mcp.NewTool("anamnesia_commitments_list",
+			mcp.WithDescription("List commitments. Default sort: open first, then by due date."),
+			mcp.WithString("status", mcp.Description("open|done|dropped — default any")),
+			mcp.WithNumber("limit"),
+			mcp.WithString("user"), mcp.WithString("project"),
+		),
+		d.commitmentList,
+	)
+	s.AddTool(
+		mcp.NewTool("anamnesia_commitments_resolve",
+			mcp.WithDescription("Mark a commitment done or dropped."),
+			mcp.WithString("id", mcp.Required()),
+			mcp.WithString("status", mcp.Required(), mcp.Description("done|dropped")),
+		),
+		d.commitmentResolve,
+	)
+
+	s.AddTool(
+		mcp.NewTool("anamnesia_capabilities",
+			mcp.WithDescription("List skills/tools registered for this user, freshness-ordered. Use at boot to discover what you can call."),
+			mcp.WithString("user"), mcp.WithString("project"),
+			mcp.WithNumber("limit"),
+		),
+		d.capabilities,
+	)
+
+	s.AddTool(
+		mcp.NewTool("anamnesia_people",
+			mcp.WithDescription("List people the user knows, sorted by recent-mention count (last 90d)."),
+			mcp.WithString("user"), mcp.WithString("project"),
+			mcp.WithNumber("limit"),
+		),
+		d.people,
+	)
+
+	s.AddTool(
+		mcp.NewTool("anamnesia_briefing",
+			mcp.WithDescription("Summarise experiences in a time window with 'adjacent' items the user might want to mention. Returns {summary, highlights[], adjacent[]}."),
+			mcp.WithString("since", mcp.Required(), mcp.Description("RFC3339 timestamp")),
+			mcp.WithString("until", mcp.Description("RFC3339; default now")),
+			mcp.WithString("topic"),
+			mcp.WithNumber("max_adjacent"),
+			mcp.WithString("user"), mcp.WithString("project"),
+		),
+		d.briefing,
+	)
+
+	s.AddTool(
 		mcp.NewTool("anamnesia_skills_register",
 			mcp.WithDescription("Register or update a callable in the skills registry."),
 			mcp.WithString("name", mcp.Required()),
@@ -166,7 +237,8 @@ func registerTools(s *server.MCPServer, d Deps) {
 
 	s.AddTool(
 		mcp.NewTool("anamnesia_audit",
-			mcp.WithDescription("Tail the audit log (most recent rows)."),
+			mcp.WithDescription("Audit log: tail (default) or per-subject history if subject is provided."),
+			mcp.WithString("subject", mcp.Description(`"<kind>:<uuid>" e.g. "fact:abc..."; if set, returns rows for that subject only`)),
 			mcp.WithString("user"), mcp.WithString("project"),
 			mcp.WithNumber("limit"),
 		),
@@ -449,6 +521,151 @@ func (d Deps) experienceForget(ctx context.Context, req mcp.CallToolRequest) (*m
 	return ok(map[string]any{"id": id, "forgotten": true})
 }
 
+func (d Deps) identity(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := argsFromRequest(req)
+	scope, err := d.resolveScope(ctx, args)
+	if err != nil {
+		return bad(err)
+	}
+	id, err := d.Store.GetIdentity(ctx, scope)
+	if err != nil {
+		return bad(err)
+	}
+	return ok(id)
+}
+
+func (d Deps) commitmentRecord(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := argsFromRequest(req)
+	scope, err := d.resolveScope(ctx, args)
+	if err != nil {
+		return bad(err)
+	}
+	c := &anamnesia.Commitment{
+		Scope: scope, Owner: argString(args, "owner"),
+		Beneficiary: argString(args, "beneficiary"), Body: argString(args, "body"),
+	}
+	if s := argString(args, "due_at"); s != "" {
+		t, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			return bad(fmt.Errorf("due_at: %w", err))
+		}
+		c.DueAt = &t
+	}
+	if err := d.Store.RecordCommitment(ctx, c); err != nil {
+		return bad(err)
+	}
+	return ok(c)
+}
+
+func (d Deps) commitmentList(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := argsFromRequest(req)
+	scope, err := d.resolveScope(ctx, args)
+	if err != nil {
+		return bad(err)
+	}
+	out, err := d.Store.ListCommitments(ctx, scope,
+		anamnesia.CommitmentStatus(argString(args, "status")), argInt(args, "limit", 50))
+	if err != nil {
+		return bad(err)
+	}
+	return ok(out)
+}
+
+func (d Deps) commitmentResolve(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := argsFromRequest(req)
+	id, err := argUUID(args, "id")
+	if err != nil {
+		return bad(err)
+	}
+	st := anamnesia.CommitmentStatus(argString(args, "status"))
+	if err := d.Store.ResolveCommitment(ctx, id, st); err != nil {
+		return bad(err)
+	}
+	return ok(map[string]any{"id": id, "status": st})
+}
+
+func (d Deps) capabilities(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := argsFromRequest(req)
+	scope, err := d.resolveScope(ctx, args)
+	if err != nil {
+		return bad(err)
+	}
+	out, err := d.Store.ListCapabilities(ctx, scope, argInt(args, "limit", 50))
+	if err != nil {
+		return bad(err)
+	}
+	return ok(out)
+}
+
+func (d Deps) people(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := argsFromRequest(req)
+	scope, err := d.resolveScope(ctx, args)
+	if err != nil {
+		return bad(err)
+	}
+	out, err := d.Store.ListPeople(ctx, scope, argInt(args, "limit", 50))
+	if err != nil {
+		return bad(err)
+	}
+	return ok(out)
+}
+
+func (d Deps) briefing(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := argsFromRequest(req)
+	scope, err := d.resolveScope(ctx, args)
+	if err != nil {
+		return bad(err)
+	}
+	since, err := time.Parse(time.RFC3339, argString(args, "since"))
+	if err != nil {
+		return bad(fmt.Errorf("since: %w", err))
+	}
+	var until time.Time
+	if u := argString(args, "until"); u != "" {
+		until, err = time.Parse(time.RFC3339, u)
+		if err != nil {
+			return bad(fmt.Errorf("until: %w", err))
+		}
+	}
+	topic := argString(args, "topic")
+	inWin, err := d.Store.ListExperiencesInWindow(ctx, scope, since, until, topic, 200)
+	if err != nil {
+		return bad(err)
+	}
+	flankSince := since.AddDate(0, 0, -14)
+	flankUntil := until
+	if flankUntil.IsZero() {
+		flankUntil = time.Now().UTC()
+	}
+	flankUntil = flankUntil.AddDate(0, 0, 14)
+	adj, err := d.Store.ListExperiencesInWindow(ctx, scope, flankSince, flankUntil, topic, 50)
+	if err != nil {
+		return bad(err)
+	}
+	inSet := map[uuid.UUID]bool{}
+	for _, e := range inWin {
+		inSet[e.ID] = true
+	}
+	adjOut := adj[:0]
+	for _, e := range adj {
+		if !inSet[e.ID] {
+			adjOut = append(adjOut, e)
+		}
+	}
+	var briefer jobs.Briefer
+	if d.Briefer != nil {
+		briefer = *d.Briefer
+	}
+	out, err := briefer.Brief(ctx, anamnesia.BriefingRequest{
+		Scope: scope, Since: since, Until: until,
+		Topic: topic, MaxAdjacent: argInt(args, "max_adjacent", 3),
+	}, inWin, adjOut)
+	if err != nil {
+		return bad(err)
+	}
+	return ok(out)
+}
+
 func (d Deps) search(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := argsFromRequest(req)
 	text := argString(args, "text")
@@ -557,11 +774,27 @@ func (d Deps) workingRecall(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 
 func (d Deps) audit(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := argsFromRequest(req)
+	limit := argInt(args, "limit", 50)
+	if subject := argString(args, "subject"); subject != "" {
+		parts := strings.SplitN(subject, ":", 2)
+		if len(parts) != 2 {
+			return bad(errors.New(`subject must be "<kind>:<uuid>"`))
+		}
+		id, err := uuid.Parse(parts[1])
+		if err != nil {
+			return bad(err)
+		}
+		out, err := d.Store.AuditForSubject(ctx, parts[0], id, limit)
+		if err != nil {
+			return bad(err)
+		}
+		return ok(out)
+	}
 	scope, err := d.resolveScope(ctx, args)
 	if err != nil {
 		return bad(err)
 	}
-	out, err := d.Store.AuditTail(ctx, scope, argInt(args, "limit", 50))
+	out, err := d.Store.AuditTail(ctx, scope, limit)
 	if err != nil {
 		return bad(err)
 	}

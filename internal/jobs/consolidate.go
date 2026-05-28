@@ -362,6 +362,9 @@ func distilCluster(ctx context.Context, st *store.Store, lm llm.Client, scope an
 		Outcome:     anamnesia.Outcome(out.Outcome),
 		Importance:  imp,
 		Trust:       0.7,
+		// parent_id links the summary to one representative source
+		// experience; the full cluster lineage lives in meta.
+		ParentID: &cl.members[0].ID,
 		Meta: map[string]any{
 			"consolidated_from": collectIDs(cl.members),
 			"consolidated_at":   time.Now().UTC(),
@@ -371,11 +374,13 @@ func distilCluster(ctx context.Context, st *store.Store, lm llm.Client, scope an
 	if err := st.RecordExperience(ctx, newExp); err != nil {
 		return fmt.Errorf("record distilled: %w", err)
 	}
-	for _, m := range cl.members {
-		if err := st.SupersedeExperience(ctx, m.ID, newExp.ID); err != nil {
-			return fmt.Errorf("supersede %s: %w", m.ID, err)
-		}
-	}
+	// Note: source experiences (abstraction=0) are NOT superseded here.
+	// Consolidation is additive — the summary is a derived layer for
+	// callers that want a thematic overview; the sources remain active
+	// so callers that need verbatim evidence still see them. Earlier
+	// versions called SupersedeExperience here, which invalidated every
+	// source row and silently broke fact-grounded retrieval. See
+	// retrieval.Query.OnlyRaw for the abstraction filter on the read path.
 	if log != nil {
 		log.Info("consolidated cluster",
 			"distilled", newExp.ID,

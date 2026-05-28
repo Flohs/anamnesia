@@ -36,6 +36,12 @@ type Query struct {
 	LexicalK  int                // lexical candidates per domain (default 40)
 	RRFConst  float64            // default 60
 	ProjectIn []uuid.UUID        // include hits from these projects; empty + ProjectID set = restrict to that project
+	// OnlyRaw, when true, restricts experience retrieval to abstraction=0
+	// rows — verbatim sources only, no consolidator-generated summaries.
+	// Set this for evidence-grounded answering (benchmarks, citation
+	// flows). Leave false for context injection where thematic summaries
+	// are useful.
+	OnlyRaw bool
 }
 
 // Search runs vector + lexical retrieval per requested domain and fuses
@@ -114,13 +120,13 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 			add(d, hits, false)
 		case anamnesia.DomainExperience:
 			if qvec != nil {
-				hits, err := e.vectorExperiences(ctx, q.Scope, qvec, q.VectorK)
+				hits, err := e.vectorExperiences(ctx, q.Scope, qvec, q.VectorK, q.OnlyRaw)
 				if err != nil {
 					return nil, fmt.Errorf("vector experiences: %w", err)
 				}
 				add(d, hits, true)
 			}
-			hits, err := e.lexicalExperiences(ctx, q.Scope, q.Text, q.LexicalK)
+			hits, err := e.lexicalExperiences(ctx, q.Scope, q.Text, q.LexicalK, q.OnlyRaw)
 			if err != nil {
 				return nil, fmt.Errorf("lex experiences: %w", err)
 			}
@@ -234,12 +240,15 @@ func (e *Engine) scanFactHits(ctx context.Context, q string, args []any) ([]anam
 	return out, nil
 }
 
-func (e *Engine) vectorExperiences(ctx context.Context, scope anamnesia.Scope, qvec []float32, k int) ([]anamnesia.SearchHit, error) {
+func (e *Engine) vectorExperiences(ctx context.Context, scope anamnesia.Scope, qvec []float32, k int, onlyRaw bool) ([]anamnesia.SearchHit, error) {
 	args := []any{scope.UserID, pgvector.NewVector(qvec)}
 	where := []string{"user_id = $1", "deleted_at IS NULL", "invalidated_at IS NULL", "embedding IS NOT NULL"}
 	if scope.ProjectID != nil {
 		args = append(args, *scope.ProjectID)
 		where = append(where, fmt.Sprintf("(project_id = $%d OR project_id IS NULL)", len(args)))
+	}
+	if onlyRaw {
+		where = append(where, "abstraction = 0")
 	}
 	args = append(args, k)
 	q := fmt.Sprintf(`SELECT id, user_id, project_id, source_id, kind, abstraction, title, body, outcome, meta,
@@ -251,7 +260,7 @@ func (e *Engine) vectorExperiences(ctx context.Context, scope anamnesia.Scope, q
 	return e.scanExperienceHits(ctx, q, args)
 }
 
-func (e *Engine) lexicalExperiences(ctx context.Context, scope anamnesia.Scope, text string, k int) ([]anamnesia.SearchHit, error) {
+func (e *Engine) lexicalExperiences(ctx context.Context, scope anamnesia.Scope, text string, k int, onlyRaw bool) ([]anamnesia.SearchHit, error) {
 	if strings.TrimSpace(text) == "" {
 		return nil, nil
 	}
@@ -260,6 +269,9 @@ func (e *Engine) lexicalExperiences(ctx context.Context, scope anamnesia.Scope, 
 	if scope.ProjectID != nil {
 		args = append(args, *scope.ProjectID)
 		where = append(where, fmt.Sprintf("(project_id = $%d OR project_id IS NULL)", len(args)))
+	}
+	if onlyRaw {
+		where = append(where, "abstraction = 0")
 	}
 	args = append(args, k)
 	q := fmt.Sprintf(`SELECT id, user_id, project_id, source_id, kind, abstraction, title, body, outcome, meta,

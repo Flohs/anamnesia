@@ -20,6 +20,8 @@ type fakeLLM struct {
 	Ops    []Operation
 	Calls  int
 	Prompt string
+	System string
+	Schema json.RawMessage
 }
 
 func mustJSON(v any) json.RawMessage {
@@ -36,6 +38,8 @@ func (f *fakeLLM) Distill(context.Context, llm.DistillInput, any) error   { retu
 func (f *fakeLLM) Extract(_ context.Context, in llm.DistillInput, out any) error {
 	f.Calls++
 	f.Prompt = in.User
+	f.System = in.System
+	f.Schema = in.Schema
 	rawOps := make([]json.RawMessage, len(f.Ops))
 	for i, op := range f.Ops {
 		b, err := json.Marshal(op)
@@ -231,4 +235,55 @@ func TestSurpriseGate(t *testing.T) {
 	if hasTemporalMarker("the build is broken") {
 		t.Error("false positive: no temporal marker should match 'the build is broken'")
 	}
+}
+
+// TestCommitmentPromptGating verifies the ADD_COMMITMENT instructions and
+// schema variant are sent only when Config.ExtractCommitments is true.
+// DB-free: the fake LLM returns a single NOOP so executeOp (and the
+// store) is never reached.
+func TestCommitmentPromptGating(t *testing.T) {
+	ctx := context.Background()
+	src := &anamnesia.Source{
+		Scope:      anamnesia.Scope{UserID: uuid.New()},
+		Kind:       "chat-turn",
+		OccurredAt: time.Now().UTC(),
+		RawContent: "Some content long enough to clear the min-content gate.",
+	}
+
+	t.Run("enabled", func(t *testing.T) {
+		fake := &fakeLLM{Ops: []Operation{{Op: "NOOP"}}}
+		ex := &Extractor{Cfg: Config{ExtractCommitments: true}, LLM: fake}
+		if _, err := ex.Run(ctx, src); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		if !strings.Contains(fake.System, "ADD_COMMITMENT") {
+			t.Errorf("system prompt should include ADD_COMMITMENT instructions when enabled")
+		}
+		if !strings.Contains(string(fake.Schema), "ADD_COMMITMENT") {
+			t.Errorf("schema should permit ADD_COMMITMENT when enabled")
+		}
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		fake := &fakeLLM{Ops: []Operation{{Op: "NOOP"}}}
+		ex := &Extractor{Cfg: Config{ExtractCommitments: false}, LLM: fake}
+		if _, err := ex.Run(ctx, src); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		if strings.Contains(fake.System, "ADD_COMMITMENT") {
+			t.Errorf("system prompt must NOT mention ADD_COMMITMENT when disabled")
+		}
+		if strings.Contains(string(fake.Schema), "ADD_COMMITMENT") {
+			t.Errorf("schema must NOT permit ADD_COMMITMENT when disabled")
+		}
+	})
+
+	t.Run("disabled op is a no-op", func(t *testing.T) {
+		// With the flag off, even a stray ADD_COMMITMENT op must not reach
+		// the (nil) store. executeOp returns nil before touching it.
+		ex := &Extractor{Cfg: Config{ExtractCommitments: false}}
+		if err := ex.executeOp(ctx, src, Operation{Op: "ADD_COMMITMENT", Body: "x"}); err != nil {
+			t.Errorf("disabled ADD_COMMITMENT should be a no-op, got %v", err)
+		}
+	})
 }

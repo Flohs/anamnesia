@@ -12,6 +12,7 @@ import (
 
 	"github.com/flohs/anamnesia-open-source/internal/config"
 	"github.com/flohs/anamnesia-open-source/internal/embed"
+	"github.com/flohs/anamnesia-open-source/internal/extract"
 	"github.com/flohs/anamnesia-open-source/internal/httpapi"
 	"github.com/flohs/anamnesia-open-source/internal/jobs"
 	"github.com/flohs/anamnesia-open-source/internal/llm"
@@ -66,13 +67,20 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	emb, err := embed.New(cfg.EmbedProvider, cfg.EmbedModel, cfg.OpenAIBaseURL, cfg.OpenAIAPIKey, cfg.EmbedDims)
+	embKey := cfg.OpenAIAPIKey
+	if cfg.EmbedProvider == "openrouter" {
+		embKey = cfg.OpenRouterAPIKey
+	}
+	emb, err := embed.New(cfg.EmbedProvider, cfg.EmbedModel, cfg.OpenAIBaseURL, embKey, cfg.EmbedDims)
 	if err != nil {
 		return err
 	}
 	llmKey := cfg.AnthropicAPIKey
-	if cfg.LLMProvider == "openai" {
+	switch cfg.LLMProvider {
+	case "openai":
 		llmKey = cfg.OpenAIAPIKey
+	case "openrouter":
+		llmKey = cfg.OpenRouterAPIKey
 	}
 	llmc, err := llm.New(llm.Config{
 		Provider: cfg.LLMProvider,
@@ -83,7 +91,11 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	reranker, err := retrieval.NewReranker(cfg.RerankProvider, cfg.CohereAPIKey, cfg.RerankModel)
+	rerankKey := cfg.CohereAPIKey
+	if cfg.RerankProvider == "openrouter" {
+		rerankKey = cfg.OpenRouterAPIKey
+	}
+	reranker, err := retrieval.NewReranker(cfg.RerankProvider, rerankKey, cfg.RerankModel)
 	if err != nil {
 		return err
 	}
@@ -94,11 +106,14 @@ func runServe(cmd *cobra.Command, _ []string) error {
 
 	retr := &retrieval.Engine{Store: st, Embedder: emb, Reranker: reranker}
 
+	briefer := &jobs.Briefer{LLM: llmc}
+
 	// MCP handler
 	mcpHandler := mcp.NewHandler(mcp.Deps{
 		Store:          st,
 		Retrieval:      retr,
 		PII:            piiDet,
+		Briefer:        briefer,
 		DefaultUser:    cfg.DefaultUser,
 		DefaultProject: cfg.DefaultProject,
 	})
@@ -109,6 +124,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		Retrieval:      retr,
 		MCPHandler:     mcpHandler,
 		PII:            piiDet,
+		Briefer:        briefer,
 		DefaultUser:    cfg.DefaultUser,
 		DefaultProject: cfg.DefaultProject,
 		ServerToken:    cfg.ServerToken,
@@ -126,6 +142,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 				DecayEvery:       cfg.DecayEvery,
 				ConsolidateEvery: cfg.ConsolidateEvery,
 				ExtractEvery:     cfg.ExtractEvery,
+				Extract:          extract.Config{ExtractCommitments: cfg.ExtractCommitments},
 			},
 			Store:     st,
 			Embedder:  emb,

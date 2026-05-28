@@ -24,11 +24,19 @@ type hookSpec struct {
 	verb    string
 }
 
+// Hook layout: session-checkpoint model.
+//   SessionStart    — read facts/experiences into Claude's context
+//   UserPromptSubmit— retrieve only (no per-turn ingest)
+//   Stop            — fire-and-forget POST of the chat transcript
+//   PreCompact      — same, snapshot before Claude compacts context
+// In-session memory is the LLM's own context; per-turn extraction is
+// removed because most chat is noise and the LLM that produced it has
+// already shaped its own responses with that context.
 var anamnesiaHooks = []hookSpec{
 	{event: "SessionStart", matcher: "", verb: "session-start"},
 	{event: "UserPromptSubmit", matcher: "", verb: "retrieve"},
-	{event: "PostToolUse", matcher: "Edit|Write|Bash|mcp__.*", verb: "capture"},
 	{event: "Stop", matcher: "", verb: "session-end"},
+	{event: "PreCompact", matcher: "", verb: "pre-compact"},
 }
 
 type installFlags struct {

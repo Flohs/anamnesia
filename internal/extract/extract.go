@@ -53,6 +53,12 @@ type Config struct {
 	MaxOps int
 	// MinContentLen skips bodies shorter than this. Default 16.
 	MinContentLen int
+	// ExtractCommitments, when true, lets the extractor emit
+	// ADD_COMMITMENT ops (open-loop obligations) in addition to the
+	// fact/experience ops. Off by default so the prompt + schema sent
+	// for the existing ops are byte-identical when the feature is
+	// disabled — benchmark runs are not perturbed.
+	ExtractCommitments bool
 }
 
 // Extractor runs the pipeline against an open-source memory store.
@@ -101,6 +107,10 @@ type Operation struct {
 	Outcome    string  `json:"outcome,omitempty"`
 	Importance float32 `json:"importance,omitempty"`
 	Topic      string  `json:"topic,omitempty"`
+	// Commitment-only. Body carries the obligation text.
+	Owner       string `json:"owner,omitempty"`
+	Beneficiary string `json:"beneficiary,omitempty"`
+	DueAt       string `json:"due_at,omitempty"` // RFC3339
 }
 
 // opsResponse decodes the outer envelope. Operations is held as raw
@@ -204,13 +214,22 @@ func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (int, error)
 		systemPrompt = extractSystemPromptLiberal
 		maxTok = 4096
 	}
+	// Commitment extraction is opt-in. When enabled, append the
+	// ADD_COMMITMENT instructions and switch to the schema variant that
+	// permits the op. When disabled, both the prompt and schema are
+	// exactly what the fact/experience-only pipeline has always sent.
+	schema := operationSchema
+	if cfg.ExtractCommitments {
+		systemPrompt += commitmentInstructions
+		schema = operationSchemaWithCommitments
+	}
 	prompt := e.userPrompt(src, content, candidates)
 	var resp opsResponse
 	if err := e.LLM.Extract(ctx, llm.DistillInput{
 		System:     systemPrompt,
 		User:       prompt,
 		MaxTok:     maxTok,
-		Schema:     operationSchema,
+		Schema:     schema,
 		SchemaName: "anamnesia_operations",
 	}, &resp); err != nil {
 		return 0, fmt.Errorf("llm extract: %w", err)
@@ -457,6 +476,52 @@ var operationSchema = json.RawMessage(`{
   "required": ["operations"]
 }`)
 
+// operationSchemaWithCommitments is operationSchema plus the
+// ADD_COMMITMENT op and its owner/beneficiary/due_at fields. Used only
+// when Config.ExtractCommitments is set. Kept as a separate literal so
+// the default schema is untouched.
+var operationSchemaWithCommitments = json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "operations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "op":          {"type": "string", "enum": ["ADD_FACT","UPDATE_FACT","DELETE_FACT","ADD_EXPERIENCE","ADD_COMMITMENT","NOOP"]},
+          "id":          {"type": "string"},
+          "fact_scope":  {"type": "string", "enum": ["user","project","environment"]},
+          "key":         {"type": "string"},
+          "value":       {},
+          "source":      {"type": "string"},
+          "trust":       {"type": "number"},
+          "kind":        {"type": "string", "enum": ["case","strategy","hybrid"]},
+          "title":       {"type": "string"},
+          "body":        {"type": "string"},
+          "outcome":     {"type": "string"},
+          "importance":  {"type": "number"},
+          "topic":       {"type": "string"},
+          "owner":       {"type": "string"},
+          "beneficiary": {"type": "string"},
+          "due_at":      {"type": "string"}
+        },
+        "required": ["op"]
+      }
+    }
+  },
+  "required": ["operations"]
+}`)
+
+// commitmentInstructions is appended to the system prompt when
+// Config.ExtractCommitments is set. Conservative on purpose — the bar
+// for ADD_COMMITMENT is an explicit, stated obligation.
+const commitmentInstructions = `
+
+You may ALSO emit:
+- ADD_COMMITMENT: an explicit open-loop obligation the source states — something owed by or to the user with a concrete action. Provide "owner" (who owes it: "user" or a person's name), "beneficiary" (who it's owed to), "body" (the obligation in one line), and optional "due_at" (RFC3339; resolve relative dates using the "now" field).
+
+Only emit ADD_COMMITMENT when the source clearly states a promise, a task owed, or a deadline ("I'll send the doc by Friday", "remind me to call Y", "I need to review Z before the meeting"). Do NOT infer commitments from vague intentions or completed actions. When in doubt, prefer NOOP or ADD_FACT over ADD_COMMITMENT.`
+
 const extractSystemPrompt = `You are the extraction worker for an agent memory system. You read one piece of input content and decide what should land in long-term memory.
 
 You can emit these operations:
@@ -523,6 +588,14 @@ func (e *Extractor) executeOp(ctx context.Context, src *anamnesia.Source, op Ope
 		return e.deleteFact(ctx, op)
 	case "ADD_EXPERIENCE":
 		return e.addExperience(ctx, src, op)
+	case "ADD_COMMITMENT":
+		// Defence in depth: the op only reaches the model when the flag
+		// is on, but guard here too so a stray op is a no-op rather than
+		// an unexpected write.
+		if !e.Cfg.ExtractCommitments {
+			return nil
+		}
+		return e.addCommitment(ctx, src, op)
 	default:
 		return fmt.Errorf("unknown op %q", op.Op)
 	}
@@ -619,6 +692,28 @@ func (e *Extractor) addExperience(ctx context.Context, src *anamnesia.Source, op
 		Meta:         map[string]any{"extracted": true, "source_id": src.ID},
 	}
 	return e.Store.RecordExperience(ctx, exp)
+}
+
+func (e *Extractor) addCommitment(ctx context.Context, src *anamnesia.Source, op Operation) error {
+	body := op.Body
+	if body == "" {
+		return errors.New("ADD_COMMITMENT: body required")
+	}
+	srcID := src.ID
+	c := &anamnesia.Commitment{
+		Scope:       src.Scope,
+		Owner:       op.Owner,
+		Beneficiary: op.Beneficiary,
+		Body:        body,
+		Status:      anamnesia.CommitmentOpen,
+		SourceID:    &srcID,
+	}
+	if op.DueAt != "" {
+		if t, err := time.Parse(time.RFC3339, op.DueAt); err == nil {
+			c.DueAt = &t
+		}
+	}
+	return e.Store.RecordCommitment(ctx, c)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────
