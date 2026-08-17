@@ -1,18 +1,33 @@
-// hook.go implements the four Claude Code hooks. Each subcommand reads
-// the JSON payload from stdin (Claude Code's hook protocol), forwards it
-// to the local Anamnesia server, and prints a Claude-friendly response
-// to stdout. Failures are non-fatal — we never want hook errors to
-// derail the user's session — so transient HTTP errors swallow.
+// hook.go implements the Claude Code hooks. Each subcommand reads the JSON
+// payload Claude Code writes to stdin, talks to the local server, and
+// prints whatever Claude should see on stdout.
+//
+// Three rules govern everything here:
+//
+// A hook never breaks a session. Every failure path returns success with no
+// output, so a stopped server or an unreachable database costs the user
+// nothing but the memory they would have had.
+//
+// A hook never disappears silently either. Every run appends one line to
+// ~/.anamnesia/hooks.log, which is what lets `anamnesia doctor` tell the
+// difference between "working" and "failing on every turn" — previously
+// indistinguishable, because both looked like an empty session.
+//
+// A hook never blocks for long. Deadlines are short, and reading the
+// transcript is incremental: each checkpoint sends only what has been added
+// since the last one.
 package main
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -20,13 +35,15 @@ import (
 )
 
 var hookCmd = &cobra.Command{
-	Use:   "hook [event]",
-	Short: "Run a Claude Code hook (session-start | retrieve | session-end | pre-compact)",
-	Args:  cobra.MinimumNArgs(1),
-	RunE:  runHook,
+	Use:    "hook [event]",
+	Short:  "Run a Claude Code hook (session-start | retrieve | session-end | pre-compact)",
+	Long:   "Invoked by Claude Code's hooks. Not meant to be run by hand.",
+	Args:   cobra.MinimumNArgs(1),
+	Hidden: true,
+	RunE:   runHook,
 }
 
-// hookEvent is the union payload sent to every hook endpoint on the server.
+// hookEvent is the union payload sent to the server's hook endpoints.
 type hookEvent struct {
 	SessionID      string `json:"session_id,omitempty"`
 	CWD            string `json:"cwd,omitempty"`
@@ -37,81 +54,151 @@ type hookEvent struct {
 	MaxExperiences int    `json:"max_experiences,omitempty"`
 }
 
-// claudeHookInput is the schema Claude Code writes to stdin.
-// We only need a handful of fields; the rest is ignored.
+// claudeHookInput is the schema Claude Code writes to stdin. Only the
+// fields we use are declared; the rest is ignored.
 type claudeHookInput struct {
 	SessionID      string `json:"session_id"`
 	CWD            string `json:"cwd"`
 	Prompt         string `json:"prompt"`
 	StopReason     string `json:"stop_reason"`
 	TranscriptPath string `json:"transcript_path"`
+	HookEventName  string `json:"hook_event_name"`
+	Source         string `json:"source"`
+	Trigger        string `json:"trigger"`
+}
+
+// errServerUnreachable is logged when a hook found no server to talk to.
+var errServerUnreachable = errors.New("server not running, so this hook did nothing")
+
+// hookTimeouts are the per-verb budgets. UserPromptSubmit is on the
+// critical path of every prompt, so it gets the tightest one.
+var hookTimeouts = map[string]time.Duration{
+	"session-start": 6 * time.Second,
+	"retrieve":      2500 * time.Millisecond,
+	"session-end":   20 * time.Second,
+	"pre-compact":   20 * time.Second,
 }
 
 func runHook(cmd *cobra.Command, args []string) error {
 	verb := args[0]
-	cfg, err := resolveHostConfig()
+	started := time.Now()
+
+	switch verb {
+	case "session-start", "retrieve", "session-end", "pre-compact":
+	default:
+		return fmt.Errorf("unknown hook verb %q (want session-start|retrieve|session-end|pre-compact)", verb)
+	}
+
+	hc, err := loadHostConfig()
 	if err != nil {
-		return err
+		logHook(verb, started, err, "config unreadable")
+		return nil // never break the session over a bad config
 	}
 	input := readHookStdin()
 	ev := hookEvent{
 		SessionID: input.SessionID,
 		CWD:       input.CWD,
-		Project:   cfg.Project,
-		User:      cfg.User,
+		Project:   hc.Project(),
+		User:      hc.User(),
 		Prompt:    input.Prompt,
 	}
 
+	ctx, cancel := context.WithTimeout(cmd.Context(), hookTimeouts[verb])
+	defer cancel()
+
+	// SessionStart can afford to wait a moment for an auto-start, because
+	// getting memory into the first prompt is the whole point. The others
+	// kick the start off and move on.
+	wait := time.Duration(0)
+	if verb == "session-start" {
+		wait = 4 * time.Second
+	}
+	if !ensureServerRunning(ctx, hc, wait) {
+		// Recorded as a failure, not a quiet skip. The session carries on
+		// regardless, but this is precisely the state doctor has to be able
+		// to see: memory silently doing nothing, every single turn.
+		logHook(verb, started, errServerUnreachable, "")
+		return nil
+	}
+
+	var note string
 	switch verb {
 	case "session-start":
-		return doSessionStart(cmd.OutOrStdout(), cfg, ev)
+		note, err = doSessionStart(ctx, cmd.OutOrStdout(), hc, ev)
 	case "retrieve":
-		return doRetrieve(cmd.OutOrStdout(), cfg, ev)
+		note, err = doRetrieve(ctx, cmd.OutOrStdout(), hc, ev)
 	case "session-end":
-		return doSessionCheckpoint(cfg, input, "claude-session")
+		note, err = doCheckpoint(ctx, hc, input, "claude-session")
 	case "pre-compact":
-		return doSessionCheckpoint(cfg, input, "claude-precompact")
-	default:
-		return fmt.Errorf("unknown hook verb %q (want session-start|retrieve|session-end|pre-compact)", verb)
+		note, err = doCheckpoint(ctx, hc, input, "claude-precompact")
 	}
+	logHook(verb, started, err, note)
+	return nil
 }
 
+// readHookStdin decodes Claude Code's payload under a deadline.
+//
+// The deadline matters: stdin is a pipe, and if the writer never closes it
+// an unguarded read blocks forever, which manifests as Claude Code hanging
+// rather than as anything recognisable as a memory problem.
 func readHookStdin() claudeHookInput {
 	var in claudeHookInput
-	st, _ := os.Stdin.Stat()
-	if (st.Mode() & os.ModeCharDevice) != 0 {
-		return in
+
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return in // no usable stdin; treat as an empty payload
 	}
-	raw, err := io.ReadAll(os.Stdin)
-	if err != nil || len(raw) == 0 {
-		return in
+	if (info.Mode() & os.ModeCharDevice) != 0 {
+		return in // a terminal, so nobody is piping us a payload
 	}
-	_ = json.Unmarshal(raw, &in)
+
+	type result struct {
+		raw []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		raw, err := io.ReadAll(io.LimitReader(os.Stdin, 8<<20))
+		done <- result{raw, err}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err != nil || len(r.raw) == 0 {
+			return in
+		}
+		_ = json.Unmarshal(r.raw, &in)
+	case <-time.After(2 * time.Second):
+		// Nothing arrived; carry on with an empty payload.
+	}
 	return in
 }
 
-func httpPost(ctx context.Context, cfg *hostConfig, path string, body any, dst any) error {
+// httpPost sends a JSON body and decodes a JSON reply.
+//
+// Any 2xx counts: /v1/ingest answers 202 and /v1/experience answers 201, so
+// a 200-only check classified every successful write as a failure.
+func httpPost(ctx context.Context, hc *hostConfig, path string, body, dst any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		cfg.ServerURL+path, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, hc.ServerURL()+path, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if cfg.ServerToken != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.ServerToken)
+	if tok := hc.Token(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
-	res, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
-	rb, _ := io.ReadAll(res.Body)
-	if res.StatusCode != 200 {
-		return fmt.Errorf("server %s: %s: %s", path, res.Status, string(rb))
+	rb, _ := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	if res.StatusCode < 200 || res.StatusCode > 299 {
+		return fmt.Errorf("server %s: %s: %s", path, res.Status, strings.TrimSpace(string(rb)))
 	}
 	if dst != nil && len(rb) > 0 {
 		return json.Unmarshal(rb, dst)
@@ -140,20 +227,18 @@ type experienceMin struct {
 	Outcome string `json:"outcome,omitempty"`
 }
 
-func doSessionStart(w io.Writer, cfg *hostConfig, ev hookEvent) error {
+func doSessionStart(ctx context.Context, w io.Writer, hc *hostConfig, ev hookEvent) (string, error) {
 	ev.MaxFacts = 50
 	ev.MaxExperiences = 10
 	var resp sessionStartResp
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := httpPost(ctx, cfg, "/v1/sessions/start", ev, &resp); err != nil {
-		// Non-fatal.
-		return nil
+	if err := httpPost(ctx, hc, "/v1/sessions/start", ev, &resp); err != nil {
+		return "", err
 	}
 	hasPersona := strings.TrimSpace(resp.PersonaBlock) != ""
 	hasMemory := len(resp.Facts) > 0 || len(resp.Experiences) > 0
+	note := fmt.Sprintf("%d facts, %d experiences", len(resp.Facts), len(resp.Experiences))
 	if !hasPersona && !hasMemory {
-		return nil
+		return note, nil
 	}
 	if hasPersona {
 		fmt.Fprintln(w, "## How to respond")
@@ -161,7 +246,7 @@ func doSessionStart(w io.Writer, cfg *hostConfig, ev hookEvent) error {
 		fmt.Fprintln(w)
 	}
 	if !hasMemory {
-		return nil
+		return note, nil
 	}
 	fmt.Fprintln(w, "## Anamnesia memory")
 	if len(resp.Facts) > 0 {
@@ -181,14 +266,14 @@ func doSessionStart(w io.Writer, cfg *hostConfig, ev hookEvent) error {
 			fmt.Fprintf(w, "- %s\n", title)
 		}
 	}
-	return nil
+	return note, nil
 }
 
 // ─── retrieve ────────────────────────────────────────────────────────
 
 type retrieveResp struct {
-	Hits         []retrieveHit      `json:"hits"`
-	CrossProject []crossProjectHit  `json:"cross_project,omitempty"`
+	Hits         []retrieveHit     `json:"hits"`
+	CrossProject []crossProjectHit `json:"cross_project,omitempty"`
 }
 
 type crossProjectHit struct {
@@ -199,11 +284,11 @@ type crossProjectHit struct {
 }
 
 type retrieveHit struct {
-	Domain     string          `json:"domain"`
-	Score      float64         `json:"score"`
-	Fact       *factMin        `json:"fact,omitempty"`
-	Experience *experienceMin  `json:"experience,omitempty"`
-	Skill      *skillMin       `json:"skill,omitempty"`
+	Domain     string         `json:"domain"`
+	Score      float64        `json:"score"`
+	Fact       *factMin       `json:"fact,omitempty"`
+	Experience *experienceMin `json:"experience,omitempty"`
+	Skill      *skillMin      `json:"skill,omitempty"`
 }
 
 type skillMin struct {
@@ -211,21 +296,17 @@ type skillMin struct {
 	Description string `json:"description,omitempty"`
 }
 
-func doRetrieve(w io.Writer, cfg *hostConfig, ev hookEvent) error {
+func doRetrieve(ctx context.Context, w io.Writer, hc *hostConfig, ev hookEvent) (string, error) {
 	if strings.TrimSpace(ev.Prompt) == "" {
-		return nil
+		return "empty prompt", nil
 	}
-	// Pure retrieve — per-turn ingest moved to the Stop / PreCompact
-	// checkpoint hooks. In-session memory is the LLM's own context.
-
 	var resp retrieveResp
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := httpPost(ctx, cfg, "/v1/retrieve", ev, &resp); err != nil {
-		return nil
+	if err := httpPost(ctx, hc, "/v1/retrieve", ev, &resp); err != nil {
+		return "", err
 	}
+	note := fmt.Sprintf("%d hits, %d cross-project", len(resp.Hits), len(resp.CrossProject))
 	if len(resp.Hits) == 0 && len(resp.CrossProject) == 0 {
-		return nil
+		return note, nil
 	}
 	if len(resp.Hits) > 0 {
 		fmt.Fprintln(w, "## Anamnesia retrieval")
@@ -261,62 +342,102 @@ func doRetrieve(w io.Writer, cfg *hostConfig, ev hookEvent) error {
 			fmt.Fprintf(w, "- %s [%s]\n", c.Title, label)
 		}
 	}
-	return nil
+	return note, nil
 }
 
-// ─── checkpoint (session-end + pre-compact) ──────────────────────────
-//
-// At session end and just before a context compaction, Claude Code
-// passes the path to a JSONL transcript file on stdin. We read the
-// chat-only turns out of it and fire-and-forget POST them to
-// /v1/ingest as one source. The extract worker handles the rest in
-// the background.
+// ─── checkpoints (session-end + pre-compact) ─────────────────────────
 
-func doSessionCheckpoint(cfg *hostConfig, input claudeHookInput, kind string) error {
-	content, err := readTranscript(input.TranscriptPath)
-	if err != nil || strings.TrimSpace(content) == "" {
-		// Non-fatal: missing transcript path or unreadable file just
-		// means there's nothing to ingest.
-		return nil
+// doCheckpoint sends the part of the transcript that has not been sent
+// before, and records how far it got.
+//
+// The offset is what keeps this linear. Re-reading the whole transcript at
+// every checkpoint means a long session is ingested over and over, and the
+// extractor pays for the same content each time.
+func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, kind string) (string, error) {
+	if input.TranscriptPath == "" {
+		return "no transcript path", nil
+	}
+	offset := readOffset(input.SessionID, input.TranscriptPath)
+	content, next, err := readTranscriptFrom(input.TranscriptPath, offset)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(content) == "" {
+		// Still record the offset: a checkpoint over tool-only turns has
+		// nothing to say but has definitely consumed those bytes.
+		_ = writeOffset(input.SessionID, input.TranscriptPath, next)
+		return "nothing new since last checkpoint", nil
 	}
 	title := input.SessionID
 	if title == "" {
 		title = kind
 	}
-	fireAndForgetIngest(cfg, ingestPayload{
+	err = httpPost(ctx, hc, "/v1/ingest", ingestPayload{
 		Kind:    kind,
 		Title:   title,
 		Content: content,
+		User:    hc.User(),
+		Project: hc.Project(),
 		Metadata: map[string]any{
 			"session_id":  input.SessionID,
 			"cwd":         input.CWD,
 			"stop_reason": input.StopReason,
+			"trigger":     input.Trigger,
+			"byte_range":  fmt.Sprintf("%d-%d", offset, next),
 		},
-	})
-	return nil
+	}, nil)
+	if err != nil {
+		return "", err
+	}
+	if err := writeOffset(input.SessionID, input.TranscriptPath, next); err != nil {
+		return fmt.Sprintf("ingested %d bytes, offset not saved", len(content)), err
+	}
+	return fmt.Sprintf("ingested %d new bytes", len(content)), nil
 }
 
-// readTranscript parses Claude Code's JSONL transcript file at path
-// and returns a plain "role: text\n..." rendering of the chat turns.
-// Tool calls and tool results are skipped — the assistant's natural
-// language responses already capture what the tools surfaced. Returns
-// an empty string if the file is empty, malformed, or contains no
-// chat content.
-func readTranscript(path string) (string, error) {
-	if path == "" {
-		return "", nil
-	}
+// readTranscriptFrom renders the chat turns in path starting at offset,
+// returning the text and the new offset.
+//
+// Tool calls and tool results are skipped: the assistant's own prose
+// already says what the tools produced, at a fraction of the tokens.
+func readTranscriptFrom(path string, offset int64) (string, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return "", offset, err
 	}
 	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return "", offset, err
+	}
+	// A transcript that shrank was replaced, so the old offset is
+	// meaningless and we start over.
+	if info.Size() < offset {
+		offset = 0
+	}
+	if info.Size() == offset {
+		return "", offset, nil
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return "", offset, err
+	}
 	raw, err := io.ReadAll(f)
 	if err != nil {
-		return "", err
+		return "", offset, err
 	}
+
+	// Only whole lines are consumed, so a checkpoint landing mid-write
+	// does not corrupt the next read.
+	consumed := len(raw)
+	if i := bytes.LastIndexByte(raw, '\n'); i >= 0 {
+		consumed = i + 1
+	} else {
+		return "", offset, nil // no complete line yet
+	}
+
 	var sb strings.Builder
-	for _, line := range strings.Split(string(raw), "\n") {
+	for _, line := range strings.Split(string(raw[:consumed]), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -338,18 +459,17 @@ func readTranscript(path string) (string, error) {
 		sb.WriteString(text)
 		sb.WriteString("\n")
 	}
-	return strings.TrimSpace(sb.String()), nil
+	return strings.TrimSpace(sb.String()), offset + int64(consumed), nil
 }
 
 // transcriptRecord matches the loose schema Claude Code writes to the
-// transcript JSONL. Each line is either a wrapped Anthropic
-// `message` block (role + content[]) or a top-level `type` indicator.
-// We only care about user / assistant text chunks.
+// transcript JSONL. Each line is either a wrapped message block (role plus
+// content) or a top-level type indicator.
 type transcriptRecord struct {
 	Type    string `json:"type,omitempty"`
 	Message *struct {
-		Role    string            `json:"role,omitempty"`
-		Content json.RawMessage   `json:"content,omitempty"`
+		Role    string          `json:"role,omitempty"`
+		Content json.RawMessage `json:"content,omitempty"`
 	} `json:"message,omitempty"`
 }
 
@@ -368,8 +488,7 @@ func (r transcriptRecord) text() string {
 	if r.Message == nil || len(r.Message.Content) == 0 {
 		return ""
 	}
-	// Content is either a string ("hello") or an array of typed blocks
-	// ([{type:"text", text:"..."}]). Strip everything except text blocks.
+	// Content is either a string or an array of typed blocks. Keep text.
 	var s string
 	if err := json.Unmarshal(r.Message.Content, &s); err == nil {
 		return s
@@ -393,8 +512,7 @@ func (r transcriptRecord) text() string {
 	return sb.String()
 }
 
-// ingestPayload is the host-side mirror of httpapi.IngestRequest. Kept
-// small here so the hook binary doesn't depend on the server package.
+// ingestPayload mirrors httpapi.IngestRequest.
 type ingestPayload struct {
 	Kind         string         `json:"kind"`
 	Title        string         `json:"title,omitempty"`
@@ -405,24 +523,190 @@ type ingestPayload struct {
 	Project      string         `json:"project,omitempty"`
 }
 
-// fireAndForgetIngest pushes content into /v1/ingest with a short
-// deadline. Errors are swallowed — the user's session never blocks on
-// memory work.
-func fireAndForgetIngest(cfg *hostConfig, p ingestPayload) {
-	if strings.TrimSpace(p.Content) == "" {
-		return
-	}
-	p.User = cfg.User
-	p.Project = cfg.Project
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_ = httpPost(ctx, cfg, "/v1/ingest", p, nil)
+// ─── transcript offsets ──────────────────────────────────────────────
+
+type offsetRecord struct {
+	Path    string    `json:"path"`
+	Offset  int64     `json:"offset"`
+	Updated time.Time `json:"updated"`
 }
 
+// offsetFile is the per-session state path. Session ids come from Claude
+// Code and are used in a filename, so they are sanitised.
+func offsetFile(sessionID string) (string, error) {
+	dir, err := offsetsDir()
+	if err != nil {
+		return "", err
+	}
+	name := sanitizeSlug(sessionID)
+	if name == "" {
+		name = "unknown-session"
+	}
+	return filepath.Join(dir, name+".json"), nil
+}
+
+func readOffset(sessionID, transcriptPath string) int64 {
+	path, err := offsetFile(sessionID)
+	if err != nil {
+		return 0
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	var rec offsetRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return 0
+	}
+	// A different transcript under the same session id means the offset
+	// does not apply.
+	if rec.Path != transcriptPath {
+		return 0
+	}
+	return rec.Offset
+}
+
+func writeOffset(sessionID, transcriptPath string, offset int64) error {
+	path, err := offsetFile(sessionID)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(offsetRecord{Path: transcriptPath, Offset: offset, Updated: time.Now().UTC()})
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return err
+	}
+	pruneOffsets()
+	return nil
+}
+
+// pruneOffsets deletes offset files for sessions that ended long ago, so
+// the directory does not grow without bound.
+func pruneOffsets() {
+	dir, err := offsetsDir()
+	if err != nil {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-30 * 24 * time.Hour)
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+	}
+}
+
+// ─── hook log ────────────────────────────────────────────────────────
+
+// hookLogEntry is one line of ~/.anamnesia/hooks.log.
+type hookLogEntry struct {
+	At    time.Time `json:"at"`
+	Verb  string    `json:"verb"`
+	OK    bool      `json:"ok"`
+	Ms    int64     `json:"ms"`
+	Note  string    `json:"note,omitempty"`
+	Error string    `json:"error,omitempty"`
+}
+
+// hookLogMaxBytes caps the log; past it, the oldest half is dropped.
+const hookLogMaxBytes = 512 << 10
+
+// logHook records the outcome of a hook run. Best-effort by design: a hook
+// must not fail because its own logging failed.
+func logHook(verb string, started time.Time, runErr error, note string) {
+	path, err := hookLogPath()
+	if err != nil {
+		return
+	}
+	if _, err := ensureHome(); err != nil {
+		return
+	}
+	entry := hookLogEntry{
+		At:   time.Now().UTC(),
+		Verb: verb,
+		OK:   runErr == nil,
+		Ms:   time.Since(started).Milliseconds(),
+		Note: note,
+	}
+	if runErr != nil {
+		entry.Error = runErr.Error()
+	}
+	raw, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	rotateHookLog(path)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(append(raw, '\n'))
+}
+
+func rotateHookLog(path string) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() < hookLogMaxBytes {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	half := raw[len(raw)/2:]
+	if i := bytes.IndexByte(half, '\n'); i >= 0 {
+		half = half[i+1:]
+	}
+	_ = os.WriteFile(path, half, 0o600)
+}
+
+// readHookLogTail returns the last n entries, newest last.
+func readHookLogTail(n int) ([]hookLogEntry, error) {
+	path, err := hookLogPath()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	var out []hookLogEntry
+	for _, l := range lines {
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		var e hookLogEntry
+		if err := json.Unmarshal([]byte(l), &e); err != nil {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// trimLine takes the first line of s, truncated to at most n runes.
 func trimLine(s string, n int) string {
 	s = strings.SplitN(s, "\n", 2)[0]
-	if len(s) > n {
-		return s[:n] + "…"
+	runes := []rune(s)
+	if len(runes) > n {
+		return string(runes[:n]) + "…"
 	}
 	return s
 }

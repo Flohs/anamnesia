@@ -20,8 +20,8 @@ type fakeBriefingLLM struct {
 	out     string
 }
 
-func (f *fakeBriefingLLM) Model() string                                          { return "fake" }
-func (f *fakeBriefingLLM) Complete(_ context.Context, _ string) (string, error)   { return f.out, nil }
+func (f *fakeBriefingLLM) Model() string                                        { return "fake" }
+func (f *fakeBriefingLLM) Complete(_ context.Context, _ string) (string, error) { return f.out, nil }
 func (f *fakeBriefingLLM) Distill(_ context.Context, in llm.DistillInput, out any) error {
 	f.gotUser = in.User
 	return jsonRoundTrip([]byte(f.out), out)

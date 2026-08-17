@@ -76,9 +76,9 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 	}
 
 	type ranked struct {
-		hit  anamnesia.SearchHit
-		vRk  int
-		lRk  int
+		hit anamnesia.SearchHit
+		vRk int
+		lRk int
 	}
 	byID := map[string]*ranked{}
 

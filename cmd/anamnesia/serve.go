@@ -1,10 +1,18 @@
+// serve.go runs the server, and applies migrations.
+//
+// `anamnesia start` spawns this as a detached background process; it is the
+// same binary, so there is no separate server artifact to install, version
+// or keep in sync.
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,29 +33,78 @@ import (
 var (
 	serveWorkerOnly bool
 	serveNoWorker   bool
+	migrateDims     int
 )
 
 var serveCmd = &cobra.Command{
-	Use:   "serve",
-	Short: "Run the HTTP API + MCP + worker (inside docker-compose)",
+	Use:    "serve",
+	Short:  "Run the HTTP API, MCP endpoint and background worker",
+	Hidden: true,
 	Long: "Run the Anamnesia server: HTTP API on /v1/*, MCP transport on /mcp,\n" +
-		"and the background worker (embed backfill, working-memory expiry).\n" +
-		"All three run in-process by default.",
+		"and the background workers. Normally started for you by\n" +
+		"`anamnesia start`, which runs it detached and captures its log.",
 	RunE: runServe,
 }
 
 var migrateCmd = &cobra.Command{
 	Use:   "migrate",
 	Short: "Apply database migrations and exit",
-	RunE:  runMigrate,
+	Long: "Apply any pending migrations.\n\n" +
+		"With --dims, also rebuild the embedding columns and their ANN indexes\n" +
+		"for a different vector width. That discards stored vectors, because a\n" +
+		"vector cannot be reinterpreted at another width and one produced by a\n" +
+		"different model is not comparable anyway. The embed worker re-embeds\n" +
+		"everything on its next tick.",
+	RunE: runMigrate,
 }
 
 func init() {
 	serveCmd.Flags().BoolVar(&serveWorkerOnly, "worker", false, "run only the background worker")
 	serveCmd.Flags().BoolVar(&serveNoWorker, "no-worker", false, "skip the background worker (HTTP only)")
+	migrateCmd.Flags().IntVar(&migrateDims, "dims", 0, "rebuild the embedding columns at this width")
+}
+
+// applyHostEnv projects ~/.anamnesia/config.toml into this process's
+// environment so config.Load() sees it.
+//
+// `anamnesia start` already hands the server this environment, but running
+// `anamnesia serve` or `anamnesia migrate` by hand has to work too, and
+// requiring the user to export a dozen variables to do so would make the
+// config file a lie.
+func applyHostEnv() (*hostConfig, error) {
+	hc, err := loadHostConfig()
+	if err != nil {
+		return nil, err
+	}
+	for _, kv := range hc.ServerEnv() {
+		name, value, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if err := os.Setenv(name, value); err != nil {
+			return nil, err
+		}
+	}
+	return hc, nil
+}
+
+// openStore dials Postgres and applies migrations.
+func openStore(ctx context.Context, cfg *config.Config) (*store.Store, error) {
+	st, err := store.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := st.Migrate(ctx); err != nil {
+		st.Close()
+		return nil, err
+	}
+	return st, nil
 }
 
 func runServe(cmd *cobra.Command, _ []string) error {
+	if _, err := applyHostEnv(); err != nil {
+		return err
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -58,13 +115,33 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	ctx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	st, err := store.Open(ctx, cfg.DatabaseURL)
+	st, err := openStore(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	if err := st.Migrate(ctx); err != nil {
+
+	// Refuse to serve into a schema that cannot hold what the embedder
+	// produces. Every embedding write would fail, one at a time, in a
+	// background worker nobody is watching.
+	schemaDims, err := st.EmbeddingDims(ctx)
+	if err != nil {
 		return err
+	}
+	if schemaDims != cfg.EmbedDims {
+		return fmt.Errorf(
+			"schema stores vector(%d) but embed.dims is %d, so every embedding write would fail.\n"+
+				"Run `anamnesia migrate --dims %d` to rebuild the schema, or set embed.dims to %d",
+			schemaDims, cfg.EmbedDims, cfg.EmbedDims, schemaDims)
+	}
+	if missing, err := st.MissingANNIndexes(ctx); err == nil && len(missing) > 0 {
+		if store.ANNIndexableDims(schemaDims) {
+			log.Warn("no ANN index on embedding columns, vector search will be a sequential scan",
+				"tables", missing, "fix", fmt.Sprintf("anamnesia migrate --dims %d", schemaDims))
+		} else {
+			log.Warn("embedding width exceeds pgvector's HNSW limit, vector search is a sequential scan",
+				"dims", schemaDims, "limit", 2000)
+		}
 	}
 
 	embKey := cfg.OpenAIAPIKey
@@ -87,6 +164,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		Model:    cfg.LLMModel,
 		APIKey:   llmKey,
 		BaseURL:  cfg.OpenAIBaseURL,
+		Timeout:  cfg.LLMHTTPTimeout,
 	})
 	if err != nil {
 		return err
@@ -105,10 +183,8 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	}
 
 	retr := &retrieval.Engine{Store: st, Embedder: emb, Reranker: reranker}
-
 	briefer := &jobs.Briefer{LLM: llmc}
 
-	// MCP handler
 	mcpHandler := mcp.NewHandler(mcp.Deps{
 		Store:          st,
 		Retrieval:      retr,
@@ -118,7 +194,6 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		DefaultProject: cfg.DefaultProject,
 	})
 
-	// HTTP server
 	srv := httpapi.NewServer(cfg.HTTPAddr, httpapi.Deps{
 		Store:          st,
 		Retrieval:      retr,
@@ -129,9 +204,14 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		DefaultProject: cfg.DefaultProject,
 		ServerToken:    cfg.ServerToken,
 		Log:            log,
+		Version:        version,
+		EmbedProvider:  cfg.EmbedProvider,
+		EmbedModel:     cfg.EmbedModel,
+		EmbedDims:      cfg.EmbedDims,
+		LLMProvider:    cfg.LLMProvider,
+		LLMModel:       cfg.LLMModel,
 	})
 
-	// Worker
 	var workerErr chan error
 	if !serveNoWorker {
 		workerErr = make(chan error, 1)
@@ -176,15 +256,14 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		log.Info("shutdown requested")
 	case err := <-httpErr:
 		log.Error("http server crashed", "err", err)
+		return err
 	}
 
-	// Graceful shutdown.
-	shCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownWait)
-	defer cancel()
+	shCtx, shCancel := context.WithTimeout(context.Background(), cfg.ShutdownWait)
+	defer shCancel()
 	if err := srv.Shutdown(shCtx); err != nil {
 		log.Warn("shutdown", "err", err)
 	}
-	// Drain worker.
 	if workerErr != nil {
 		select {
 		case <-workerErr:
@@ -195,18 +274,69 @@ func runServe(cmd *cobra.Command, _ []string) error {
 }
 
 func runMigrate(cmd *cobra.Command, _ []string) error {
+	ctx := cmd.Context()
+	out := cmd.OutOrStdout()
+
+	hc, err := applyHostEnv()
+	if err != nil {
+		return err
+	}
+	// Migrating a database that is not running is a confusing dial error,
+	// so bring the container up first.
+	if err := ensurePostgres(ctx, hc, out); err != nil {
+		return err
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	st, err := store.Open(cmd.Context(), cfg.DatabaseURL)
+
+	st, err := openStore(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	if err := st.Migrate(cmd.Context()); err != nil {
+
+	v, err := st.MigrationVersion(ctx)
+	if err != nil {
 		return err
 	}
-	rf.log.Info("migrations applied")
+	fmt.Fprintf(out, "✦ schema at version %d\n", v)
+
+	dims := migrateDims
+	if dims == 0 {
+		// Without an explicit width, still reconcile the schema with the
+		// configured one. This is what repairs an install whose columns and
+		// configuration disagree, and what restores ANN indexes.
+		dims = cfg.EmbedDims
+	}
+	current, err := st.EmbeddingDims(ctx)
+	if err != nil {
+		return err
+	}
+	missing, err := st.MissingANNIndexes(ctx)
+	if err != nil {
+		return err
+	}
+	if current == dims && len(missing) == 0 {
+		fmt.Fprintf(out, "✦ embedding columns are vector(%d) with ANN indexes in place\n", dims)
+		return nil
+	}
+	if current != dims {
+		fmt.Fprintf(out, "✦ rebuilding embedding columns: vector(%d) → vector(%d)\n", current, dims)
+		fmt.Fprintln(out, "  stored vectors are discarded and will be re-embedded in the background")
+	} else {
+		fmt.Fprintf(out, "✦ rebuilding missing ANN indexes on %v\n", missing)
+	}
+	if err := st.SetEmbeddingDims(ctx, dims); err != nil {
+		return err
+	}
+	if !store.ANNIndexableDims(dims) {
+		fmt.Fprintf(out, "  note: %d dimensions exceeds pgvector's HNSW limit of 2000, so no ANN index was created and vector search will scan\n", dims)
+	}
+	fmt.Fprintf(out, "✦ embedding columns are now vector(%d)\n", dims)
+	if dims != cfg.EmbedDims {
+		fmt.Fprintf(out, "  remember to set embed.dims to %d: anamnesia config set embed.dims %d\n", dims, dims)
+	}
 	return nil
 }

@@ -46,15 +46,22 @@ type Deps struct {
 	DefaultProject string
 	ServerToken    string // empty = no auth required
 	Log            *slog.Logger
+
+	// Reported by /v1/health so `anamnesia doctor` can compare what is
+	// running against what the caller expects.
+	Version       string
+	EmbedProvider string
+	EmbedModel    string
+	EmbedDims     int
+	LLMProvider   string
+	LLMModel      string
 }
 
 // NewServer returns a configured *http.Server bound to addr.
 func NewServer(addr string, d Deps) *http.Server {
 	mux := http.NewServeMux()
 
-	mux.Handle("/v1/health", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "anamnesia"})
-	}))
+	mux.Handle("/v1/health", http.HandlerFunc(d.handleHealth))
 
 	mux.Handle("/v1/sessions/start", d.protect(http.HandlerFunc(d.handleSessionStart)))
 	mux.Handle("/v1/retrieve", d.protect(http.HandlerFunc(d.handleRetrieve)))
@@ -121,6 +128,104 @@ type statusRecorder struct {
 }
 
 func (s *statusRecorder) WriteHeader(c int) { s.status = c; s.ResponseWriter.WriteHeader(c) }
+
+// ─── health ──────────────────────────────────────────────────────────
+
+// HealthResponse is what /v1/health reports. It is deliberately more than
+// a liveness ping: a health check that cannot fail while the product is
+// broken is worse than no health check, because it converts a real fault
+// into a green light. Everything here is something that has silently
+// broken an install before.
+type HealthResponse struct {
+	OK      bool   `json:"ok"`
+	Service string `json:"service"`
+	Version string `json:"version,omitempty"`
+
+	Database         string `json:"database"`          // "ok" or the dial error
+	MigrationVersion int64  `json:"migration_version"` // goose schema version
+
+	// SchemaEmbedDims is the width the tables are built for;
+	// ConfiguredEmbedDims is what the embedder will produce. When they
+	// disagree every embedding write fails, so it is a hard failure.
+	SchemaEmbedDims     int    `json:"schema_embed_dims"`
+	ConfiguredEmbedDims int    `json:"configured_embed_dims"`
+	EmbedProvider       string `json:"embed_provider,omitempty"`
+	EmbedModel          string `json:"embed_model,omitempty"`
+	LLMProvider         string `json:"llm_provider,omitempty"`
+	LLMModel            string `json:"llm_model,omitempty"`
+
+	// MissingANNIndexes names embedding tables with no ANN index, which
+	// means vector search there is a sequential scan.
+	MissingANNIndexes []string `json:"missing_ann_indexes,omitempty"`
+
+	// Problems lists every reason OK is false, in plain language.
+	Problems []string `json:"problems,omitempty"`
+}
+
+func (d Deps) handleHealth(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	resp := HealthResponse{
+		OK:                  true,
+		Service:             "anamnesia",
+		Version:             d.Version,
+		ConfiguredEmbedDims: d.EmbedDims,
+		EmbedProvider:       d.EmbedProvider,
+		EmbedModel:          d.EmbedModel,
+		LLMProvider:         d.LLMProvider,
+		LLMModel:            d.LLMModel,
+	}
+	problem := func(format string, a ...any) {
+		resp.OK = false
+		resp.Problems = append(resp.Problems, fmt.Sprintf(format, a...))
+	}
+
+	if d.Store == nil || d.Store.Pool == nil {
+		problem("no database configured")
+		writeJSON(w, http.StatusServiceUnavailable, resp)
+		return
+	}
+	if err := d.Store.Pool.Ping(ctx); err != nil {
+		resp.Database = err.Error()
+		problem("cannot reach postgres: %v", err)
+		writeJSON(w, http.StatusServiceUnavailable, resp)
+		return
+	}
+	resp.Database = "ok"
+
+	if v, err := d.Store.MigrationVersion(ctx); err != nil {
+		problem("cannot read schema version: %v", err)
+	} else {
+		resp.MigrationVersion = v
+	}
+
+	if dims, err := d.Store.EmbeddingDims(ctx); err != nil {
+		problem("cannot read schema embedding width: %v", err)
+	} else {
+		resp.SchemaEmbedDims = dims
+		if d.EmbedDims > 0 && dims != d.EmbedDims {
+			problem("schema stores vector(%d) but embed.dims is %d, so every embedding write fails; run `anamnesia migrate --dims %d`",
+				dims, d.EmbedDims, d.EmbedDims)
+		}
+	}
+
+	if missing, err := d.Store.MissingANNIndexes(ctx); err != nil {
+		problem("cannot list ANN indexes: %v", err)
+	} else if len(missing) > 0 {
+		resp.MissingANNIndexes = missing
+		if store.ANNIndexableDims(resp.SchemaEmbedDims) {
+			problem("no ANN index on %s, so vector search is a sequential scan; run `anamnesia migrate --dims %d`",
+				strings.Join(missing, ", "), resp.SchemaEmbedDims)
+		}
+	}
+
+	status := http.StatusOK
+	if !resp.OK {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, resp)
+}
 
 // ─── handlers ────────────────────────────────────────────────────────
 
@@ -454,10 +559,19 @@ func (d Deps) handleIngest(w http.ResponseWriter, r *http.Request) {
 	// PII scrub at ingest. If the user wants the raw content preserved
 	// (preserve_raw=true), we still scrub — the tags survive but the
 	// raw text doesn't.
+	//
+	// A scrub failure is not fatal (dropping the ingest would lose the
+	// memory outright) but it must be visible: the content lands
+	// unredacted, which is exactly the thing the detector exists to
+	// prevent.
 	content := req.Content
 	if d.PII != nil {
 		cleaned, _, err := d.PII.Scrub(r.Context(), content)
-		if err == nil {
+		if err != nil {
+			if d.Log != nil {
+				d.Log.Warn("ingest: PII scrub failed, storing content unredacted", "err", err)
+			}
+		} else {
 			content = cleaned
 		}
 	}
@@ -528,7 +642,7 @@ type ExperienceRequest struct {
 	Project      string         `json:"project,omitempty"`
 	Title        string         `json:"title,omitempty"`
 	Body         string         `json:"body"`
-	Kind         string         `json:"kind,omitempty"`        // case | strategy | hybrid (default: case)
+	Kind         string         `json:"kind,omitempty"` // case | strategy | hybrid (default: case)
 	Topic        string         `json:"topic,omitempty"`
 	Participants []string       `json:"participants,omitempty"`
 	OccurredAt   *time.Time     `json:"occurred_at,omitempty"`
@@ -559,7 +673,11 @@ func (d Deps) handleExperience(w http.ResponseWriter, r *http.Request) {
 	var piiTags []string
 	if d.PII != nil {
 		cleaned, tags, err := d.PII.Scrub(r.Context(), body)
-		if err == nil {
+		if err != nil {
+			if d.Log != nil {
+				d.Log.Warn("experience: PII scrub failed, storing body unredacted", "err", err)
+			}
+		} else {
 			body = cleaned
 			piiTags = tags
 		}
@@ -851,4 +969,3 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
-

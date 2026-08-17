@@ -1,5 +1,16 @@
-// Package config loads runtime configuration from environment
+// Package config loads the server's runtime configuration from environment
 // variables. Single-tenant edition: no OAuth, no JWKS, no tenant slugs.
+//
+// On the host side the user edits ~/.anamnesia/config.toml and `anamnesia
+// start` translates it into this environment for the server process, so
+// this package stays the single place where a server setting is defined.
+// Setting an ANAMNESIA_* variable directly still works and still wins,
+// which is what keeps one-off overrides and CI runs simple.
+//
+// Malformed values are errors, never silent fallbacks: a typo in a
+// duration or a dimension count used to be swallowed and replaced by the
+// default, which is exactly the class of misconfiguration that is
+// impossible to diagnose later.
 package config
 
 import (
@@ -11,52 +22,49 @@ import (
 	"time"
 )
 
-// Config is the resolved runtime configuration. Environment variables
-// are read in Load(); zero values use sane defaults.
+// Config is the resolved runtime configuration.
 type Config struct {
 	// Server
-	HTTPAddr     string        // ANAMNESIA_HTTP_ADDR (default ":8181")
+	HTTPAddr     string        // ANAMNESIA_HTTP_ADDR (default "127.0.0.1:8181")
 	ServerToken  string        // ANAMNESIA_SERVER_TOKEN (optional shared secret for /v1 + /mcp)
-	WorkerInProc bool          // ANAMNESIA_WORKER_IN_PROCESS (default true)
 	ShutdownWait time.Duration // ANAMNESIA_SHUTDOWN_WAIT (default 30s)
 
 	// Database
 	DatabaseURL string // ANAMNESIA_DATABASE_URL (required)
 
-	// Default identity. When the HTTP API receives a request without an
-	// override header, use these.
+	// Default identity, used when a request carries no override.
 	DefaultUser    string // ANAMNESIA_DEFAULT_USER (default "default")
 	DefaultProject string // ANAMNESIA_DEFAULT_PROJECT (optional)
 
 	// Embeddings
-	EmbedProvider string // "openai" | "openrouter" | "stub" (default depends on OPENROUTER_API_KEY)
-	EmbedModel    string // ANAMNESIA_EMBED_MODEL (default depends on provider)
+	EmbedProvider string // "openai" | "openrouter" | "stub"
+	EmbedModel    string // ANAMNESIA_EMBED_MODEL
 	EmbedDims     int    // ANAMNESIA_EMBED_DIMS (default 1536)
 	OpenAIAPIKey  string // OPENAI_API_KEY
-	OpenAIBaseURL string // OPENAI_BASE_URL (default https://api.openai.com/v1)
+	OpenAIBaseURL string // OPENAI_BASE_URL
 
-	// LLM (consolidation + extraction worker)
-	LLMProvider     string // "anthropic" | "openai" | "openrouter" | "stub" (default depends on OPENROUTER_API_KEY)
-	LLMModel        string // ANAMNESIA_LLM_MODEL (default depends on provider)
-	AnthropicAPIKey string // ANTHROPIC_API_KEY
+	// LLM (extraction + consolidation workers)
+	LLMProvider     string        // "anthropic" | "openai" | "openrouter" | "stub"
+	LLMModel        string        // ANAMNESIA_LLM_MODEL
+	LLMHTTPTimeout  time.Duration // ANAMNESIA_LLM_HTTP_TIMEOUT (default 120s)
+	AnthropicAPIKey string        // ANTHROPIC_API_KEY
 
 	// Reranker
-	RerankProvider string // "" | "none" | "cohere" | "openrouter" (default depends on OPENROUTER_API_KEY)
-	RerankModel    string // ANAMNESIA_RERANK_MODEL (default depends on provider)
+	RerankProvider string // "" | "none" | "cohere" | "openrouter"
+	RerankModel    string // ANAMNESIA_RERANK_MODEL
 	CohereAPIKey   string // COHERE_API_KEY
 
-	// OpenRouter
-	// One API key + one base URL fronts chat, embeddings, and rerank.
+	// OpenRouter. One key and base URL fronts chat, embeddings and rerank.
 	// When OPENROUTER_API_KEY is set and no other provider is explicitly
-	// chosen, all three workloads auto-default to "openrouter".
+	// chosen, all three workloads default to "openrouter".
 	OpenRouterAPIKey string // OPENROUTER_API_KEY
 
 	// PII detector
-	PIIProvider    string // "" | "none" | "regex" | "presidio" (default "regex")
-	PIIMode        string // "tag" | "redact" (default "tag")
-	PresidioURL    string // ANAMNESIA_PRESIDIO_URL
+	PIIProvider string // "" | "none" | "regex" | "presidio" (default "regex")
+	PIIMode     string // "tag" | "redact" (default "tag")
+	PresidioURL string // ANAMNESIA_PRESIDIO_URL
 
-	// Worker
+	// Worker cadences
 	ConsolidateEvery time.Duration // ANAMNESIA_CONSOLIDATE_EVERY (default 24h)
 	ForgetEvery      time.Duration // ANAMNESIA_FORGET_EVERY (default 1h)
 	DecayEvery       time.Duration // ANAMNESIA_DECAY_EVERY (default 1h)
@@ -64,89 +72,145 @@ type Config struct {
 	EmbedBackfill    time.Duration // ANAMNESIA_EMBED_BACKFILL (default 1m)
 
 	// ExtractCommitments lets the extractor emit ADD_COMMITMENT ops.
-	// ANAMNESIA_EXTRACT_COMMITMENTS (default false).
-	ExtractCommitments bool
+	ExtractCommitments bool // ANAMNESIA_EXTRACT_COMMITMENTS (default false)
 }
 
-// Load reads the environment and produces a Config.
-func Load() (*Config, error) {
-	orKey := os.Getenv("OPENROUTER_API_KEY")
-	hasOR := strings.TrimSpace(orKey) != ""
+// DefaultEmbedDims is the shipped embedding width. It matches
+// text-embedding-3-small and the schema built by the migrations.
+const DefaultEmbedDims = 1536
 
-	// Provider auto-light-up: with OPENROUTER_API_KEY set, every workload
-	// whose provider env var is unset defaults to "openrouter". Explicit
-	// settings (including "stub" / "none") win.
+// Load reads the environment and produces a Config. Every parse failure is
+// reported rather than defaulted, and all of them are collected so one run
+// surfaces every problem instead of one per attempt.
+func Load() (*Config, error) {
+	var errs []string
+	fail := func(format string, a ...any) { errs = append(errs, fmt.Sprintf(format, a...)) }
+
+	str := func(key, def string) string {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+		return def
+	}
+	dur := func(key string, def time.Duration) time.Duration {
+		v := strings.TrimSpace(os.Getenv(key))
+		if v == "" {
+			return def
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			fail("%s=%q is not a duration (try %q)", key, v, def.String())
+			return def
+		}
+		if d <= 0 {
+			fail("%s=%q must be positive", key, v)
+			return def
+		}
+		return d
+	}
+	num := func(key string, def int) int {
+		v := strings.TrimSpace(os.Getenv(key))
+		if v == "" {
+			return def
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			fail("%s=%q is not a number", key, v)
+			return def
+		}
+		if n <= 0 {
+			fail("%s=%q must be positive", key, v)
+			return def
+		}
+		return n
+	}
+	boolean := func(key string, def bool) bool {
+		v := strings.TrimSpace(os.Getenv(key))
+		if v == "" {
+			return def
+		}
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			fail("%s=%q is not a boolean (true/false)", key, v)
+			return def
+		}
+		return b
+	}
+
+	orKey := strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY"))
+	hasOR := orKey != ""
+
 	embedProvider := providerDefault(os.Getenv("ANAMNESIA_EMBED_PROVIDER"), hasOR, "openrouter", "stub")
 	llmProvider := providerDefault(os.Getenv("ANAMNESIA_LLM_PROVIDER"), hasOR, "openrouter", "stub")
 	rerankProvider := providerDefault(os.Getenv("ANAMNESIA_RERANK_PROVIDER"), hasOR, "openrouter", "none")
 
 	c := &Config{
-		HTTPAddr:         getenv("ANAMNESIA_HTTP_ADDR", ":8181"),
+		HTTPAddr:         str("ANAMNESIA_HTTP_ADDR", "127.0.0.1:8181"),
 		ServerToken:      os.Getenv("ANAMNESIA_SERVER_TOKEN"),
-		WorkerInProc:     parseBool(os.Getenv("ANAMNESIA_WORKER_IN_PROCESS"), true),
-		ShutdownWait:     parseDuration(os.Getenv("ANAMNESIA_SHUTDOWN_WAIT"), 30*time.Second),
+		ShutdownWait:     dur("ANAMNESIA_SHUTDOWN_WAIT", 30*time.Second),
 		DatabaseURL:      os.Getenv("ANAMNESIA_DATABASE_URL"),
-		DefaultUser:      getenv("ANAMNESIA_DEFAULT_USER", "default"),
+		DefaultUser:      str("ANAMNESIA_DEFAULT_USER", "default"),
 		DefaultProject:   os.Getenv("ANAMNESIA_DEFAULT_PROJECT"),
 		EmbedProvider:    embedProvider,
-		EmbedModel:       getenv("ANAMNESIA_EMBED_MODEL", defaultEmbedModel(embedProvider)),
-		EmbedDims:        parseInt(os.Getenv("ANAMNESIA_EMBED_DIMS"), 1536),
+		EmbedModel:       str("ANAMNESIA_EMBED_MODEL", defaultEmbedModel(embedProvider)),
+		EmbedDims:        num("ANAMNESIA_EMBED_DIMS", DefaultEmbedDims),
 		OpenAIAPIKey:     os.Getenv("OPENAI_API_KEY"),
-		OpenAIBaseURL:    getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+		OpenAIBaseURL:    str("OPENAI_BASE_URL", "https://api.openai.com/v1"),
 		LLMProvider:      llmProvider,
-		LLMModel:         getenv("ANAMNESIA_LLM_MODEL", defaultLLMModel(llmProvider)),
+		LLMModel:         str("ANAMNESIA_LLM_MODEL", defaultLLMModel(llmProvider)),
+		LLMHTTPTimeout:   dur("ANAMNESIA_LLM_HTTP_TIMEOUT", 120*time.Second),
 		AnthropicAPIKey:  os.Getenv("ANTHROPIC_API_KEY"),
 		RerankProvider:   rerankProvider,
-		RerankModel:      getenv("ANAMNESIA_RERANK_MODEL", defaultRerankModel(rerankProvider)),
+		RerankModel:      str("ANAMNESIA_RERANK_MODEL", defaultRerankModel(rerankProvider)),
 		CohereAPIKey:     os.Getenv("COHERE_API_KEY"),
 		OpenRouterAPIKey: orKey,
-		PIIProvider:      getenv("ANAMNESIA_PII_PROVIDER", "regex"),
-		PIIMode:          getenv("ANAMNESIA_PII_MODE", "tag"),
+		PIIProvider:      str("ANAMNESIA_PII_PROVIDER", "regex"),
+		PIIMode:          str("ANAMNESIA_PII_MODE", "tag"),
 		PresidioURL:      os.Getenv("ANAMNESIA_PRESIDIO_URL"),
-		ConsolidateEvery: parseDuration(os.Getenv("ANAMNESIA_CONSOLIDATE_EVERY"), 24*time.Hour),
-		ForgetEvery:      parseDuration(os.Getenv("ANAMNESIA_FORGET_EVERY"), time.Hour),
-		DecayEvery:       parseDuration(os.Getenv("ANAMNESIA_DECAY_EVERY"), time.Hour),
-		ExtractEvery:     parseDuration(os.Getenv("ANAMNESIA_EXTRACT_EVERY"), 15*time.Second),
-		EmbedBackfill:    parseDuration(os.Getenv("ANAMNESIA_EMBED_BACKFILL"), time.Minute),
+		ConsolidateEvery: dur("ANAMNESIA_CONSOLIDATE_EVERY", 24*time.Hour),
+		ForgetEvery:      dur("ANAMNESIA_FORGET_EVERY", time.Hour),
+		DecayEvery:       dur("ANAMNESIA_DECAY_EVERY", time.Hour),
+		ExtractEvery:     dur("ANAMNESIA_EXTRACT_EVERY", 15*time.Second),
+		EmbedBackfill:    dur("ANAMNESIA_EMBED_BACKFILL", time.Minute),
 
-		ExtractCommitments: parseBool(os.Getenv("ANAMNESIA_EXTRACT_COMMITMENTS"), false),
+		ExtractCommitments: boolean("ANAMNESIA_EXTRACT_COMMITMENTS", false),
 	}
 
 	if strings.TrimSpace(c.DatabaseURL) == "" {
-		return nil, errors.New("ANAMNESIA_DATABASE_URL is required")
+		fail("ANAMNESIA_DATABASE_URL is required")
 	}
 
-	if c.EmbedProvider == "openai" && c.OpenAIAPIKey == "" {
-		return nil, errors.New("OPENAI_API_KEY is required when ANAMNESIA_EMBED_PROVIDER=openai")
-	}
-	if c.EmbedProvider == "openrouter" && c.OpenRouterAPIKey == "" {
-		return nil, errors.New("OPENROUTER_API_KEY is required when ANAMNESIA_EMBED_PROVIDER=openrouter")
-	}
-	if c.LLMProvider == "anthropic" && c.AnthropicAPIKey == "" {
-		return nil, errors.New("ANTHROPIC_API_KEY is required when ANAMNESIA_LLM_PROVIDER=anthropic")
-	}
-	if c.LLMProvider == "openai" && c.OpenAIAPIKey == "" {
-		return nil, errors.New("OPENAI_API_KEY is required when ANAMNESIA_LLM_PROVIDER=openai")
-	}
-	if c.LLMProvider == "openrouter" && c.OpenRouterAPIKey == "" {
-		return nil, errors.New("OPENROUTER_API_KEY is required when ANAMNESIA_LLM_PROVIDER=openrouter")
-	}
-	if c.RerankProvider == "cohere" && c.CohereAPIKey == "" {
-		return nil, errors.New("COHERE_API_KEY is required when ANAMNESIA_RERANK_PROVIDER=cohere")
-	}
-	if c.RerankProvider == "openrouter" && c.OpenRouterAPIKey == "" {
-		return nil, errors.New("OPENROUTER_API_KEY is required when ANAMNESIA_RERANK_PROVIDER=openrouter")
-	}
-	if c.PIIProvider == "presidio" && c.PresidioURL == "" {
-		return nil, errors.New("ANAMNESIA_PRESIDIO_URL is required when ANAMNESIA_PII_PROVIDER=presidio")
+	// Each provider needs its key. Checked here so the failure names the
+	// missing variable instead of surfacing as a 401 during a background
+	// worker tick hours later.
+	for _, need := range []struct {
+		when   bool
+		envVar string
+		why    string
+	}{
+		{c.EmbedProvider == "openai", "OPENAI_API_KEY", "embed.provider=openai"},
+		{c.EmbedProvider == "openrouter", "OPENROUTER_API_KEY", "embed.provider=openrouter"},
+		{c.LLMProvider == "anthropic", "ANTHROPIC_API_KEY", "llm.provider=anthropic"},
+		{c.LLMProvider == "openai", "OPENAI_API_KEY", "llm.provider=openai"},
+		{c.LLMProvider == "openrouter", "OPENROUTER_API_KEY", "llm.provider=openrouter"},
+		{c.RerankProvider == "cohere", "COHERE_API_KEY", "rerank.provider=cohere"},
+		{c.RerankProvider == "openrouter", "OPENROUTER_API_KEY", "rerank.provider=openrouter"},
+		{c.PIIProvider == "presidio", "ANAMNESIA_PRESIDIO_URL", "pii.provider=presidio"},
+	} {
+		if need.when && strings.TrimSpace(os.Getenv(need.envVar)) == "" {
+			fail("%s is required when %s", need.envVar, need.why)
+		}
 	}
 
+	if len(errs) > 0 {
+		return nil, errors.New("configuration: " + strings.Join(errs, "; "))
+	}
 	return c, nil
 }
 
 // providerDefault picks the default provider value. Explicit settings
-// (anything non-empty, including "stub" or "none") win unconditionally;
-// when nothing is set, return ifOR if the auto-light-up condition is true
+// (anything non-empty, including "stub" / "none") win unconditionally;
+// when nothing is set, return ifOR if the auto-light-up condition holds
 // and otherwise the plain default.
 func providerDefault(explicit string, autoOR bool, ifOR, plain string) string {
 	if v := strings.TrimSpace(explicit); v != "" {
@@ -158,8 +222,8 @@ func providerDefault(explicit string, autoOR bool, ifOR, plain string) string {
 	return plain
 }
 
-// defaultLLMModel picks a sensible default per provider so the user
-// only needs to set the provider + key to get going.
+// defaultLLMModel picks a sensible default per provider so the user only
+// needs to set the provider and key to get going.
 func defaultLLMModel(provider string) string {
 	switch provider {
 	case "anthropic":
@@ -167,8 +231,8 @@ func defaultLLMModel(provider string) string {
 	case "openai":
 		return "gpt-4o-mini"
 	case "openrouter":
-		// OpenRouter slugs use dot-separated versions (vs Anthropic's
-		// dash-separated direct-API names).
+		// OpenRouter slugs use dot-separated versions, unlike Anthropic's
+		// dash-separated direct-API names.
 		return "anthropic/claude-sonnet-4.6"
 	default:
 		return "stub"
@@ -195,56 +259,13 @@ func defaultRerankModel(provider string) string {
 	}
 }
 
-func getenv(k, d string) string {
-	if v := strings.TrimSpace(os.Getenv(k)); v != "" {
-		return v
-	}
-	return d
-}
-
-func parseBool(v string, def bool) bool {
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return def
-	}
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return def
-	}
-	return b
-}
-
-func parseInt(v string, def int) int {
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return def
-	}
-	return n
-}
-
-func parseDuration(v string, def time.Duration) time.Duration {
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		return def
-	}
-	return d
-}
-
 // String returns a redacted single-line summary suitable for logs.
 func (c *Config) String() string {
 	return fmt.Sprintf(
-		"http=%s db=%s embed=%s/%s/%d llm=%s/%s",
+		"http=%s db=%s embed=%s/%s/%d llm=%s/%s rerank=%s",
 		c.HTTPAddr, redact(c.DatabaseURL),
 		c.EmbedProvider, c.EmbedModel, c.EmbedDims,
-		c.LLMProvider, c.LLMModel,
+		c.LLMProvider, c.LLMModel, c.RerankProvider,
 	)
 }
 

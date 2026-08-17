@@ -41,7 +41,7 @@ any agent in any language that speaks MCP can dock the same way.
 
 ```bash
 # 1. Anamnesia must be up:
-(cd ../.. && ./bin/anamnesia up)
+(cd ../.. && ./bin/anamnesia start)
 
 # 2. Optionally seed a persona so the agent has a voice:
 curl -sS http://localhost:8181/mcp/ -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"anamnesia_facts_upsert","arguments":{"key":"user.persona.system_prompt","value":{"v":"Be terse and concrete."},"scope":"user"}}}'

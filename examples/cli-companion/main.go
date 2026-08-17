@@ -5,7 +5,9 @@
 //
 // Boot:   anamnesia_identity (persona) + anamnesia_capabilities (tools).
 // Turn:   anamnesia_search (context) -> LLM -> anamnesia_commitments_record
-//         if the reply contains a promise.
+//
+//	if the reply contains a promise.
+//
 // Exit:   anamnesia_ingest (whole transcript) so the kernel can extract.
 //
 // The LLM step uses the Anthropic Messages API over raw HTTP when

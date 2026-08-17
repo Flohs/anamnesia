@@ -261,13 +261,13 @@ func (s *Store) Neighbors(ctx context.Context, src uuid.UUID, kinds []string, di
 	)
 	for rows.Next() {
 		var (
-			ent      anamnesia.Entity
-			project  *uuid.UUID
-			propsRaw []byte
-			edge     anamnesia.Edge
+			ent       anamnesia.Entity
+			project   *uuid.UUID
+			propsRaw  []byte
+			edge      anamnesia.Edge
 			edgeProps []byte
-			validTo  *time.Time
-			invalid  *time.Time
+			validTo   *time.Time
+			invalid   *time.Time
 		)
 		if err := rows.Scan(
 			&ent.ID, &ent.Scope.UserID, &project, &ent.Kind, &ent.Name, &propsRaw, &ent.CreatedAt,

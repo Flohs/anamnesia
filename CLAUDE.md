@@ -1,18 +1,47 @@
 # Anamnesia
 
-Local-first long-term memory for AI agents. Single Go binary, single Postgres,
-single MCP endpoint. The same binary runs the server (inside docker) and the
-Claude Code hooks (on the host).
+Local-first long-term memory for Claude Code. One Go binary, one Postgres
+container, one config file.
+
+The binary is the CLI, the Claude Code hooks, and the server. All three are
+the same executable running on the host, so they cannot end up on different
+versions. The only containerised part is Postgres, which the binary manages
+itself through the `docker` CLI: there is no compose file and no Anamnesia
+image.
+
+## Layout
+
+- `cmd/anamnesia`: CLI, hooks, server entrypoint.
+  - `settings.go`: **every** setting, declared once. Drives the generated
+    config file, `anamnesia config`, validation, and the server's
+    environment. Add settings here and nowhere else.
+  - `hostconfig.go`: resolution (flags > env > project file > global file >
+    defaults) and comment-preserving writes.
+  - `docker.go` / `stack.go`: the Postgres container and the server process.
+  - `install.go`: patches Claude Code's `settings.json` and MCP config.
+  - `hook.go`: the four hooks.
+  - `doctor.go`: install verification; exits non-zero on failure.
+- `internal/`: store, retrieval, extraction, workers, HTTP, MCP.
+- `~/.anamnesia/`: user state: `config.toml`, `server.log`, `server.pid`,
+  `hooks.log`, `offsets/`. Override the root with `ANAMNESIA_HOME` (this is
+  what the tests use).
 
 ## What it does
 
-Anything pushed to `POST /v1/ingest` (or the `anamnesia_ingest` MCP tool, or
-the `UserPromptSubmit` hook in the background) lands as a `sources` row.
-A background extractor reads pending sources, runs a surprise gate, fetches
-top-K similar memories, asks the LLM for `ADD_FACT / UPDATE_FACT /
-DELETE_FACT / ADD_EXPERIENCE / NOOP` operations, and executes them. Default
-is NOOP — most chat is noise; we don't save the conversation, we extract
-what matters. Raw `sources.raw_content` TTLs out in 7 days.
+Four hooks: `SessionStart` loads memory into the session,
+`UserPromptSubmit` retrieves for the prompt, and `PreCompact` and
+`SessionEnd` checkpoint the conversation. Checkpoints are **incremental**:
+a per-session byte offset in `~/.anamnesia/offsets/` means each one sends
+only what was added since the last. (`Stop` must not be used for this: it
+fires after every assistant turn, which made ingest quadratic in session
+length.)
+
+A checkpoint, `POST /v1/ingest`, or the `anamnesia_ingest` MCP tool lands as
+a `sources` row. A background extractor reads pending sources, runs a
+surprise gate, fetches top-K similar memories, asks the LLM for `ADD_FACT /
+UPDATE_FACT / DELETE_FACT / ADD_EXPERIENCE / NOOP` operations, and executes
+them. Default is NOOP, because most chat is noise; we don't save the conversation,
+we extract what matters. Raw `sources.raw_content` TTLs out in 7 days.
 
 Memory model — five typed domains:
 - `facts` — keyed claims (preferences, project config).
@@ -24,6 +53,36 @@ Memory model — five typed domains:
 
 Retrieval: pgvector ANN + tsvector lexical, RRF-fused, optional Cohere rerank,
 decay-aware scoring on experiences (`relevance` recomputed hourly).
+
+## Invariants worth not breaking
+
+- **The schema width and `embed.dims` must agree.** A mismatch makes every
+  embedding write fail. `serve` refuses to boot on a mismatch; `migrate
+  --dims N` is the repair. This shipped broken once.
+- **`install` owns any hook running `anamnesia hook`**, not only entries
+  carrying the `_anamnesia_managed` marker. Keying off the marker alone
+  appended a second copy of every hook for anyone upgrading.
+- **Hooks are written with the absolute binary path.** The shell Claude Code
+  spawns often lacks `/usr/local/bin` on its PATH.
+- **Hooks never break a session**: they exit 0 whatever happens, and record
+  the outcome in `hooks.log` so `doctor` can report a hook that silently
+  fails every turn.
+- **Never default silently.** A bad config value is an error naming the
+  setting, not a quiet fallback.
+- **`/v1/health` must be able to fail.** It checks the database, schema
+  version, embedding width and ANN indexes. A health check that cannot fail
+  turns a broken install into a green light.
+
+## Verifying a change
+
+```bash
+make lint                                   # gofmt, vet, tests
+export ANAMNESIA_HOME=/tmp/anamnesia-dev    # never touch the real install
+./bin/anamnesia setup --no-hooks --no-start
+./bin/anamnesia start && ./bin/anamnesia doctor --deep
+```
+
+Go may not be installed on the host; run the toolchain in a container if so.
 
 ## Behavioral guidelines
 

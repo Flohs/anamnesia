@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Formatting, vet and unit tests. No database and no Docker needed: the
+  # tests that matter for install correctness run against temporary
+  # directories, which is why they can gate every pull request.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -s -l .)
+          if [ -n "$out" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race ./...
+
+      - name: build
+        run: go build ./...
+
+  # Bring the real thing up the way a user does, and let doctor decide
+  # whether it worked. This is the check that would have caught the schema
+  # shipping at a width the default embedder could not write.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: make build
+
+      - name: setup, start and verify
+        env:
+          ANAMNESIA_HOME: ${{ runner.temp }}/anamnesia
+        run: |
+          set -euo pipefail
+          ./bin/anamnesia setup --no-hooks --no-start
+          ./bin/anamnesia install --config-dir "$ANAMNESIA_HOME/claude"
+          ./bin/anamnesia start
+          # --deep writes and reads back a memory, so a schema that cannot
+          # hold an embedding fails here rather than in a user's session.
+          ./bin/anamnesia doctor --config-dir "$ANAMNESIA_HOME/claude" --deep
+
+      - name: re-running setup must not duplicate hooks
+        env:
+          ANAMNESIA_HOME: ${{ runner.temp }}/anamnesia
+        run: |
+          set -euo pipefail
+          ./bin/anamnesia install --config-dir "$ANAMNESIA_HOME/claude"
+          ./bin/anamnesia install --config-dir "$ANAMNESIA_HOME/claude"
+          ./bin/anamnesia doctor --config-dir "$ANAMNESIA_HOME/claude"
+
+      - name: update must be a no-op on a current install
+        env:
+          ANAMNESIA_HOME: ${{ runner.temp }}/anamnesia
+        run: |
+          set -euo pipefail
+          ./bin/anamnesia update --no-pull --no-hooks
+          ./bin/anamnesia doctor --config-dir "$ANAMNESIA_HOME/claude"
+
+      - name: server log on failure
+        if: failure()
+        env:
+          ANAMNESIA_HOME: ${{ runner.temp }}/anamnesia
+        run: cat "$ANAMNESIA_HOME/server.log" || true

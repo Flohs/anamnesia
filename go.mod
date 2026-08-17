@@ -3,6 +3,7 @@ module github.com/flohs/anamnesia-open-source
 go 1.25.7
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/mark3labs/mcp-go v0.52.0

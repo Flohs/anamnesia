@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 )
@@ -57,6 +56,20 @@ type Config struct {
 	Model    string
 	APIKey   string
 	BaseURL  string // OpenAI-compatible endpoints only
+	// Timeout is the per-request HTTP timeout. Zero means the default
+	// below, which is generous enough for hosted APIs; a local Ollama
+	// with a cold model can need far more on its first call.
+	Timeout time.Duration
+}
+
+// defaultLLMTimeout applies when Config.Timeout is unset.
+const defaultLLMTimeout = 120 * time.Second
+
+func (c Config) timeout() time.Duration {
+	if c.Timeout > 0 {
+		return c.Timeout
+	}
+	return defaultLLMTimeout
 }
 
 // New returns a Client for the configured provider.
@@ -66,7 +79,7 @@ func New(cfg Config) (Client, error) {
 		if cfg.APIKey == "" {
 			return nil, errors.New("anthropic: ANTHROPIC_API_KEY required")
 		}
-		return &anthropic{apiKey: cfg.APIKey, model: cfg.Model}, nil
+		return &anthropic{apiKey: cfg.APIKey, model: cfg.Model, timeout: cfg.timeout()}, nil
 	case "openai":
 		if cfg.APIKey == "" {
 			return nil, errors.New("openai: OPENAI_API_KEY required")
@@ -75,7 +88,7 @@ func New(cfg Config) (Client, error) {
 		if baseURL == "" {
 			baseURL = "https://api.openai.com/v1"
 		}
-		return &openaiLLM{apiKey: cfg.APIKey, baseURL: baseURL, model: cfg.Model}, nil
+		return &openaiLLM{apiKey: cfg.APIKey, baseURL: baseURL, model: cfg.Model, timeout: cfg.timeout()}, nil
 	case "openrouter":
 		if cfg.APIKey == "" {
 			return nil, errors.New("openrouter: OPENROUTER_API_KEY required")
@@ -85,6 +98,7 @@ func New(cfg Config) (Client, error) {
 			baseURL:      OpenRouterBaseURL,
 			model:        cfg.Model,
 			extraHeaders: OpenRouterHeaders(),
+			timeout:      cfg.timeout(),
 		}, nil
 	case "stub", "":
 		return &stubLLM{model: "stub"}, nil
@@ -131,16 +145,17 @@ func (s *stubLLM) Extract(_ context.Context, in DistillInput, out any) error {
 }
 
 type anthropic struct {
-	apiKey string
-	model  string
-	hc     *http.Client
+	apiKey  string
+	model   string
+	timeout time.Duration
+	hc      *http.Client
 }
 
 func (a *anthropic) Model() string { return a.model }
 
 func (a *anthropic) client() *http.Client {
 	if a.hc == nil {
-		a.hc = &http.Client{Timeout: clientTimeout()}
+		a.hc = &http.Client{Timeout: a.timeout}
 	}
 	return a.hc
 }
@@ -258,6 +273,7 @@ type openaiLLM struct {
 	baseURL      string
 	model        string
 	extraHeaders map[string]string
+	timeout      time.Duration
 	hc           *http.Client
 }
 
@@ -265,22 +281,9 @@ func (o *openaiLLM) Model() string { return o.model }
 
 func (o *openaiLLM) client() *http.Client {
 	if o.hc == nil {
-		o.hc = &http.Client{Timeout: clientTimeout()}
+		o.hc = &http.Client{Timeout: o.timeout}
 	}
 	return o.hc
-}
-
-// clientTimeout returns the per-request HTTP timeout. Default 120s is
-// enough for hosted APIs; local Ollama with a cold model can take much
-// longer on the first call. Bump via ANAMNESIA_LLM_HTTP_TIMEOUT (e.g.
-// "600s") when running against a CPU-bound local model.
-func clientTimeout() time.Duration {
-	if s := os.Getenv("ANAMNESIA_LLM_HTTP_TIMEOUT"); s != "" {
-		if d, err := time.ParseDuration(s); err == nil && d > 0 {
-			return d
-		}
-	}
-	return 120 * time.Second
 }
 
 type oaiMsg struct {

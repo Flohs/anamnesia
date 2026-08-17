@@ -32,9 +32,9 @@ func mustJSON(v any) json.RawMessage {
 	return b
 }
 
-func (f *fakeLLM) Model() string                                          { return "fake" }
-func (f *fakeLLM) Complete(context.Context, string) (string, error)       { return "", nil }
-func (f *fakeLLM) Distill(context.Context, llm.DistillInput, any) error   { return nil }
+func (f *fakeLLM) Model() string                                        { return "fake" }
+func (f *fakeLLM) Complete(context.Context, string) (string, error)     { return "", nil }
+func (f *fakeLLM) Distill(context.Context, llm.DistillInput, any) error { return nil }
 func (f *fakeLLM) Extract(_ context.Context, in llm.DistillInput, out any) error {
 	f.Calls++
 	f.Prompt = in.User

@@ -1,22 +1,30 @@
-// Anamnesia is a single binary that does double duty.
+// Anamnesia is a single binary: the CLI, the Claude Code hooks, and the
+// memory server are all the same executable.
 //
-// On a user's host machine, it:
+// Getting started:
 //
-//	anamnesia init       write .anamnesia.toml for the current project
-//	anamnesia install    patch ~/.claude/settings.json + ~/.claude.json
-//	anamnesia uninstall  remove the patches
-//	anamnesia hook ...   invoked by Claude Code's hooks at runtime
-//	anamnesia doctor     diagnose config + connectivity
-//	anamnesia up         docker compose up (start the local stack)
-//	anamnesia down       docker compose down
+//	anamnesia setup      create ~/.anamnesia/config.toml, wire Claude Code, start
+//	anamnesia config …   read and write settings
+//	anamnesia doctor     verify the installation
 //
-// Inside the docker-compose container, it runs:
+// Running the stack:
 //
-//	anamnesia serve              HTTP API + MCP + (in-process) worker
-//	anamnesia serve --worker     only the background worker
-//	anamnesia migrate            apply DB migrations and exit
+//	anamnesia start      start the postgres container + the server
+//	anamnesia stop       stop the server (--all also stops postgres)
+//	anamnesia restart    restart the server
+//	anamnesia status     what is running
+//	anamnesia logs       the server log
 //
-// One binary, one Go module, one container image.
+// Maintenance:
+//
+//	anamnesia update     reconcile everything with this binary after upgrading
+//	anamnesia migrate    apply migrations (--dims rebuilds the vector columns)
+//	anamnesia install    (re)wire Claude Code only
+//	anamnesia uninstall  remove the wiring (--purge also deletes stored memory)
+//
+// The only thing Anamnesia puts in a container is Postgres. There is no
+// compose file and no Anamnesia image: the binary you downloaded is the
+// server, so `anamnesia start` needs nothing but Docker.
 package main
 
 import (
@@ -35,11 +43,10 @@ var (
 )
 
 type rootFlags struct {
-	configPath string
-	serverURL  string
-	project    string
-	user       string
-	verbose    int
+	serverURL string
+	project   string
+	user      string
+	verbose   int
 
 	log *slog.Logger
 }
@@ -49,17 +56,20 @@ var rf rootFlags
 var root = &cobra.Command{
 	Use:   "anamnesia",
 	Short: "Anamnesia — local-first memory for Claude Code",
-	Long: "Anamnesia is a single binary that runs the memory server inside docker\n" +
-		"and runs the Claude Code hooks on your host. One install, one config,\n" +
-		"one place to store everything you've taught Claude.",
-	SilenceUsage: true,
+	Long: "Anamnesia gives Claude Code a long-term memory: it reads what you work\n" +
+		"on, keeps what matters, and hands it back at the start of your next\n" +
+		"session.\n\n" +
+		"One binary does everything. It manages its own Postgres container, so\n" +
+		"there is no compose file to write and no image to build.\n\n" +
+		"Start with `anamnesia setup`.",
+	SilenceUsage:  true,
+	SilenceErrors: true, // main() is the only place that prints errors
 }
 
 func init() {
-	root.PersistentFlags().StringVar(&rf.configPath, "config", "", "config file (default ~/.anamnesia/config.toml)")
-	root.PersistentFlags().StringVar(&rf.serverURL, "server", "", "Anamnesia server URL (default http://localhost:8181)")
-	root.PersistentFlags().StringVar(&rf.project, "project", "", "project slug (default basename of CWD)")
-	root.PersistentFlags().StringVar(&rf.user, "user", "", "user handle (default $USER or 'default')")
+	root.PersistentFlags().StringVar(&rf.serverURL, "server", "", "server URL (default: from your config)")
+	root.PersistentFlags().StringVar(&rf.project, "project", "", "project slug (default: this git repository's name)")
+	root.PersistentFlags().StringVar(&rf.user, "user", "", "user handle (default: from your config)")
 	root.PersistentFlags().CountVarP(&rf.verbose, "verbose", "v", "increase logging verbosity (-v / -vv)")
 
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
@@ -67,16 +77,29 @@ func init() {
 		return nil
 	}
 
-	root.AddCommand(versionCmd)
-	root.AddCommand(serveCmd)
+	// Onboarding and configuration.
+	root.AddCommand(setupCmd)
+	root.AddCommand(configCmd)
+	root.AddCommand(doctorCmd)
+
+	// Running the stack.
+	root.AddCommand(startCmd)
+	root.AddCommand(stopCmd)
+	root.AddCommand(restartCmd)
+	root.AddCommand(statusCmd)
+	root.AddCommand(logsCmd)
+
+	// Maintenance.
+	root.AddCommand(updateCmd)
 	root.AddCommand(migrateCmd)
-	root.AddCommand(initCmd)
 	root.AddCommand(installCmd)
 	root.AddCommand(uninstallCmd)
+
+	// Internal: invoked by Claude Code, and by `anamnesia start`.
 	root.AddCommand(hookCmd)
-	root.AddCommand(doctorCmd)
-	root.AddCommand(upCmd)
-	root.AddCommand(downCmd)
+	root.AddCommand(serveCmd)
+
+	root.AddCommand(versionCmd)
 }
 
 func newLogger(v int, w io.Writer) *slog.Logger {
@@ -92,6 +115,11 @@ func newLogger(v int, w io.Writer) *slog.Logger {
 
 func main() {
 	if err := root.Execute(); err != nil {
+		// doctor prints its own report and signals failure with an empty
+		// error, so there is nothing left to say here.
+		if err.Error() != "" {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+		}
 		os.Exit(1)
 	}
 }
