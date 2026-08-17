@@ -422,7 +422,7 @@ func TestLatestReleaseReportsNoReleases(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error when no releases exist")
 	}
-	if !strings.Contains(err.Error(), "no release found") {
+	if !strings.Contains(err.Error(), "no published releases") {
 		t.Errorf("unhelpful error: %v", err)
 	}
 }
