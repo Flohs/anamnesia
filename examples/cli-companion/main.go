@@ -1,7 +1,7 @@
 // cli-companion is the reference dock-on agent for Anamnesia. It proves
 // that an external agent can become a personal AI by consuming only
 // Anamnesia's public MCP surface — it imports nothing from
-// github.com/flohs/anamnesia-open-source/internal/*.
+// github.com/flohs/anamnesia/internal/*.
 //
 // Boot:   anamnesia_identity (persona) + anamnesia_capabilities (tools).
 // Turn:   anamnesia_search (context) -> LLM -> anamnesia_commitments_record

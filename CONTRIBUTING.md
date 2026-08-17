@@ -6,8 +6,8 @@ tooling beyond the Go toolchain and Docker.
 ## Getting set up
 
 ```bash
-git clone https://github.com/Flohs/anamnesia-open-source.git
-cd anamnesia-open-source
+git clone https://github.com/Flohs/anamnesia.git
+cd anamnesia
 make build           # ./bin/anamnesia
 make lint            # gofmt, vet, tests: exactly what CI runs
 ```

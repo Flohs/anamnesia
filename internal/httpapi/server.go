@@ -28,11 +28,11 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/flohs/anamnesia-open-source/internal/jobs"
-	"github.com/flohs/anamnesia-open-source/internal/pii"
-	"github.com/flohs/anamnesia-open-source/internal/retrieval"
-	"github.com/flohs/anamnesia-open-source/internal/store"
-	"github.com/flohs/anamnesia-open-source/pkg/anamnesia"
+	"github.com/flohs/anamnesia/internal/jobs"
+	"github.com/flohs/anamnesia/internal/pii"
+	"github.com/flohs/anamnesia/internal/retrieval"
+	"github.com/flohs/anamnesia/internal/store"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 // Deps bundles the runtime collaborators handed to the HTTP layer.

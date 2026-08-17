@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/flohs/anamnesia-open-source/pkg/anamnesia"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 // RegisterSkill upserts a skill keyed by (scope.user_id, scope.project_id, name).

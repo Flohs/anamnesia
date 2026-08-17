@@ -263,7 +263,7 @@ const OpenRouterBaseURL = "https://openrouter.ai/api/v1"
 // ignore unknown headers).
 func OpenRouterHeaders() map[string]string {
 	return map[string]string{
-		"HTTP-Referer": "https://github.com/flohs/anamnesia-open-source",
+		"HTTP-Referer": "https://github.com/flohs/anamnesia",
 		"X-Title":      "Anamnesia",
 	}
 }

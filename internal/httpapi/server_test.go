@@ -6,7 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/flohs/anamnesia-open-source/pkg/anamnesia"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 func TestHumanRecency(t *testing.T) {

@@ -12,12 +12,12 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/flohs/anamnesia-open-source/internal/decay"
-	"github.com/flohs/anamnesia-open-source/internal/embed"
-	"github.com/flohs/anamnesia-open-source/internal/extract"
-	"github.com/flohs/anamnesia-open-source/internal/llm"
-	"github.com/flohs/anamnesia-open-source/internal/retrieval"
-	"github.com/flohs/anamnesia-open-source/internal/store"
+	"github.com/flohs/anamnesia/internal/decay"
+	"github.com/flohs/anamnesia/internal/embed"
+	"github.com/flohs/anamnesia/internal/extract"
+	"github.com/flohs/anamnesia/internal/llm"
+	"github.com/flohs/anamnesia/internal/retrieval"
+	"github.com/flohs/anamnesia/internal/store"
 )
 
 // Config governs the worker loop cadence.

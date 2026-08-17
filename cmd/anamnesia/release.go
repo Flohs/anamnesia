@@ -34,7 +34,7 @@ import (
 // fork does not have to patch source.
 var (
 	releaseOwner = "Flohs"
-	releaseRepo  = "anamnesia-open-source"
+	releaseRepo  = "anamnesia"
 	// releaseAPIBase is overridden by tests to point at a local server.
 	releaseAPIBase = "https://api.github.com"
 )
@@ -111,7 +111,11 @@ func latestRelease(ctx context.Context) (*ghRelease, error) {
 	switch res.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotFound:
-		return nil, fmt.Errorf("%s/%s has no published releases yet", releaseOwner, releaseRepo)
+		// GitHub answers 404 both for "no releases" and for "you cannot see
+		// this repository", so name the second possibility rather than
+		// asserting the first.
+		return nil, fmt.Errorf("no release found for %s/%s.\nEither none is published yet, or the repository is private, in which case set GITHUB_TOKEN to a token that can read it",
+			releaseOwner, releaseRepo)
 	case http.StatusForbidden, http.StatusTooManyRequests:
 		return nil, fmt.Errorf("GitHub rate-limited this check; try again later, or set GITHUB_TOKEN")
 	default:

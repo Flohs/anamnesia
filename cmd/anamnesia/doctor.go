@@ -24,7 +24,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/flohs/anamnesia-open-source/internal/httpapi"
+	"github.com/flohs/anamnesia/internal/httpapi"
 )
 
 type checkStatus string

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flohs/anamnesia-open-source/internal/llm"
-	"github.com/flohs/anamnesia-open-source/pkg/anamnesia"
+	"github.com/flohs/anamnesia/internal/llm"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 const briefingSystemPrompt = `You are a personal-assistant brief writer. Given a list of experiences in a time window plus "adjacent" experiences from before or related topics, produce JSON:

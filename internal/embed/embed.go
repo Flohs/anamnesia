@@ -10,7 +10,7 @@ import (
 	"errors"
 	"math"
 
-	"github.com/flohs/anamnesia-open-source/internal/llm"
+	"github.com/flohs/anamnesia/internal/llm"
 )
 
 // Embedder converts a batch of strings into float32 vectors.

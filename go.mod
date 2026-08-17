@@ -1,4 +1,4 @@
-module github.com/flohs/anamnesia-open-source
+module github.com/flohs/anamnesia
 
 go 1.25.7
 

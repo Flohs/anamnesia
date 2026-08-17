@@ -22,8 +22,8 @@ import (
 	"math"
 	"time"
 
-	"github.com/flohs/anamnesia-open-source/internal/store"
-	"github.com/flohs/anamnesia-open-source/pkg/anamnesia"
+	"github.com/flohs/anamnesia/internal/store"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 // Config controls the worker.

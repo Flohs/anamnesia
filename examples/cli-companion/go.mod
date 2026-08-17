@@ -1,4 +1,4 @@
-module github.com/flohs/anamnesia-open-source/examples/cli-companion
+module github.com/flohs/anamnesia/examples/cli-companion
 
 go 1.25.5
 

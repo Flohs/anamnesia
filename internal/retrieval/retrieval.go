@@ -12,9 +12,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/pgvector/pgvector-go"
 
-	"github.com/flohs/anamnesia-open-source/internal/embed"
-	"github.com/flohs/anamnesia-open-source/internal/store"
-	"github.com/flohs/anamnesia-open-source/pkg/anamnesia"
+	"github.com/flohs/anamnesia/internal/embed"
+	"github.com/flohs/anamnesia/internal/store"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 // Engine wires a Store + Embedder for query-time retrieval. Reranker is

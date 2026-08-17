@@ -6,7 +6,7 @@ package store
 import (
 	"context"
 
-	"github.com/flohs/anamnesia-open-source/pkg/anamnesia"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 // QueryFacts runs an arbitrary SELECT and scans rows into *Fact.

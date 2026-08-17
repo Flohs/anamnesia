@@ -18,16 +18,16 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/flohs/anamnesia-open-source/internal/config"
-	"github.com/flohs/anamnesia-open-source/internal/embed"
-	"github.com/flohs/anamnesia-open-source/internal/extract"
-	"github.com/flohs/anamnesia-open-source/internal/httpapi"
-	"github.com/flohs/anamnesia-open-source/internal/jobs"
-	"github.com/flohs/anamnesia-open-source/internal/llm"
-	"github.com/flohs/anamnesia-open-source/internal/mcp"
-	"github.com/flohs/anamnesia-open-source/internal/pii"
-	"github.com/flohs/anamnesia-open-source/internal/retrieval"
-	"github.com/flohs/anamnesia-open-source/internal/store"
+	"github.com/flohs/anamnesia/internal/config"
+	"github.com/flohs/anamnesia/internal/embed"
+	"github.com/flohs/anamnesia/internal/extract"
+	"github.com/flohs/anamnesia/internal/httpapi"
+	"github.com/flohs/anamnesia/internal/jobs"
+	"github.com/flohs/anamnesia/internal/llm"
+	"github.com/flohs/anamnesia/internal/mcp"
+	"github.com/flohs/anamnesia/internal/pii"
+	"github.com/flohs/anamnesia/internal/retrieval"
+	"github.com/flohs/anamnesia/internal/store"
 )
 
 var (

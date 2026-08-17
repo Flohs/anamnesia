@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/flohs/anamnesia-open-source/pkg/anamnesia"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 // RenderIdentity produces the deterministic system-prompt block that

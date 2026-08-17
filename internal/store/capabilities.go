@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/flohs/anamnesia-open-source/pkg/anamnesia"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 // ListCapabilities returns active skills in scope, sorted by freshness

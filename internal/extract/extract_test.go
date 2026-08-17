@@ -10,9 +10,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/flohs/anamnesia-open-source/internal/llm"
-	"github.com/flohs/anamnesia-open-source/internal/store"
-	"github.com/flohs/anamnesia-open-source/pkg/anamnesia"
+	"github.com/flohs/anamnesia/internal/llm"
+	"github.com/flohs/anamnesia/internal/store"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 // fakeLLM returns whatever the test pre-loads into Ops.

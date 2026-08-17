@@ -26,13 +26,13 @@ it extracts nothing: you get the plumbing and an empty memory.
 ### 1. Install the binary
 
 Download it from the
-[latest release](https://github.com/Flohs/anamnesia-open-source/releases/latest),
+[latest release](https://github.com/Flohs/anamnesia/releases/latest),
 verify it, and put it on your PATH. Swap the asset name for your platform:
 `anamnesia-darwin-arm64`, `anamnesia-darwin-amd64`, `anamnesia-linux-amd64` or
 `anamnesia-linux-arm64`.
 
 ```bash
-REPO=https://github.com/Flohs/anamnesia-open-source/releases/latest/download
+REPO=https://github.com/Flohs/anamnesia/releases/latest/download
 curl -fsSLO $REPO/anamnesia-darwin-arm64
 curl -fsSLO $REPO/checksums.txt
 shasum -a 256 --check --ignore-missing checksums.txt
@@ -42,8 +42,8 @@ sudo install -m 0755 anamnesia-darwin-arm64 /usr/local/bin/anamnesia
 Or build it yourself, which needs **Go 1.25.7+**:
 
 ```bash
-git clone https://github.com/Flohs/anamnesia-open-source.git
-cd anamnesia-open-source
+git clone https://github.com/Flohs/anamnesia.git
+cd anamnesia
 sudo make install          # builds, then installs /usr/local/bin/anamnesia
 ```
 

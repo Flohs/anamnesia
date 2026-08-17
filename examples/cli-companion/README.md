@@ -25,11 +25,11 @@ Anamnesia is a substrate, not just a Claude Code add-on.
 ## The constraint
 
 This is a **separate Go module**. It imports nothing from
-`github.com/flohs/anamnesia-open-source/internal/*` — the MCP surface is
+`github.com/flohs/anamnesia/internal/*` — the MCP surface is
 the only contract. Enforced in CI:
 
 ```bash
-go list -deps ./... | grep '^github.com/flohs/anamnesia-open-source/internal/'
+go list -deps ./... | grep '^github.com/flohs/anamnesia/internal/'
 # must print nothing
 ```
 

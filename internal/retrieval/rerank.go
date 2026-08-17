@@ -11,8 +11,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/flohs/anamnesia-open-source/internal/llm"
-	"github.com/flohs/anamnesia-open-source/pkg/anamnesia"
+	"github.com/flohs/anamnesia/internal/llm"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 // Reranker re-orders an existing candidate set against the query.
