@@ -1,40 +1,56 @@
-// update.go reconciles an installation with the binary that is running.
+// update.go upgrades Anamnesia and reconciles the installation with it.
 //
-// Upgrading Anamnesia is: replace the binary, run `anamnesia update`.
+// Upgrading is one command: `anamnesia update`.
 //
-// There is deliberately no self-download here. The one thing an update has
-// to guarantee is that nothing is left half-upgraded, and that is entirely
-// about the things around the binary: the hooks still name a path that
-// exists, the recorded hook set matches this version, the schema matches
-// the configured embedding width, the database image is current, and the
-// running server is this binary rather than the previous one.
+// Two halves. First the binary itself, against the project's GitHub releases
+// (see release.go, which does the verifying). Then everything around it,
+// because that is where an upgrade actually goes wrong: the hooks must name a
+// path that exists, the recorded hook set must match this version, the schema
+// must match the configured embedding width, the database image should be
+// current, and the running server has to be this binary rather than the
+// previous one.
 //
-// The server cannot drift from the CLI, because they are the same
-// executable. That removes the whole category of version skew that a
-// separate server image would reintroduce.
+// The order matters. The binary is replaced first and the rest is handed to
+// the new one, so the version stamped into Claude Code's hooks and the code
+// enforcing the schema are the version that will actually serve.
+//
+// The server cannot drift from the CLI, because they are the same executable.
+// That removes the whole category of version skew a separate server image
+// would reintroduce.
 package main
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
 
 var (
-	updateSkipPull  bool
-	updateSkipHooks bool
-	updateScope     string
-	updateConfigDir string
+	updateSkipPull    bool
+	updateSkipHooks   bool
+	updateScope       string
+	updateConfigDir   string
+	updateCheckOnly   bool
+	updateNoSelf      bool
+	updateForceSelf   bool
+	updateHandedOffBy string
 )
 
 var updateCmd = &cobra.Command{
 	Use:   "update",
-	Short: "Reconcile hooks, schema, image and server with this binary",
-	Long: "Bring an existing installation in line with the binary you are running.\n\n" +
-		"Replace the binary first, then run this. It re-points Claude Code's\n" +
-		"hooks at the current path, refreshes the hook set, pulls the database\n" +
-		"image, applies migrations, reconciles the embedding schema, restarts\n" +
-		"the server, and finishes with a full health check.\n\n" +
+	Short: "Update Anamnesia and reconcile the installation with it",
+	Long: "Update Anamnesia and bring the installation in line with it.\n\n" +
+		"Compares this build against the latest GitHub release and, when a newer\n" +
+		"one exists, downloads it, verifies its checksum, replaces this binary and\n" +
+		"hands the rest of the update to it. Then re-points Claude Code's hooks,\n" +
+		"refreshes the hook set, pulls the database image, applies migrations,\n" +
+		"restarts the server, and finishes with a health check.\n\n" +
+		"  --check           report whether an update exists, change nothing\n" +
+		"  --no-self-update  reconcile the installed binary, download nothing\n" +
+		"  --force           replace a locally built binary too\n\n" +
 		"Safe to run at any time; every step is idempotent.",
 	RunE: runUpdate,
 }
@@ -44,18 +60,49 @@ func init() {
 	updateCmd.Flags().BoolVar(&updateSkipHooks, "no-hooks", false, "skip refreshing Claude Code's config")
 	updateCmd.Flags().StringVar(&updateScope, "scope", "user", "hook scope to refresh: user or project")
 	updateCmd.Flags().StringVar(&updateConfigDir, "config-dir", "", "override the config directory (testing escape hatch)")
+	updateCmd.Flags().BoolVar(&updateCheckOnly, "check", false, "only report whether a newer release exists")
+	updateCmd.Flags().BoolVar(&updateNoSelf, "no-self-update", false, "do not download a new binary, only reconcile this one")
+	updateCmd.Flags().BoolVar(&updateForceSelf, "force", false, "download the latest release even when this is not a released build")
+	// Set on the hand-off run so the new binary knows not to look again.
+	updateCmd.Flags().StringVar(&updateHandedOffBy, "handed-off-by", "", "internal: version that performed the self-update")
+	_ = updateCmd.Flags().MarkHidden("handed-off-by")
 }
 
 func runUpdate(cmd *cobra.Command, _ []string) error {
 	ctx := cmd.Context()
 	out := cmd.OutOrStdout()
 
+	if updateCheckOnly {
+		return checkOnly(ctx, out)
+	}
+
 	self, err := selfPath()
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "Updating Anamnesia to %s\n", version)
+	if updateHandedOffBy != "" {
+		fmt.Fprintf(out, "Continuing the update as %s (was %s)\n", version, updateHandedOffBy)
+	} else {
+		fmt.Fprintf(out, "Updating Anamnesia (running %s)\n", version)
+	}
 	fmt.Fprintf(out, "  binary: %s\n", self)
+
+	// Replace the binary first, then hand the rest of the update to it. The
+	// steps that follow write the version into Claude Code's hooks and enforce
+	// the schema, so they have to run as the version that will actually serve.
+	if !updateNoSelf && updateHandedOffBy == "" {
+		result, err := selfUpdate(ctx, out, updateForceSelf)
+		if err != nil {
+			// Failing to upgrade the binary is not a reason to abandon the
+			// reconcile: the local install may still need repairing, and often
+			// that is why someone ran this. Say plainly that the binary did not
+			// change, so nobody reads the success line below as an upgrade.
+			fmt.Fprintf(out, "  self-update did not happen: %v\n", err)
+			fmt.Fprintf(out, "  continuing to reconcile the installed version (%s)\n", version)
+		} else if result.Replaced {
+			return handOffToNewBinary(cmd, result.SelfPath)
+		}
+	}
 
 	// A missing config means this is a first run, not an update.
 	created, configPath, err := ensureConfigFile()
@@ -116,5 +163,34 @@ func runUpdate(cmd *cobra.Command, _ []string) error {
 	}
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Update complete. Run `anamnesia doctor` for a full check.")
+	return nil
+}
+
+// handOffToNewBinary re-runs `update` using the binary that was just
+// installed, passing the flags the user gave plus a marker so it does not look
+// for another release. Its exit status becomes ours.
+func handOffToNewBinary(cmd *cobra.Command, self string) error {
+	args := []string{"update", "--handed-off-by", version, "--scope", updateScope}
+	if updateSkipPull {
+		args = append(args, "--no-pull")
+	}
+	if updateSkipHooks {
+		args = append(args, "--no-hooks")
+	}
+	if updateConfigDir != "" {
+		args = append(args, "--config-dir", updateConfigDir)
+	}
+	if rf.verbose > 0 {
+		args = append(args, "-"+strings.Repeat("v", rf.verbose))
+	}
+
+	fmt.Fprintln(cmd.OutOrStdout())
+	next := exec.Command(self, args...)
+	next.Stdout = cmd.OutOrStdout()
+	next.Stderr = cmd.ErrOrStderr()
+	next.Stdin = os.Stdin
+	if err := next.Run(); err != nil {
+		return fmt.Errorf("the new binary is installed, but finishing the update failed: %w\nRun `anamnesia update` again", err)
+	}
 	return nil
 }

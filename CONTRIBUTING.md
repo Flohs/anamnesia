@@ -73,6 +73,32 @@ Anything that touches the embedding columns has to keep the schema and
 fail. `SetEmbeddingDims` and the boot-time check in `serve.go` are what
 enforce that.
 
+## Releasing
+
+Releases are cut by pushing a tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow runs gofmt, vet and the race tests, cross-compiles for macOS and
+Linux, writes `checksums.txt`, checks the artifacts against what `anamnesia
+update` expects, and publishes a GitHub release.
+
+Two things the tag has to get right, because the self-updater parses it:
+
+- It must be plain semver (`v1.2.3`, or `v1.2.3-rc1` for a prerelease, which
+  is marked as such automatically). The workflow rejects anything else rather
+  than publishing a release the updater cannot compare.
+- It must be strictly newer than the previous one, or installed copies will not
+  see it as an update.
+
+`make release` produces the same artifacts locally if you want to check a
+build before tagging. To rehearse the whole workflow without publishing, run
+it from the Actions tab with a version input; it uploads the artifacts and
+skips the release step.
+
 ## Pull requests
 
 - `make lint` passes.

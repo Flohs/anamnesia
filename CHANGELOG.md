@@ -82,6 +82,28 @@ were rebuilt around being verifiable.
 
 ### Added
 
+- **`anamnesia update` updates itself.** It compares the running build against
+  the latest GitHub release and, when a newer one exists, downloads that
+  release's binary for the platform, verifies its SHA-256 against the
+  `checksums.txt` published in the same release, confirms the download runs and
+  reports the version it claims to be, and only then replaces the binary
+  atomically. The remainder of the update is handed to the new binary, so the
+  version stamped into Claude Code's hooks and the code enforcing the schema
+  are the version that will serve.
+
+  It refuses on a checksum mismatch, a missing `checksums.txt`, a release with
+  no asset for the platform, or a binary that disagrees about its own version.
+  It never escalates privileges: an unwritable install directory produces the
+  `sudo` instruction instead. A locally built binary reports a commit hash
+  rather than a version and is not replaced without `--force`.
+  `--check` reports without changing anything; `--no-self-update` reconciles
+  the installed binary only.
+- **A release workflow.** Pushing a `v*` tag runs gofmt, vet and the race
+  tests, cross-compiles for macOS and Linux, writes `checksums.txt`, verifies
+  the artifacts are what the updater expects, and publishes a GitHub release
+  with install instructions. Tags that are not plain semver are rejected
+  rather than published, because the updater could not compare them. The
+  workflow can be run manually to rehearse a build without publishing.
 - `anamnesia setup`: creates the config, wires Claude Code, starts the
   stack, reports health. Idempotent.
 - `anamnesia start` / `stop` / `restart` / `status` / `logs`: Anamnesia

@@ -1,0 +1,145 @@
+name: Release
+
+# Tag a commit to publish a release:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The tag name becomes the version reported by `anamnesia version`, and
+# `anamnesia update` compares against it, so it has to be a plain semver tag
+# (v1.2.3, optionally with a -rc1 suffix). Anything else builds fine but the
+# updater will refuse to compare it.
+on:
+  push:
+    tags:
+      - "v*"
+  # Lets you rehearse the build without publishing anything.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (dry run, nothing is published)"
+        required: true
+        default: "v0.0.0-test"
+
+permissions:
+  contents: write # required to create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags, so `git describe` works
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Determine version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
+          # The updater parses this, so reject a tag it could never compare
+          # rather than publishing an unusable release.
+          if ! printf '%s' "$version" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$version' is not a semver tag like v1.2.3 or v1.2.3-rc1."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building $version"
+
+      # Never publish a build that does not pass what CI enforces.
+      - name: Verify
+        run: |
+          set -euo pipefail
+          out=$(gofmt -s -l .)
+          if [ -n "$out" ]; then echo "not gofmt'd:"; echo "$out"; exit 1; fi
+          go vet ./...
+          go test -race ./...
+
+      - name: Build every platform
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: make release
+
+      # The updater fetches this file and refuses to install a binary whose
+      # hash is not listed in it, so it is part of the release, not a nicety.
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum anamnesia-* > checksums.txt
+          cat checksums.txt
+
+      # A release whose own updater cannot read it is a broken release. This
+      # runs the real code path against the artifacts just built.
+      - name: Check the artifacts are what the updater expects
+        working-directory: dist
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected="anamnesia-linux-amd64"
+          test -f "$expected" || { echo "::error::missing $expected"; exit 1; }
+          grep -q " \*\?$expected\$" checksums.txt || { echo "::error::$expected missing from checksums.txt"; exit 1; }
+          sha256sum --check --ignore-missing checksums.txt
+          chmod +x "$expected"
+          reported=$(./"$expected" version)
+          echo "reports: $reported"
+          # `anamnesia update` compares the tag against this string and will
+          # not install a binary that disagrees with the release it came from.
+          printf '%s' "$reported" | grep -q "${VERSION#v}" \
+            || { echo "::error::binary reports '$reported', which does not contain ${VERSION#v}"; exit 1; }
+
+      - name: Upload artifacts (dry run only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: anamnesia-${{ steps.version.outputs.version }}
+          path: dist/*
+
+      - name: Publish release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          notes=$(mktemp)
+          {
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo "# macOS (Apple silicon); swap the asset name for your platform"
+            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/anamnesia-darwin-arm64"
+            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/checksums.txt"
+            echo "shasum -a 256 --check --ignore-missing checksums.txt"
+            echo "chmod +x anamnesia-darwin-arm64"
+            echo "sudo install -m 0755 anamnesia-darwin-arm64 /usr/local/bin/anamnesia"
+            echo "anamnesia setup"
+            echo '```'
+            echo
+            echo "Already installed? \`anamnesia update\` picks this up, verifies it, and replaces itself."
+            echo
+            if [ -f CHANGELOG.md ]; then
+              echo "## Changes"
+              echo
+              echo "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${VERSION}/CHANGELOG.md)."
+            fi
+          } > "$notes"
+
+          prerelease=""
+          case "$VERSION" in *-*) prerelease="--prerelease";; esac
+
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --notes-file "$notes" \
+            --verify-tag \
+            $prerelease \
+            dist/anamnesia-* dist/checksums.txt

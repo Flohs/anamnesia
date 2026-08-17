@@ -17,16 +17,29 @@ write and no image to build.
   and podman's docker shim all work.
 - **Claude Code**, the client Anamnesia wires itself into.
 - **macOS or Linux.**
-- **Go 1.25.7+**, only to build the binary. See below.
 
 Optionally, an **API key** for a model. Without one Anamnesia still runs, but
 it extracts nothing: you get the plumbing and an empty memory.
 
 ## Getting started
 
-### 1. Build and install the binary
+### 1. Install the binary
 
-There are no pre-built downloads yet, so build it once:
+Download it from the
+[latest release](https://github.com/Flohs/anamnesia-open-source/releases/latest),
+verify it, and put it on your PATH. Swap the asset name for your platform:
+`anamnesia-darwin-arm64`, `anamnesia-darwin-amd64`, `anamnesia-linux-amd64` or
+`anamnesia-linux-arm64`.
+
+```bash
+REPO=https://github.com/Flohs/anamnesia-open-source/releases/latest/download
+curl -fsSLO $REPO/anamnesia-darwin-arm64
+curl -fsSLO $REPO/checksums.txt
+shasum -a 256 --check --ignore-missing checksums.txt
+sudo install -m 0755 anamnesia-darwin-arm64 /usr/local/bin/anamnesia
+```
+
+Or build it yourself, which needs **Go 1.25.7+**:
 
 ```bash
 git clone https://github.com/Flohs/anamnesia-open-source.git
@@ -34,9 +47,9 @@ cd anamnesia-open-source
 sudo make install          # builds, then installs /usr/local/bin/anamnesia
 ```
 
-`make build` alone leaves it at `./bin/anamnesia` if you would rather place it
-yourself. It needs to land somewhere permanent, because the hooks are wired to
-the exact path you install it at.
+Either way it needs to land somewhere permanent, because the hooks are wired
+to the exact path you install it at. `make build` alone leaves it at
+`./bin/anamnesia` if you would rather place it yourself.
 
 ### 2. Run setup
 
@@ -181,7 +194,7 @@ anamnesia status     what is running (--json for scripts)
 anamnesia logs       the server log (-f to follow, -n to change how much)
 anamnesia doctor     verify the install (--json, --deep)
 anamnesia config     read and write settings
-anamnesia update     reconcile everything after replacing the binary
+anamnesia update     update the binary and reconcile the install (--check to look)
 anamnesia migrate    apply migrations (--dims rebuilds the vector columns)
 anamnesia install    (re)wire Claude Code only
 anamnesia uninstall  remove the wiring (--purge also deletes stored memory)
@@ -189,17 +202,34 @@ anamnesia uninstall  remove the wiring (--purge also deletes stored memory)
 
 ## Updating
 
-Replace the binary, then reconcile:
-
 ```bash
-cd anamnesia-open-source && git pull
-sudo make install
 anamnesia update
 ```
 
-`update` re-points the hooks at the current binary, refreshes the hook set,
-pulls the database image, applies migrations, restarts the server, and
-finishes with a health check. Every step is idempotent.
+That updates itself. It compares your build against the latest GitHub release
+and, when a newer one exists, downloads that release's binary for your
+platform, checks its SHA-256 against the `checksums.txt` published alongside
+it, confirms the downloaded binary runs and reports the version it claims to
+be, and only then replaces itself. The rest of the update is handed to the new
+binary, so the version written into your hooks and the code enforcing the
+schema are the version that will actually serve.
+
+Then it re-points the hooks at the binary, refreshes the hook set, pulls the
+database image, applies migrations, restarts the server, and runs a health
+check. Every step is idempotent.
+
+```bash
+anamnesia update --check           # is there a newer release? change nothing
+anamnesia update --no-self-update  # reconcile this binary, download nothing
+```
+
+If the binary lives somewhere you do not own, such as `/usr/local/bin`, use
+`sudo anamnesia update`. It will not escalate privileges on its own; it tells
+you and stops.
+
+A locally built binary reports a commit hash rather than a version, so
+`update` will not silently replace it. Pass `--force` if you want the latest
+release to overwrite your own build.
 
 Because the CLI, the hooks and the server are one executable, they cannot end
 up on different versions.
