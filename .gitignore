@@ -20,8 +20,10 @@
 __pycache__/
 *.pyc
 
-# Personal, machine-local Claude Code settings (permission grants etc.)
-/.claude/settings.local.json
+# Local Claude Code settings. Kept out of the repository on purpose: these
+# are per-machine (permission grants, enabled plugins, a local skill copy),
+# not project configuration other people should inherit.
+/.claude/
 
 # Compiled example agent binary
 /examples/cli-companion/cli-companion
