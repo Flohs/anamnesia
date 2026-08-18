@@ -971,10 +971,7 @@ func TestBaselineComparisonDetectsARecallRegression(t *testing.T) {
 	}
 }
 
-func TestBaselineComparisonAcceptsAnImprovement() {
-}
-
-func TestBaselineComparisonAcceptsAnImprovementProperly(t *testing.T) {
+func TestBaselineComparisonAcceptsAnImprovement(t *testing.T) {
 	base := evalReport{Aggregate: aggregateScore{RecallAt: map[int]float64{5: 0.62}, PrecisionAt: map[int]float64{5: 0.5}}}
 	now := evalReport{Aggregate: aggregateScore{RecallAt: map[int]float64{5: 0.71}, PrecisionAt: map[int]float64{5: 0.5}}}
 	if regressed, _ := compareToBaseline(base, now); regressed {
@@ -982,8 +979,6 @@ func TestBaselineComparisonAcceptsAnImprovementProperly(t *testing.T) {
 	}
 }
 ```
-
-Delete the empty `TestBaselineComparisonAcceptsAnImprovement` stub when writing this — it is shown only to make the point that a test with no body and no `*testing.T` is not a test. Keep only the `...Properly` version, renamed to `TestBaselineComparisonAcceptsAnImprovement`.
 
 - [ ] **Step 2: Run the test and watch it fail**
 
@@ -1263,4 +1258,4 @@ git commit -m "Grow the eval corpus to a measurable size, and record the rc7 bas
 
 **Type consistency:** `queryScore` and `aggregateScore` are defined in Task 1 and used unchanged in Tasks 4 and 5. `evalSource` and `evalQuery` are defined in Task 2 and consumed in Task 4. `evalReport` is defined in Task 4 and consumed in Task 5. `DeleteUser` returns `(bool, error)` in Task 3 and is called for its error only in Task 4, which is fine. `renderReport` takes `io.Writer` in both its test and its implementation.
 
-**One test-quality note for the implementer:** Task 5's test block deliberately contains a broken stub (`TestBaselineComparisonAcceptsAnImprovement` with no body and no `*testing.T`) to show what not to ship. Delete it and keep the `...Properly` version under the original name.
+**Corrected at pre-flight:** an earlier draft of Task 5 carried a deliberately broken test stub as a teaching device. A plan must not mandate what the review rubric treats as a defect, and an implementer transcribing it verbatim would have shipped a function that compiles and tests nothing. Removed.
