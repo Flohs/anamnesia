@@ -122,11 +122,21 @@ func (w *Worker) applyDefaults() Config {
 		c.LRUArchiveAfter = 90 * 24 * time.Hour
 	}
 	if c.HalfLives == nil {
-		c.HalfLives = map[anamnesia.ExperienceKind]time.Duration{
-			anamnesia.ExperienceCase:     14 * 24 * time.Hour,
-			anamnesia.ExperienceStrategy: 365 * 24 * time.Hour,
-			anamnesia.ExperienceHybrid:   60 * 24 * time.Hour,
-		}
+		c.HalfLives = DefaultHalfLives()
 	}
 	return c
+}
+
+// DefaultHalfLives is the shipped forgetting policy: a case decays in
+// weeks, a strategy effectively never, a hybrid somewhere between.
+//
+// Exported because these are also configuration defaults, declared in
+// cmd/anamnesia/settings.go, and a test there checks the two agree. A
+// default that lives in two places drifts.
+func DefaultHalfLives() map[anamnesia.ExperienceKind]time.Duration {
+	return map[anamnesia.ExperienceKind]time.Duration{
+		anamnesia.ExperienceCase:     14 * 24 * time.Hour,
+		anamnesia.ExperienceStrategy: 365 * 24 * time.Hour,
+		anamnesia.ExperienceHybrid:   60 * 24 * time.Hour,
+	}
 }

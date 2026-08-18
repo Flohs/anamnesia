@@ -20,6 +20,7 @@ import (
 
 	"github.com/flohs/anamnesia/internal/activity"
 	"github.com/flohs/anamnesia/internal/config"
+	"github.com/flohs/anamnesia/internal/decay"
 	"github.com/flohs/anamnesia/internal/embed"
 	"github.com/flohs/anamnesia/internal/extract"
 	"github.com/flohs/anamnesia/internal/httpapi"
@@ -29,6 +30,7 @@ import (
 	"github.com/flohs/anamnesia/internal/pii"
 	"github.com/flohs/anamnesia/internal/retrieval"
 	"github.com/flohs/anamnesia/internal/store"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 var (
@@ -117,6 +119,21 @@ func configSnapshot(hc *hostConfig) []httpapi.ConfigItem {
 		})
 	}
 	return items
+}
+
+// decayConfig turns the configured half-lives into the worker's policy.
+//
+// Until these became settings the worker fell back to its own defaults,
+// so nothing here was configurable and /v1/config could not report what
+// the running server was actually forgetting by.
+func decayConfig(cfg *config.Config) decay.Config {
+	return decay.Config{
+		HalfLives: map[anamnesia.ExperienceKind]time.Duration{
+			anamnesia.ExperienceCase:     cfg.DecayHalfLifeCase,
+			anamnesia.ExperienceStrategy: cfg.DecayHalfLifeStrategy,
+			anamnesia.ExperienceHybrid:   cfg.DecayHalfLifeHybrid,
+		},
+	}
 }
 
 func runServe(cmd *cobra.Command, _ []string) error {
@@ -258,6 +275,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 				ConsolidateEvery: cfg.ConsolidateEvery,
 				ExtractEvery:     cfg.ExtractEvery,
 				Extract:          extract.Config{ExtractCommitments: cfg.ExtractCommitments},
+				Decay:            decayConfig(cfg),
 			},
 			Store:     st,
 			Embedder:  emb,

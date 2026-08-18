@@ -154,6 +154,14 @@ var settings = []setting{
 	{Key: "worker.extract_commitments", Kind: kBool, Def: "false", Env: "ANAMNESIA_EXTRACT_COMMITMENTS",
 		Doc: "Also record open obligations (\"I'll send X by Friday\") in the commitments ledger."},
 
+	// ─── decay ───────────────────────────────────────────────────────
+	{Key: "decay.half_life_case", Kind: kDuration, Def: "336h", Env: "ANAMNESIA_DECAY_HALF_LIFE_CASE",
+		Doc: "How long a remembered episode takes to lose half its relevance. Two weeks by default: what you did last fortnight matters, what you did last spring usually does not. Recomputed every worker.decay_every."},
+	{Key: "decay.half_life_strategy", Kind: kDuration, Def: "8760h", Env: "ANAMNESIA_DECAY_HALF_LIFE_STRATEGY",
+		Doc: "The same for a learned approach rather than an episode. A year by default, which is close enough to never: how you solve a problem outlives the day you solved it."},
+	{Key: "decay.half_life_hybrid", Kind: kDuration, Def: "1440h", Env: "ANAMNESIA_DECAY_HALF_LIFE_HYBRID",
+		Doc: "The same for an experience that is part episode, part approach. Two months by default, between the other two."},
+
 	// ─── activity ────────────────────────────────────────────────────
 	{Key: "activity.enabled", Kind: kBool, Def: "true", Env: "ANAMNESIA_ACTIVITY_ENABLED",
 		Doc: "Record what the server is doing, in memory, and serve it on /v1/activity. Off makes those routes 404 and every recording call a no-op."},

@@ -74,6 +74,13 @@ type Config struct {
 	// ExtractCommitments lets the extractor emit ADD_COMMITMENT ops.
 	ExtractCommitments bool // ANAMNESIA_EXTRACT_COMMITMENTS (default false)
 
+	// Decay half-lives per experience kind. Relevance falls by half over
+	// this long since a memory was last used, per kind, which is what
+	// makes an episode fade while an approach does not.
+	DecayHalfLifeCase     time.Duration // ANAMNESIA_DECAY_HALF_LIFE_CASE (default 336h)
+	DecayHalfLifeStrategy time.Duration // ANAMNESIA_DECAY_HALF_LIFE_STRATEGY (default 8760h)
+	DecayHalfLifeHybrid   time.Duration // ANAMNESIA_DECAY_HALF_LIFE_HYBRID (default 1440h)
+
 	// Activity recorder. ActivityEnabled off means no recorder at all,
 	// which is also what makes the /v1/activity routes 404.
 	ActivityEnabled bool // ANAMNESIA_ACTIVITY_ENABLED (default true)
@@ -179,6 +186,10 @@ func Load() (*Config, error) {
 		EmbedBackfill:    dur("ANAMNESIA_EMBED_BACKFILL", time.Minute),
 
 		ExtractCommitments: boolean("ANAMNESIA_EXTRACT_COMMITMENTS", false),
+
+		DecayHalfLifeCase:     dur("ANAMNESIA_DECAY_HALF_LIFE_CASE", 336*time.Hour),
+		DecayHalfLifeStrategy: dur("ANAMNESIA_DECAY_HALF_LIFE_STRATEGY", 8760*time.Hour),
+		DecayHalfLifeHybrid:   dur("ANAMNESIA_DECAY_HALF_LIFE_HYBRID", 1440*time.Hour),
 
 		ActivityEnabled: boolean("ANAMNESIA_ACTIVITY_ENABLED", true),
 		ActivityTraces:  num("ANAMNESIA_ACTIVITY_TRACES", 200),

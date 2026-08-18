@@ -5,6 +5,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/flohs/anamnesia/internal/config"
+	"github.com/flohs/anamnesia/internal/decay"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 // isolatedHome points the config system at a scratch directory and moves
@@ -497,5 +502,67 @@ func TestEnvDifferingFromTheFileIsStillAnOverride(t *testing.T) {
 	}
 	if got := hc.Get("llm.model"); got != "gpt-4o-mini" {
 		t.Errorf("value = %q, want the environment to win", got)
+	}
+}
+
+func TestDecayHalfLifeDefaultsMatchTheCode(t *testing.T) {
+	// Promoting a default to a setting must not change what the server
+	// does. This fails if the two ever drift, and if a new experience
+	// kind arrives without a setting to go with it.
+	for kind, want := range decay.DefaultHalfLives() {
+		key := "decay.half_life_" + string(kind)
+		s, ok := settingByKey[key]
+		if !ok {
+			t.Errorf("experience kind %q has a half-life in the code and no %s setting", kind, key)
+			continue
+		}
+		got, err := time.ParseDuration(s.Def)
+		if err != nil {
+			t.Errorf("%s default %q is not a duration: %v", key, s.Def, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s defaults to %s, but the decay worker uses %s", key, got, want)
+		}
+	}
+}
+
+func TestDecayConfigCarriesEverySettingToTheWorker(t *testing.T) {
+	cfg := &config.Config{
+		DecayHalfLifeCase:     48 * time.Hour,
+		DecayHalfLifeStrategy: 100 * 24 * time.Hour,
+		DecayHalfLifeHybrid:   72 * time.Hour,
+	}
+	got := decayConfig(cfg).HalfLives
+	want := map[anamnesia.ExperienceKind]time.Duration{
+		anamnesia.ExperienceCase:     48 * time.Hour,
+		anamnesia.ExperienceStrategy: 100 * 24 * time.Hour,
+		anamnesia.ExperienceHybrid:   72 * time.Hour,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("half-lives = %v, want %v", got, want)
+	}
+	for kind, d := range want {
+		if got[kind] != d {
+			t.Errorf("%s half-life = %s, want %s", kind, got[kind], d)
+		}
+	}
+}
+
+func TestDecaySettingsReachTheServer(t *testing.T) {
+	isolatedHome(t)
+	hc, err := loadHostConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := strings.Join(hc.ServerEnv(), "\n")
+	for _, want := range []string{
+		"ANAMNESIA_DECAY_HALF_LIFE_CASE=336h",
+		"ANAMNESIA_DECAY_HALF_LIFE_STRATEGY=8760h",
+		"ANAMNESIA_DECAY_HALF_LIFE_HYBRID=1440h",
+	} {
+		if !strings.Contains(env, want) {
+			t.Errorf("server environment is missing %s", want)
+		}
 	}
 }
