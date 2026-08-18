@@ -228,9 +228,24 @@ Updates follow stable releases only. Prereleases are opt-in per run with
 `--pre`, and `--check` tells you when one is available that you are not
 being offered.
 
-If the binary lives somewhere you do not own, such as `/usr/local/bin`, use
-`sudo anamnesia update`. It will not escalate privileges on its own; it tells
-you and stops.
+If the binary lives somewhere you do not own, such as `/usr/local/bin`, run
+`anamnesia update` normally: it downloads and verifies as you, then asks
+before escalating the one step that needs it.
+
+```
+  /usr/local/bin belongs to root, so the swap needs your password.
+  Install it with sudo? [y/N]:
+```
+
+Answering yes runs a single `sudo install` of the already-verified file.
+Everything else stays as you.
+
+Do not run `sudo anamnesia update`. It is refused, because it would write your
+config, Claude Code's `settings.json` and `.claude.json`, and the server's pid
+file as root, leaving you unable to write your own files. Use `--allow-root`
+if you genuinely mean it. On a non-interactive terminal nothing is prompted:
+it prints the instruction and exits, so scripts fail loudly instead of hanging
+on a password.
 
 A locally built binary reports a commit hash rather than a version, so
 `update` will not silently replace it. Pass `--force` if you want the latest

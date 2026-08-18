@@ -119,6 +119,17 @@ were rebuilt around being verifiable.
   the highest version rather than the most recently published one, and skipping
   drafts. When only a prerelease exists, the stable channel names it instead of
   reporting that nothing is published.
+- **Self-update asks for a password instead of demanding sudo.** When the
+  binary lives somewhere root owns, the download and verification still happen
+  as the user, and only the file swap is escalated, as a single
+  `sudo install` of the already-verified file. The prompt appears only on a
+  terminal, so a script prints the instruction and exits rather than hanging.
+- **Running under sudo is refused.** `sudo anamnesia update` writes the user's
+  config, patches Claude Code's `settings.json` and `.claude.json`, and starts
+  the server: as root, every one of those becomes root-owned and the user can
+  no longer write their own Claude Code files. Commands that only read
+  (`doctor`, `status`, `version`) still run, a genuine root account is
+  unaffected, and `--allow-root` overrides it.
 - **A release workflow.** Pushing a `v*` tag runs gofmt, vet and the race
   tests, cross-compiles for macOS and Linux, writes `checksums.txt`, verifies
   the artifacts are what the updater expects, and publishes a GitHub release

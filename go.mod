@@ -10,6 +10,7 @@ require (
 	github.com/pgvector/pgvector-go v0.3.0
 	github.com/pressly/goose/v3 v3.27.1
 	github.com/spf13/cobra v1.10.2
+	golang.org/x/term v0.45.0
 )
 
 require (
@@ -26,5 +27,6 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
 )

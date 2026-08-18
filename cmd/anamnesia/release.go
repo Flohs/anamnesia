@@ -14,10 +14,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +30,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 )
 
 // The repository releases are published from. Overridable at build time so a
@@ -432,6 +436,10 @@ func installBinary(src, dest, retryCmd string) error {
 	return nil
 }
 
+// errNeedsRoot marks an install that failed only because the destination
+// belongs to root. The caller may offer to escalate; anything else is fatal.
+var errNeedsRoot = errors.New("installing there requires root")
+
 // installPermissionError turns an opaque EACCES into the actual next step.
 // Anamnesia does not escalate privileges on its own.
 //
@@ -444,15 +452,23 @@ func installPermissionError(dest, retryCmd string, cause error) error {
 	}
 	return fmt.Errorf(`cannot write to %s: %w
 
-That location needs elevated permissions. Either:
+Run this on a terminal and it will ask for your password for that one step:
   %s
-or install somewhere you own and update there instead`, dest, cause, retryCmd)
+
+Do not put sudo in front of it: that runs the whole update as root and leaves
+your config and Claude Code's files owned by root. Installing somewhere you
+own avoids the question entirely.`, dest, errNeedsRoot, retryCmd)
 }
 
-// sudoRetryCommand renders the invocation that would get past a permission
-// failure, preserving the flags that chose what to install.
-func sudoRetryCommand(force, pre bool) string {
-	cmd := "sudo anamnesia update"
+// retryCommand renders the invocation to re-run, preserving the flags that
+// chose what to install.
+//
+// Deliberately not prefixed with sudo. Escalating the whole command is refused
+// (see refuseSudo): it would leave the user's config and Claude Code's files
+// owned by root. Run interactively, this asks for a password for the one step
+// that needs it.
+func retryCommand(force, pre bool) string {
+	cmd := "anamnesia update"
 	if pre {
 		cmd += " --pre"
 	}
@@ -460,6 +476,66 @@ func sudoRetryCommand(force, pre bool) string {
 		cmd += " --force"
 	}
 	return cmd
+}
+
+// installWithSudo replaces dest by escalating a single command.
+//
+// Only the file swap runs as root. Running the whole update under sudo is the
+// obvious alternative and it is wrong: it writes the user's config, Claude
+// Code's settings.json and .claude.json, and the server's pid file as root,
+// leaving the user unable to write their own files and the memory server
+// running as root. Root's entire job here is to move one already-verified file
+// into place.
+func installWithSudo(ctx context.Context, out io.Writer, src, dest string) error {
+	sudo, err := exec.LookPath("sudo")
+	if err != nil {
+		return fmt.Errorf("sudo is not available: %w", err)
+	}
+	mode := "0755"
+	if info, err := os.Stat(dest); err == nil {
+		mode = fmt.Sprintf("%04o", info.Mode().Perm())
+	}
+	fmt.Fprintf(out, "  running: sudo install -m %s <verified download> %s\n", mode, dest)
+
+	cmd := exec.CommandContext(ctx, sudo, "install", "-m", mode, src, dest)
+	// Inherited so sudo can prompt for the password on the terminal.
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, out, out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("sudo install: %w", err)
+	}
+	return nil
+}
+
+// confirm asks a yes/no question, defaulting to no.
+//
+// Only ever asked on a terminal: a script or CI run must fail with the
+// instruction rather than block on a password prompt nobody will answer.
+func confirm(out io.Writer, question string) bool {
+	if !stdinIsTerminal() {
+		return false
+	}
+	fmt.Fprintf(out, "%s [y/N]: ", question)
+	reader := bufio.NewReader(os.Stdin)
+	answer, err := reader.ReadString('\n')
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "y", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+// stdinIsTerminal reports whether someone is there to answer.
+//
+// A ModeCharDevice check is not enough: /dev/null is a character device, so
+// `anamnesia update < /dev/null` looked interactive and printed a prompt that
+// nothing could ever answer. This asks whether the descriptor is really a
+// terminal.
+func stdinIsTerminal() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
 }
 
 // ─── the self-update step ────────────────────────────────────────────
@@ -521,8 +597,22 @@ func selfUpdate(ctx context.Context, out io.Writer, force, pre bool) (selfUpdate
 	if err != nil {
 		return res, err
 	}
-	if err := installBinary(verified, self, sudoRetryCommand(force, pre)); err != nil {
-		return res, err
+	if err := installBinary(verified, self, retryCommand(force, pre)); err != nil {
+		if !errors.Is(err, errNeedsRoot) {
+			return res, err
+		}
+		// The download is already verified, so the only thing left needing
+		// privileges is moving it into place.
+		fmt.Fprintf(out, "  %s belongs to root, so the swap needs your password.\n", filepath.Dir(self))
+		if !confirm(out, "  Install it with sudo?") {
+			return res, err
+		}
+		if sudoErr := installWithSudo(ctx, out, verified, self); sudoErr != nil {
+			return res, fmt.Errorf("%w\n\n%v", sudoErr, err)
+		}
+		if vErr := verifyDownloadedVersion(ctx, self, rel.TagName); vErr != nil {
+			return res, fmt.Errorf("installed %s but it does not look right: %w", self, vErr)
+		}
 	}
 	res.Replaced = true
 	fmt.Fprintf(out, "  replaced %s with %s\n", self, rel.TagName)

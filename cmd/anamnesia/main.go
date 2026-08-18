@@ -47,6 +47,7 @@ type rootFlags struct {
 	project   string
 	user      string
 	verbose   int
+	allowRoot bool
 
 	log *slog.Logger
 }
@@ -71,10 +72,11 @@ func init() {
 	root.PersistentFlags().StringVar(&rf.project, "project", "", "project slug (default: this git repository's name)")
 	root.PersistentFlags().StringVar(&rf.user, "user", "", "user handle (default: from your config)")
 	root.PersistentFlags().CountVarP(&rf.verbose, "verbose", "v", "increase logging verbosity (-v / -vv)")
+	root.PersistentFlags().BoolVar(&rf.allowRoot, "allow-root", false, "permit running under sudo (see the warning it prints)")
 
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		rf.log = newLogger(rf.verbose, cmd.ErrOrStderr())
-		return nil
+		return refuseSudo(cmd)
 	}
 
 	// Onboarding and configuration.
@@ -100,6 +102,55 @@ func init() {
 	root.AddCommand(serveCmd)
 
 	root.AddCommand(versionCmd)
+}
+
+// rootSafeCommands may legitimately run as root: they neither write into the
+// invoking user's home nor start anything long-lived.
+var rootSafeCommands = map[string]bool{
+	"version": true, "help": true, "completion": true, "doctor": true, "status": true,
+}
+
+// refuseSudo stops a command that was escalated from a normal account.
+//
+// `sudo anamnesia update` looks harmless and is not. Anamnesia writes the
+// user's config, patches Claude Code's settings.json and .claude.json, and
+// starts the memory server. Under sudo every one of those becomes root-owned:
+// the user can no longer write their own Claude Code config, and the server
+// runs as root. Self-update asks for a password for the one step that needs
+// it, so there is no reason to escalate the rest.
+//
+// Genuine root usage (a root account, not `sudo` from a user) is left alone,
+// as is --allow-root for anyone who means it.
+func refuseSudo(cmd *cobra.Command) error {
+	return sudoRefusal(os.Geteuid(), os.Getenv("SUDO_USER"), cmd.Name(), rf.allowRoot)
+}
+
+// sudoRefusal is the decision, separated from the environment so it can be
+// tested without actually being root.
+func sudoRefusal(euid int, invoker, command string, allowRoot bool) error {
+	if allowRoot || euid != 0 {
+		return nil
+	}
+	if invoker == "" || invoker == "root" {
+		return nil // actually running as root, not escalated from a user
+	}
+	if rootSafeCommands[command] {
+		return nil
+	}
+	return fmt.Errorf(`refusing to run as root.
+
+You ran this with sudo from the account %q. Anamnesia writes your config,
+patches Claude Code's settings.json and .claude.json, and starts the memory
+server: under sudo all of those end up owned by root, and Claude Code can no
+longer write its own files.
+
+Run it as yourself:
+
+  anamnesia %s
+
+If the binary itself needs replacing, anamnesia update will ask for your
+password for that one step. Pass --allow-root to override this.`,
+		invoker, command)
 }
 
 func newLogger(v int, w io.Writer) *slog.Logger {

@@ -173,7 +173,7 @@ func runUpdate(cmd *cobra.Command, _ []string) error {
 		// upgrade and is how someone ends up believing they are on a version
 		// they are not.
 		fmt.Fprintf(out, "Reconciled, but the binary was NOT updated: still %s.\n", version)
-		fmt.Fprintf(out, "To finish upgrading, run: %s\n", sudoRetryCommand(updateForceSelf, updatePre))
+		fmt.Fprintf(out, "To finish upgrading, run this on a terminal: %s\n", retryCommand(updateForceSelf, updatePre))
 		return nil
 	}
 	fmt.Fprintln(out, "Update complete. Run `anamnesia doctor` for a full check.")
