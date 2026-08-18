@@ -186,11 +186,28 @@ and the honest response is to raise the threshold or back the change out.
   nothing currently uses (`working_memory` holds 0 rows), where this design
   improves the write path that carries all real traffic.
 
-## Open questions for review
+## Resolved, 2026-08-18
 
-- Is `20m` the right gap? It is a guess. The eval can answer it by sweeping
-  the value, which is an argument for shipping the setting before tuning it.
-- Should `pre-compact` be investigated separately? It has never fired on this
-  install, which is either correct (no session ever compacted) or a defect.
-  Segmentation makes it matter more: compaction is exactly when a long session
-  has the most unposted content.
+**The `20m` gap stays a guess, for now.** Ship the setting, tune it with the
+eval by sweeping the value against the fixture corpus. Picking a defensible
+number before there is any way to measure one would just be a more confident
+guess.
+
+**`pre-compact` never firing is correct, not a defect.** The operator avoids
+compacting, so no session on this install has ever compacted. The hook is
+wired and would fire if one did.
+
+That has a consequence for this design worth stating plainly: with compaction
+avoided, **`SessionEnd` is the only write path in practice**. Everything a
+session learned arrives in one lump at the end, which is exactly the shape
+that makes whole-source gating so lossy — and it is why segmentation matters
+more here than it would on an install that compacts regularly.
+
+It also concentrates risk. A session that never ends cleanly contributes
+nothing at all, and the hook log shows 8 `session-start` against 6
+`session-end`. Some of that gap is sessions still open, but not necessarily
+all of it. Segmentation does not fix this; it is a separate question about
+whether a long-running session should checkpoint before it ends, and the
+byte-offset mechanism means such a checkpoint would be linear rather than the
+quadratic one that got `Stop` removed. Worth its own decision, not this
+design.
