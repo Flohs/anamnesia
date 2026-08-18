@@ -43,6 +43,9 @@ type Trace struct {
 	Summary   string
 	Steps     []Step
 	StepCount int
+	// StepTimings is what a list view gets instead of Steps: enough to
+	// draw one bar segment per step, and nothing else.
+	StepTimings []StepTiming
 
 	rec         *Recorder
 	detailBytes int // spent against maxTraceDetail
@@ -56,6 +59,16 @@ type Step struct {
 	Summary  string
 	Detail   map[string]any
 	Err      string
+}
+
+// StepTiming is a step reduced to what a bar segment needs.
+type StepTiming struct {
+	Name     string
+	Duration time.Duration
+	// Detail carries only the keys that label a segment ("llm ·
+	// gpt-4o-mini", "gate · skip"). Everything else in a step's detail
+	// is exactly what a summary exists to leave out.
+	Detail map[string]any
 }
 
 // LoopState is one worker loop, overwritten every tick.
@@ -381,13 +394,46 @@ func (r *Recorder) loop(name string) *LoopState {
 }
 
 // summary copies a trace without its steps, for the list views and for
-// the stream. Must be called with the recorder locked.
+// the stream. The steps' names and durations survive: they are what a
+// reader needs to see where the time went, and they cost a fraction of
+// the steps themselves. Must be called with the recorder locked.
 func (t *Trace) summary() *Trace {
 	c := *t
 	c.rec = nil
 	c.Steps = nil
 	c.StepCount = len(t.Steps)
+	c.StepTimings = nil
+	if len(t.Steps) > 0 {
+		c.StepTimings = make([]StepTiming, len(t.Steps))
+		for i, s := range t.Steps {
+			c.StepTimings[i] = StepTiming{
+				Name:     s.Name,
+				Duration: s.Duration,
+				Detail:   labelDetail(s.Detail),
+			}
+		}
+	}
 	return &c
+}
+
+// labelKeys are the detail keys a bar segment can be labelled with.
+var labelKeys = [...]string{"model", "verdict"}
+
+// labelDetail keeps the labelling keys and drops the rest, returning nil
+// when there are none so the field stays absent rather than empty.
+func labelDetail(d map[string]any) map[string]any {
+	var out map[string]any
+	for _, k := range labelKeys {
+		v, ok := d[k]
+		if !ok {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]any, len(labelKeys))
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // loopStates copies the loop table, ordered by name so the worker lane

@@ -114,6 +114,11 @@ were rebuilt around being verifiable.
   and no write on the hot path. `activity.enabled` turns it off, and
   `activity.traces` sizes the ring.
 
+  The list and stream views leave the steps out, but carry `step_timings`:
+  one name and duration per step, so a reader can see where the time went
+  without pulling every trace in full. A step that has a model or a gate
+  verdict carries that too, and nothing else.
+
 - **Every worker tick now says what it did.** The six loops report "1 source,
   2 operations" or "nothing to embed" rather than only proving the process is
   alive.

@@ -340,3 +340,60 @@ func TestOversizedListKeepsAsManyEntriesAsFit(t *testing.T) {
 		t.Errorf("kept %d bytes, want at most %d", size, maxDetailValue)
 	}
 }
+
+func TestSummaryCarriesStepTimings(t *testing.T) {
+	r := New(4)
+	tr := r.Begin("retrieve", "alice", "proj")
+	tr.Step("query", "Retrieving for \"hooks\"", map[string]any{"text": "hooks"})
+	tr.Step("gate", "Kept: nothing similar", map[string]any{"verdict": "keep", "reason": "novel"})
+	tr.Step("llm", "returned 2 operations", map[string]any{
+		"model": "gpt-4o-mini", "raw_response": strings.Repeat("x", 200)})
+	tr.End("ok", "Extracted 2 operations")
+
+	full, ok := r.Trace(tr.ID)
+	if !ok {
+		t.Fatal("trace not found")
+	}
+	got := r.Snapshot().Traces[0]
+	if got.Steps != nil {
+		t.Error("a summary must not carry its steps")
+	}
+	if len(got.StepTimings) != len(full.Steps) {
+		t.Fatalf("step timings = %d, want one per step (%d)", len(got.StepTimings), len(full.Steps))
+	}
+	for i, want := range full.Steps {
+		if got.StepTimings[i].Name != want.Name {
+			t.Errorf("timing %d name = %q, want %q in execution order",
+				i, got.StepTimings[i].Name, want.Name)
+		}
+		if got.StepTimings[i].Duration != want.Duration {
+			t.Errorf("timing %d duration = %v, want the step's own %v",
+				i, got.StepTimings[i].Duration, want.Duration)
+		}
+	}
+}
+
+func TestStepTimingsKeepOnlyTheLabellingDetail(t *testing.T) {
+	r := New(4)
+	tr := r.Begin("ingest", "alice", "proj")
+	tr.Step("query", "Retrieving", map[string]any{"text": "hooks"})
+	tr.Step("gate", "Kept", map[string]any{"verdict": "keep", "reason": "novel"})
+	tr.Step("llm", "returned 2 operations", map[string]any{
+		"model": "gpt-4o-mini", "raw_response": strings.Repeat("x", 200)})
+	tr.End("ok", "done")
+
+	timings := r.Snapshot().Traces[0].StepTimings
+	if len(timings) != 3 {
+		t.Fatalf("timings = %v, want three", timings)
+	}
+	if timings[0].Detail != nil {
+		t.Errorf("query timing detail = %v, want none: it carries nothing that labels a segment",
+			timings[0].Detail)
+	}
+	if len(timings[1].Detail) != 1 || timings[1].Detail["verdict"] != "keep" {
+		t.Errorf("gate timing detail = %v, want the verdict alone", timings[1].Detail)
+	}
+	if len(timings[2].Detail) != 1 || timings[2].Detail["model"] != "gpt-4o-mini" {
+		t.Errorf("llm timing detail = %v, want the model alone", timings[2].Detail)
+	}
+}

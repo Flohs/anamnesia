@@ -230,3 +230,95 @@ func TestActivityStreamSendsSnapshotThenLiveEvents(t *testing.T) {
 		t.Errorf("streamed trace = %v, want the ingest that just ran", trace)
 	}
 }
+
+func TestActivityListCarriesStepTimings(t *testing.T) {
+	rec := activity.New(10)
+	tr := rec.Begin("retrieve", "alice", "proj")
+	tr.Step("query", "Retrieving for \"hooks\"", map[string]any{"text": "hooks"})
+	tr.Step("gate", "Kept: nothing similar", map[string]any{"verdict": "keep", "reason": "novel"})
+	tr.Step("llm", "returned 2 operations", map[string]any{
+		"model": "gpt-4o-mini", "raw_response": "…"})
+	tr.End("ok", "Extracted 2 operations")
+
+	srv := testServer(t, Deps{Activity: rec})
+	var got map[string]any
+	if code := getJSON(t, srv.URL+"/v1/activity", &got); code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	trace := got["traces"].([]any)[0].(map[string]any)
+	if _, ok := trace["steps"]; ok {
+		t.Error("the list view still carries step_count and timings, not the steps themselves")
+	}
+	raw, ok := trace["step_timings"].([]any)
+	if !ok {
+		t.Fatalf("trace = %v, want step_timings so the console can size a segmented bar", trace)
+	}
+	if len(raw) != 3 {
+		t.Fatalf("step_timings = %v, want one per step", raw)
+	}
+	for i, name := range []string{"query", "gate", "llm"} {
+		timing := raw[i].(map[string]any)
+		if timing["name"] != name {
+			t.Errorf("timing %d name = %v, want %q in execution order", i, timing["name"], name)
+		}
+		if _, ok := timing["duration_ms"].(float64); !ok {
+			t.Errorf("timing %d = %v, want a duration_ms", i, timing)
+		}
+		if _, ok := timing["summary"]; ok {
+			t.Errorf("timing %d = %v, a bar segment needs no summary", i, timing)
+		}
+	}
+	if _, ok := raw[0].(map[string]any)["detail"]; ok {
+		t.Error("the query timing carries no labelling detail and must omit the field")
+	}
+	gate := raw[1].(map[string]any)["detail"].(map[string]any)
+	if len(gate) != 1 || gate["verdict"] != "keep" {
+		t.Errorf("gate detail = %v, want the verdict alone", gate)
+	}
+	llm := raw[2].(map[string]any)["detail"].(map[string]any)
+	if len(llm) != 1 || llm["model"] != "gpt-4o-mini" {
+		t.Errorf("llm detail = %v, want the model alone", llm)
+	}
+}
+
+func TestStreamedTraceFrameCarriesStepTimings(t *testing.T) {
+	rec := activity.New(10)
+	events, unsubscribe := rec.Subscribe()
+	defer unsubscribe()
+
+	tr := rec.Begin("retrieve", "alice", "proj")
+	tr.Step("vector", "12 vector hits", nil)
+	tr.End("ok", "Returned 12 hits")
+
+	// The console renders the feed from whichever frame arrives first, so
+	// the closing trace frame has to carry what the list view carries.
+	var closed *activity.Trace
+	for len(events) > 0 {
+		ev := <-events
+		if ev.Kind == "trace" && ev.Trace != nil && ev.Trace.Status == "ok" {
+			closed = ev.Trace
+		}
+	}
+	if closed == nil {
+		t.Fatal("no closing trace event was published")
+	}
+	name, payload := sseFrame(activity.Event{Kind: "trace", Trace: closed})
+	if name != "trace" {
+		t.Fatalf("frame = %q, want trace", name)
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame map[string]any
+	if err := json.Unmarshal(body, &frame); err != nil {
+		t.Fatal(err)
+	}
+	timings, ok := frame["step_timings"].([]any)
+	if !ok || len(timings) != 1 {
+		t.Fatalf("frame = %v, want one step_timings entry", frame)
+	}
+	if timings[0].(map[string]any)["name"] != "vector" {
+		t.Errorf("timing = %v, want the vector step", timings[0])
+	}
+}

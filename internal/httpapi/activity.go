@@ -75,6 +75,15 @@ type traceView struct {
 	Summary    string     `json:"summary"`
 	StepCount  int        `json:"step_count"`
 	Steps      []stepView `json:"steps,omitempty"`
+	// StepTimings is how the list view says where the time went without
+	// carrying the steps themselves.
+	StepTimings []stepTimingView `json:"step_timings,omitempty"`
+}
+
+type stepTimingView struct {
+	Name       string         `json:"name"`
+	DurationMS int64          `json:"duration_ms"`
+	Detail     map[string]any `json:"detail,omitempty"`
 }
 
 type stepView struct {
@@ -262,8 +271,9 @@ func viewLoop(l activity.LoopState) loopView {
 }
 
 // viewTrace renders a trace. withSteps is false for list and stream
-// frames, which carry step_count instead: a ring of 200 traces with
-// every step inlined is a payload nobody asked for.
+// frames, which carry step_count and step_timings instead: a ring of 200
+// traces with every step inlined is a payload nobody asked for, while a
+// name and a duration per step is what a segmented bar is drawn from.
 func viewTrace(t activity.Trace, withSteps bool) traceView {
 	v := traceView{
 		ID:        t.ID.String(),
@@ -290,6 +300,13 @@ func viewTrace(t activity.Trace, withSteps bool) traceView {
 		for _, s := range t.Steps {
 			v.Steps = append(v.Steps, viewStep(s))
 		}
+	}
+	for _, s := range t.StepTimings {
+		v.StepTimings = append(v.StepTimings, stepTimingView{
+			Name:       s.Name,
+			DurationMS: s.Duration.Milliseconds(),
+			Detail:     s.Detail,
+		})
 	}
 	return v
 }
