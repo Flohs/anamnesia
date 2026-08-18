@@ -95,6 +95,7 @@ func init() {
 	// Maintenance.
 	root.AddCommand(updateCmd)
 	root.AddCommand(migrateCmd)
+	root.AddCommand(evalCmd)
 	root.AddCommand(installCmd)
 	root.AddCommand(uninstallCmd)
 

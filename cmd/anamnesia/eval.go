@@ -10,14 +10,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/flohs/anamnesia/internal/httpapi"
 	"github.com/flohs/anamnesia/internal/store"
 	"github.com/flohs/anamnesia/pkg/anamnesia"
+	"github.com/spf13/cobra"
 )
 
 const (
@@ -161,6 +164,11 @@ func (c *evalClient) waitForDrain(ctx context.Context, timeout time.Duration) er
 		if err != nil {
 			return err
 		}
+		if resp.StatusCode >= 300 {
+			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
+			resp.Body.Close()
+			return fmt.Errorf("/v1/queue/pending: %s: %s", resp.Status, bytes.TrimSpace(msg))
+		}
 		var q httpapi.QueuePendingResponse
 		err = json.NewDecoder(resp.Body).Decode(&q)
 		resp.Body.Close()
@@ -221,4 +229,169 @@ func deleteEvalScope(ctx context.Context, hc *hostConfig) error {
 
 	_, err = st.DeleteUser(ctx, evalUser)
 	return err
+}
+
+var (
+	evalJSON     bool
+	evalKeep     bool
+	evalBaseline string
+	evalK        int
+)
+
+var evalCmd = &cobra.Command{
+	Use:   "eval",
+	Short: "Measure retrieval against the built-in fixture corpus",
+	Long: "Ingest a committed fixture corpus through the real pipeline, run\n" +
+		"labelled queries against it, and report recall, precision, MRR and\n" +
+		"latency.\n\n" +
+		"The corpus is ingested under a dedicated user and deleted afterwards,\n" +
+		"so a run cannot touch your own memory. It needs a configured model:\n" +
+		"the stub extracts nothing and every query would score zero.",
+	Args: cobra.NoArgs,
+	RunE: runEval,
+}
+
+func init() {
+	evalCmd.Flags().BoolVar(&evalJSON, "json", false, "emit the report as JSON")
+	evalCmd.Flags().BoolVar(&evalKeep, "keep", false, "leave the ingested corpus in place")
+	evalCmd.Flags().StringVar(&evalBaseline, "baseline", "", "compare against a previous --json report and fail on regression")
+	evalCmd.Flags().IntVar(&evalK, "k", 10, "how many hits to request per query")
+}
+
+func runEval(cmd *cobra.Command, _ []string) error {
+	if evalK <= 0 {
+		return errors.New("--k must be a positive number")
+	}
+	hc, err := loadHostConfig()
+	if err != nil {
+		return err
+	}
+	sources, queries, err := loadCorpus()
+	if err != nil {
+		return err
+	}
+	ctx := cmd.Context()
+	out := cmd.OutOrStdout()
+
+	// The corpus is ingested, not simulated, so a run against the wrong
+	// scope would write dozens of fixture rows into real memory.
+	if hc.User() == evalUser {
+		return fmt.Errorf("identity.user is %q, which is the scope eval deletes afterwards", evalUser)
+	}
+
+	// Teardown deletes evalUser's entire scope by that fixed handle. If a
+	// real person ever holds it, an automatic delete would destroy their
+	// whole memory, so a prior run left behind (crashed, killed, whatever)
+	// stops this one cold rather than being cleaned up automatically.
+	// Refusing to run is recoverable; deleting a stranger's memory is not.
+	exists, err := evalScopeExists(ctx, hc)
+	if err != nil {
+		return fmt.Errorf("check for an existing eval scope: %w", err)
+	}
+	if exists {
+		return fmt.Errorf("the %q scope already exists: a previous eval run may have crashed before cleanup.\n"+
+			"Remove that user yourself before re-running eval", evalUser)
+	}
+
+	// Progress goes to stderr, not out: --json must produce nothing but the
+	// report on stdout, or `eval --json > file` captures this line too and
+	// leaves the file unparseable.
+	fmt.Fprintf(cmd.ErrOrStderr(), "Ingesting %d sources as %s/%s\n", len(sources), evalUser, evalProject)
+	report, runErr := runEvalPass(ctx, hc, sources, queries, evalK)
+	if !evalKeep {
+		if err := deleteEvalScope(context.WithoutCancel(ctx), hc); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not delete the eval scope: %v\n", err)
+		}
+	}
+	if runErr != nil {
+		return runErr
+	}
+	report.At = time.Now().UTC().Format(time.RFC3339)
+
+	if evalJSON {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(report); err != nil {
+			return err
+		}
+	} else {
+		renderReport(out, report)
+	}
+
+	if evalBaseline != "" {
+		raw, err := os.ReadFile(evalBaseline)
+		if err != nil {
+			return fmt.Errorf("read baseline: %w", err)
+		}
+		var base evalReport
+		if err := json.Unmarshal(raw, &base); err != nil {
+			return fmt.Errorf("parse baseline %s: %w", evalBaseline, err)
+		}
+		regressed, lines := compareToBaseline(base, report)
+		fmt.Fprintln(out)
+		for _, l := range lines {
+			fmt.Fprintln(out, l)
+		}
+		if regressed {
+			return errors.New("retrieval regressed against the baseline")
+		}
+	}
+	return nil
+}
+
+// renderReport prints the aggregate, then names every query that found
+// nothing. An average hides exactly the failures worth seeing.
+func renderReport(w io.Writer, r evalReport) {
+	a := r.Aggregate
+	fmt.Fprintf(w, "\n%d queries over the fixture corpus\n\n", a.Queries)
+	for _, k := range []int{1, 5, 10} {
+		fmt.Fprintf(w, "  recall@%-3d %.3f      precision@%-3d %.3f\n",
+			k, a.RecallAt[k], k, a.PrecisionAt[k])
+	}
+	fmt.Fprintf(w, "\n  MRR        %.3f\n", a.MRR)
+	fmt.Fprintf(w, "  latency    p50 %d ms, p95 %d ms\n", a.P50MS, a.P95MS)
+	fmt.Fprintf(w, "  found nothing: %d of %d\n", a.ZeroHit, a.Queries)
+	if a.ZeroHit > 0 {
+		fmt.Fprintln(w, "\n  queries that returned nothing relevant:")
+		for _, q := range r.PerQuery {
+			if !q.Found {
+				fmt.Fprintf(w, "    %s\n", q.ID)
+			}
+		}
+	}
+}
+
+// regressionTolerance is how far a metric may drift before it counts as a
+// regression. Retrieval is not deterministic — the model, the reranker and
+// the embedding service all vary run to run — so a strict comparison would
+// cry wolf on every invocation.
+const regressionTolerance = 0.02
+
+// compareToBaseline reports whether the run got worse, and explains every
+// metric either way.
+func compareToBaseline(base, now evalReport) (bool, []string) {
+	var lines []string
+	regressed := false
+	type metric struct {
+		name       string
+		base, curr float64
+	}
+	var metrics []metric
+	for _, k := range []int{1, 5, 10} {
+		metrics = append(metrics,
+			metric{fmt.Sprintf("recall@%d", k), base.Aggregate.RecallAt[k], now.Aggregate.RecallAt[k]},
+			metric{fmt.Sprintf("precision@%d", k), base.Aggregate.PrecisionAt[k], now.Aggregate.PrecisionAt[k]},
+		)
+	}
+	metrics = append(metrics, metric{"MRR", base.Aggregate.MRR, now.Aggregate.MRR})
+	for _, m := range metrics {
+		delta := m.curr - m.base
+		mark := "  "
+		if delta < -regressionTolerance {
+			mark = "!!"
+			regressed = true
+		}
+		lines = append(lines, fmt.Sprintf("%s %-14s %.3f -> %.3f  (%+.3f)", mark, m.name, m.base, m.curr, delta))
+	}
+	return regressed, lines
 }
