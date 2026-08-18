@@ -151,6 +151,22 @@ were rebuilt around being verifiable.
   All of it is read-only, and it means it: these routes resolve `?user=` and
   `?project=` by lookup, so a typo is a `404` rather than a newly created user.
 
+- **`anamnesia init` is back.** It was removed when project settings moved
+  into `.anamnesia.toml`, on the grounds that `anamnesia config --project set`
+  could create the file. It can, but it leaves two naked lines and no hint of
+  what else a repository can override, which is a poor first thing for a new
+  user to meet. `init` detects the slug from the repository directory, writes
+  the file with each project-settable key documented beside it, and refuses to
+  overwrite one that already exists without `--force`.
+
+  The template is rendered from the settings table rather than written out
+  here, so it cannot drift from what is settable, and secrets are excluded
+  structurally: `.anamnesia.toml` is committed with the repository, and a
+  generated file does not get to publish an API key. Keys it has no value for
+  are written commented out, because a blank value is an override like any
+  other and `identity.user = ""` would file that repository's memories under
+  whoever `$USER` happens to be.
+
 - **The forgetting policy is configurable.** The decay half-lives were
   constants nothing could reach, so the rate at which memory fades could not
   be tuned and nothing could report it. They are now
@@ -233,9 +249,9 @@ were rebuilt around being verifiable.
 - `server.addr` defaults to `127.0.0.1:8181` rather than all interfaces.
 - The LLM HTTP timeout is a normal setting (`llm.timeout`) instead of an
   environment variable read directly inside the LLM client.
-- Removed `anamnesia init`, `up` and `down`. Project settings live in
-  `.anamnesia.toml` via `anamnesia config --project`; the stack is `start`
-  and `stop`.
+- Removed `anamnesia up` and `down`; the stack is `start` and `stop`. Project
+  settings live in `.anamnesia.toml`, written by `anamnesia init` or one key
+  at a time with `anamnesia config --project set`.
 - Removed the unused `ANAMNESIA_WORKER_IN_PROCESS` setting, which was parsed
   and documented but never read.
 - The extractor now asks the model to name an experience, not only describe

@@ -81,6 +81,7 @@ func init() {
 
 	// Onboarding and configuration.
 	root.AddCommand(setupCmd)
+	root.AddCommand(initCmd)
 	root.AddCommand(configCmd)
 	root.AddCommand(doctorCmd)
 

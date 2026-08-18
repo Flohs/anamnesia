@@ -169,8 +169,17 @@ override the file, and command-line flags override those.
 ### Per project, and per person
 
 Memories are filed under a project slug, which defaults to your git
-repository's directory name. Override it for one repository by adding
+repository's directory name. Pin it for one repository by writing
 `.anamnesia.toml` at its root:
+
+```bash
+anamnesia init
+```
+
+That detects the slug from the directory, writes the file with the other
+per-project settings documented alongside it, and refuses to overwrite one
+that already exists. The file is meant to be committed, so it never holds
+API keys or passwords. To change a single key later:
 
 ```bash
 anamnesia config --project set identity.project my-service
@@ -187,6 +196,7 @@ For a small team sharing one server, give each person a distinct
 
 ```
 anamnesia setup      create the config, wire Claude Code, start the stack
+anamnesia init       write .anamnesia.toml for the current repository
 anamnesia start      start the postgres container and the server
 anamnesia stop       stop the server (--all also stops postgres)
 anamnesia restart    restart the server, e.g. after changing a setting

@@ -46,6 +46,11 @@ type setting struct {
 	// Generated marks values created at setup time (the database
 	// password), so regenerating a config does not overwrite them.
 	Generated bool
+	// Project marks a setting worth overriding for one repository, and
+	// so worth rendering into the .anamnesia.toml `anamnesia init`
+	// writes. That file is committed with the repository, which is why a
+	// kSecret setting can never be one of these.
+	Project bool
 }
 
 func (s setting) section() string { return strings.SplitN(s.Key, ".", 2)[0] }
@@ -62,10 +67,10 @@ func (s setting) name() string {
 // to "what you almost never touch".
 var settings = []setting{
 	// ─── identity ────────────────────────────────────────────────────
-	{Key: "identity.user", Kind: kString, Def: "", Env: "ANAMNESIA_DEFAULT_USER",
+	{Key: "identity.user", Kind: kString, Def: "", Env: "ANAMNESIA_DEFAULT_USER", Project: true,
 		Doc: "Who memories belong to. Defaults to your OS username. A small team can share one server by giving each person a distinct handle."},
-	{Key: "identity.project", Kind: kString, Def: "", Env: "",
-		Doc: "Project slug memories are filed under. Defaults to the git repository's directory name. Usually set per project in ./.anamnesia.toml rather than here."},
+	{Key: "identity.project", Kind: kString, Def: "", Env: "", Project: true,
+		Doc: "Project slug memories are filed under. Defaults to the git repository's directory name. Belongs in a repository's ./.anamnesia.toml, which `anamnesia init` writes."},
 
 	// ─── providers ───────────────────────────────────────────────────
 	{Key: "openrouter.api_key", Kind: kSecret, Env: "OPENROUTER_API_KEY",
@@ -107,7 +112,7 @@ var settings = []setting{
 	// ─── server ──────────────────────────────────────────────────────
 	{Key: "server.addr", Kind: kString, Def: "127.0.0.1:8181", Env: "ANAMNESIA_HTTP_ADDR",
 		Doc: "Address the local server listens on. Loopback by default; anything else exposes your memory to the network, so set server.token too."},
-	{Key: "server.url", Kind: kString, Def: "", Env: "",
+	{Key: "server.url", Kind: kString, Def: "", Env: "", Project: true,
 		Doc: "Where the CLI and hooks look for the server. Leave empty to derive it from server.addr. Set it to point at a server on another machine."},
 	{Key: "server.token", Kind: kSecret, Env: "ANAMNESIA_SERVER_TOKEN",
 		Doc: "Optional shared secret. Required in practice whenever server.addr is not loopback."},
