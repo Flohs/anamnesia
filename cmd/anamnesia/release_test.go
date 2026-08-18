@@ -169,7 +169,7 @@ func TestLatestReleaseParsesAssets(t *testing.T) {
 	releaseAPIBase = srv.URL
 	t.Cleanup(func() { releaseAPIBase = "https://api.github.com" })
 
-	rel, err := latestRelease(context.Background())
+	rel, err := latestRelease(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestDownloadRejectsBadChecksum(t *testing.T) {
 	releaseAPIBase = srv.URL
 	t.Cleanup(func() { releaseAPIBase = "https://api.github.com" })
 
-	rel, err := latestRelease(context.Background())
+	rel, err := latestRelease(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestDownloadRejectsMissingChecksums(t *testing.T) {
 	releaseAPIBase = srv.URL
 	t.Cleanup(func() { releaseAPIBase = "https://api.github.com" })
 
-	rel, err := latestRelease(context.Background())
+	rel, err := latestRelease(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestDownloadRejectsMissingPlatformAsset(t *testing.T) {
 	releaseAPIBase = srv.URL
 	t.Cleanup(func() { releaseAPIBase = "https://api.github.com" })
 
-	rel, err := latestRelease(context.Background())
+	rel, err := latestRelease(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +265,7 @@ func TestDownloadAcceptsVerifiedBinary(t *testing.T) {
 	releaseAPIBase = srv.URL
 	t.Cleanup(func() { releaseAPIBase = "https://api.github.com" })
 
-	rel, err := latestRelease(context.Background())
+	rel, err := latestRelease(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +298,7 @@ func TestDownloadRejectsVersionMismatch(t *testing.T) {
 	releaseAPIBase = srv.URL
 	t.Cleanup(func() { releaseAPIBase = "https://api.github.com" })
 
-	rel, err := latestRelease(context.Background())
+	rel, err := latestRelease(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +368,7 @@ func TestSelfUpdateSkipsUnreleasedBuildWithoutForce(t *testing.T) {
 	})
 
 	var out strings.Builder
-	res, err := selfUpdate(context.Background(), &out, false)
+	res, err := selfUpdate(context.Background(), &out, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +395,7 @@ func TestSelfUpdateSkipsWhenCurrent(t *testing.T) {
 	})
 
 	var out strings.Builder
-	res, err := selfUpdate(context.Background(), &out, false)
+	res, err := selfUpdate(context.Background(), &out, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,11 +418,125 @@ func TestLatestReleaseReportsNoReleases(t *testing.T) {
 	releaseAPIBase = srv.URL
 	t.Cleanup(func() { releaseAPIBase = "https://api.github.com" })
 
-	_, err := latestRelease(context.Background())
+	_, err := latestRelease(context.Background(), false)
 	if err == nil {
 		t.Fatal("expected an error when no releases exist")
 	}
 	if !strings.Contains(err.Error(), "no published releases") {
 		t.Errorf("unhelpful error: %v", err)
+	}
+}
+
+// multiReleaseServer serves a release list plus the /releases/latest endpoint,
+// which GitHub populates only from non-prerelease entries.
+func multiReleaseServer(t *testing.T, rels []map[string]any) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/releases/latest"):
+			for _, rel := range rels {
+				if rel["prerelease"] == true || rel["draft"] == true {
+					continue
+				}
+				_ = json.NewEncoder(w).Encode(rel)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+		case strings.HasSuffix(r.URL.Path, "/releases"):
+			_ = json.NewEncoder(w).Encode(rels)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	return srv
+}
+
+func rel(tag string, pre, draft bool) map[string]any {
+	return map[string]any{"tag_name": tag, "prerelease": pre, "draft": draft, "assets": []any{}}
+}
+
+// TestStableChannelIgnoresPrereleases is the behaviour that surprised us in
+// practice: GitHub's /releases/latest omits prereleases entirely.
+func TestStableChannelIgnoresPrereleases(t *testing.T) {
+	srv := multiReleaseServer(t, []map[string]any{
+		rel("v0.2.0-rc1", true, false),
+		rel("v0.1.0", false, false),
+	})
+	releaseAPIBase = srv.URL
+	t.Cleanup(func() { releaseAPIBase = "https://api.github.com" })
+
+	got, err := latestRelease(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TagName != "v0.1.0" {
+		t.Errorf("stable channel returned %q, want v0.1.0", got.TagName)
+	}
+	got, err = latestRelease(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TagName != "v0.2.0-rc1" {
+		t.Errorf("prerelease channel returned %q, want v0.2.0-rc1", got.TagName)
+	}
+}
+
+// TestPrereleaseChannelPicksHighestVersion: the list is ordered by creation
+// date, so a patch to an older line can be published after a newer prerelease.
+func TestPrereleaseChannelPicksHighestVersion(t *testing.T) {
+	srv := multiReleaseServer(t, []map[string]any{
+		rel("v0.1.1", false, false),    // published most recently
+		rel("v0.2.0-rc2", true, false), // but this is the highest version
+		rel("v0.2.0-rc1", true, false),
+	})
+	releaseAPIBase = srv.URL
+	t.Cleanup(func() { releaseAPIBase = "https://api.github.com" })
+
+	got, err := latestRelease(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TagName != "v0.2.0-rc2" {
+		t.Errorf("got %q, want v0.2.0-rc2", got.TagName)
+	}
+}
+
+func TestPrereleaseChannelSkipsDrafts(t *testing.T) {
+	srv := multiReleaseServer(t, []map[string]any{
+		rel("v9.9.9", false, true), // draft, not public
+		rel("v0.2.0-rc1", true, false),
+	})
+	releaseAPIBase = srv.URL
+	t.Cleanup(func() { releaseAPIBase = "https://api.github.com" })
+
+	got, err := latestRelease(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TagName != "v0.2.0-rc1" {
+		t.Errorf("a draft was offered: got %q", got.TagName)
+	}
+}
+
+// TestNoStableReleasePointsAtThePrerelease keeps the message honest when the
+// only thing published is a prerelease.
+func TestNoStableReleasePointsAtThePrerelease(t *testing.T) {
+	srv := multiReleaseServer(t, []map[string]any{rel("v0.1.0-rc1", true, false)})
+	releaseAPIBase = srv.URL
+	t.Cleanup(func() { releaseAPIBase = "https://api.github.com" })
+
+	_, err := latestRelease(context.Background(), false)
+	if err == nil {
+		t.Fatal("expected an error when only a prerelease exists")
+	}
+	for _, want := range []string{"v0.1.0-rc1", "prerelease", "--pre"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("message does not mention %q: %v", want, err)
+		}
 	}
 }

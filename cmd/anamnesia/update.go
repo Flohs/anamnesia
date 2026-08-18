@@ -36,6 +36,7 @@ var (
 	updateCheckOnly   bool
 	updateNoSelf      bool
 	updateForceSelf   bool
+	updatePre         bool
 	updateHandedOffBy string
 )
 
@@ -49,6 +50,7 @@ var updateCmd = &cobra.Command{
 		"refreshes the hook set, pulls the database image, applies migrations,\n" +
 		"restarts the server, and finishes with a health check.\n\n" +
 		"  --check           report whether an update exists, change nothing\n" +
+		"  --pre             consider prereleases too, not just stable releases\n" +
 		"  --no-self-update  reconcile the installed binary, download nothing\n" +
 		"  --force           replace a locally built binary too\n\n" +
 		"Safe to run at any time; every step is idempotent.",
@@ -63,6 +65,7 @@ func init() {
 	updateCmd.Flags().BoolVar(&updateCheckOnly, "check", false, "only report whether a newer release exists")
 	updateCmd.Flags().BoolVar(&updateNoSelf, "no-self-update", false, "do not download a new binary, only reconcile this one")
 	updateCmd.Flags().BoolVar(&updateForceSelf, "force", false, "download the latest release even when this is not a released build")
+	updateCmd.Flags().BoolVar(&updatePre, "pre", false, "consider prereleases as well as stable releases")
 	// Set on the hand-off run so the new binary knows not to look again.
 	updateCmd.Flags().StringVar(&updateHandedOffBy, "handed-off-by", "", "internal: version that performed the self-update")
 	_ = updateCmd.Flags().MarkHidden("handed-off-by")
@@ -73,7 +76,7 @@ func runUpdate(cmd *cobra.Command, _ []string) error {
 	out := cmd.OutOrStdout()
 
 	if updateCheckOnly {
-		return checkOnly(ctx, out)
+		return checkOnly(ctx, out, updatePre)
 	}
 
 	self, err := selfPath()
@@ -91,7 +94,7 @@ func runUpdate(cmd *cobra.Command, _ []string) error {
 	// steps that follow write the version into Claude Code's hooks and enforce
 	// the schema, so they have to run as the version that will actually serve.
 	if !updateNoSelf && updateHandedOffBy == "" {
-		result, err := selfUpdate(ctx, out, updateForceSelf)
+		result, err := selfUpdate(ctx, out, updateForceSelf, updatePre)
 		if err != nil {
 			// Failing to upgrade the binary is not a reason to abandon the
 			// reconcile: the local install may still need repairing, and often
@@ -169,6 +172,16 @@ func runUpdate(cmd *cobra.Command, _ []string) error {
 // handOffToNewBinary re-runs `update` using the binary that was just
 // installed, passing the flags the user gave plus a marker so it does not look
 // for another release. Its exit status becomes ours.
+//
+// Only flags that still mean something after the download are forwarded.
+// --pre and --force choose *what* to fetch, and the handed-off run fetches
+// nothing, so passing them on is at best noise and at worst fatal: the binary
+// being handed to is a different version, and it may not know a flag this one
+// does.
+//
+// That version gap is also why a rejected argument falls back to a minimal
+// invocation rather than stranding the user with a freshly installed binary
+// and a half-finished update.
 func handOffToNewBinary(cmd *cobra.Command, self string) error {
 	args := []string{"update", "--handed-off-by", version, "--scope", updateScope}
 	if updateSkipPull {
@@ -184,12 +197,24 @@ func handOffToNewBinary(cmd *cobra.Command, self string) error {
 		args = append(args, "-"+strings.Repeat("v", rf.verbose))
 	}
 
-	fmt.Fprintln(cmd.OutOrStdout())
-	next := exec.Command(self, args...)
-	next.Stdout = cmd.OutOrStdout()
-	next.Stderr = cmd.ErrOrStderr()
-	next.Stdin = os.Stdin
-	if err := next.Run(); err != nil {
+	out := cmd.OutOrStdout()
+	fmt.Fprintln(out)
+
+	run := func(argv []string) ([]byte, error) {
+		next := exec.Command(self, argv...)
+		next.Stdin = os.Stdin
+		// Captured rather than streamed so a failed first attempt does not
+		// print a confusing error the fallback then contradicts.
+		return next.CombinedOutput()
+	}
+
+	combined, err := run(args)
+	if err != nil && strings.Contains(string(combined), "unknown flag") {
+		fmt.Fprintf(out, "  %s does not accept every option this version passes; retrying with the essentials\n", version)
+		combined, err = run([]string{"update", "--handed-off-by", version})
+	}
+	_, _ = out.Write(combined)
+	if err != nil {
 		return fmt.Errorf("the new binary is installed, but finishing the update failed: %w\nRun `anamnesia update` again", err)
 	}
 	return nil

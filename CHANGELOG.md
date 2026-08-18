@@ -98,6 +98,12 @@ were rebuilt around being verifiable.
   rather than a version and is not replaced without `--force`.
   `--check` reports without changing anything; `--no-self-update` reconciles
   the installed binary only.
+
+  Updates follow stable releases only, because GitHub's "latest release"
+  deliberately excludes prereleases. `--pre` opts into them per run, picking
+  the highest version rather than the most recently published one, and skipping
+  drafts. When only a prerelease exists, the stable channel names it instead of
+  reporting that nothing is published.
 - **A release workflow.** Pushing a `v*` tag runs gofmt, vet and the race
   tests, cross-compiles for macOS and Linux, writes `checksums.txt`, verifies
   the artifacts are what the updater expects, and publishes a GitHub release

@@ -220,8 +220,13 @@ check. Every step is idempotent.
 
 ```bash
 anamnesia update --check           # is there a newer release? change nothing
+anamnesia update --pre             # include prereleases, not just stable ones
 anamnesia update --no-self-update  # reconcile this binary, download nothing
 ```
+
+Updates follow stable releases only. Prereleases are opt-in per run with
+`--pre`, and `--check` tells you when one is available that you are not
+being offered.
 
 If the binary lives somewhere you do not own, such as `/usr/local/bin`, use
 `sudo anamnesia update`. It will not escalate privileges on its own; it tells

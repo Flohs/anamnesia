@@ -96,30 +96,31 @@ func httpGet(ctx context.Context, url string) (*http.Response, error) {
 	return (&http.Client{Timeout: 60 * time.Second}).Do(req)
 }
 
-// latestRelease fetches the newest published release.
-func latestRelease(ctx context.Context) (*ghRelease, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/releases/latest", releaseAPIBase, releaseOwner, releaseRepo)
-	res, err := httpGet(ctx, url)
-	if err != nil {
-		return nil, fmt.Errorf("ask GitHub for the latest release: %w", err)
+// latestRelease returns the newest release to offer.
+//
+// Two endpoints, because GitHub means two different things by "latest".
+// /releases/latest is the newest *stable* release: it omits prereleases
+// entirely, which is the right default for someone who just wants the tool to
+// work. Opting into prereleases means listing releases and picking the highest
+// version ourselves, since the list is ordered by creation date and a patch to
+// an older line can be published after a newer prerelease.
+func latestRelease(ctx context.Context, includePrerelease bool) (*ghRelease, error) {
+	if includePrerelease {
+		return newestOfAllReleases(ctx)
 	}
-	defer res.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	url := fmt.Sprintf("%s/repos/%s/%s/releases/latest", releaseAPIBase, releaseOwner, releaseRepo)
+	body, status, err := getJSON(ctx, url)
 	if err != nil {
 		return nil, err
 	}
-	switch res.StatusCode {
-	case http.StatusOK:
-	case http.StatusNotFound:
-		// For a public repository this means exactly one thing. (A fork that
-		// retargets these vars at a private repository would also land here,
-		// since GitHub hides what you cannot read behind the same 404; setting
-		// GITHUB_TOKEN is the fix in that case.)
-		return nil, fmt.Errorf("%s/%s has no published releases yet", releaseOwner, releaseRepo)
-	case http.StatusForbidden, http.StatusTooManyRequests:
-		return nil, fmt.Errorf("GitHub rate-limited this check; try again later, or set GITHUB_TOKEN")
-	default:
-		return nil, fmt.Errorf("GitHub returned %s: %s", res.Status, strings.TrimSpace(string(body)))
+	if status == http.StatusNotFound {
+		// No stable release. A prerelease may still exist, and saying so is
+		// the difference between "nothing to install" and "there is something,
+		// behind a flag".
+		return nil, noStableReleaseError(ctx)
+	}
+	if err := ghStatusError(status, body); err != nil {
+		return nil, err
 	}
 	var rel ghRelease
 	if err := json.Unmarshal(body, &rel); err != nil {
@@ -129,6 +130,90 @@ func latestRelease(ctx context.Context) (*ghRelease, error) {
 		return nil, fmt.Errorf("GitHub returned a release with no tag")
 	}
 	return &rel, nil
+}
+
+// newestOfAllReleases picks the highest version among all releases,
+// prereleases included. Drafts are never offered: they are not public.
+func newestOfAllReleases(ctx context.Context) (*ghRelease, error) {
+	rels, err := listReleases(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var best *ghRelease
+	var bestV semver
+	for i := range rels {
+		r := &rels[i]
+		if r.Draft {
+			continue
+		}
+		v, ok := parseVersion(r.TagName)
+		if !ok {
+			continue
+		}
+		if best == nil || compareVersions(v, bestV) > 0 {
+			best, bestV = r, v
+		}
+	}
+	if best == nil {
+		return nil, fmt.Errorf("%s/%s has no releases with a version tag", releaseOwner, releaseRepo)
+	}
+	return best, nil
+}
+
+// listReleases fetches the release list.
+func listReleases(ctx context.Context) ([]ghRelease, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/releases?per_page=30", releaseAPIBase, releaseOwner, releaseRepo)
+	body, status, err := getJSON(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusNotFound {
+		return nil, fmt.Errorf("%s/%s has no published releases yet", releaseOwner, releaseRepo)
+	}
+	if err := ghStatusError(status, body); err != nil {
+		return nil, err
+	}
+	var rels []ghRelease
+	if err := json.Unmarshal(body, &rels); err != nil {
+		return nil, fmt.Errorf("parse GitHub's reply: %w", err)
+	}
+	return rels, nil
+}
+
+// noStableReleaseError explains a missing stable release, naming a prerelease
+// when one is available rather than claiming there is nothing at all.
+func noStableReleaseError(ctx context.Context) error {
+	if rel, err := newestOfAllReleases(ctx); err == nil && rel.Prerelease {
+		return fmt.Errorf("%s/%s has no stable release yet, but %s is published as a prerelease.\nInstall it with `anamnesia update --pre`",
+			releaseOwner, releaseRepo, rel.TagName)
+	}
+	return fmt.Errorf("%s/%s has no published releases yet", releaseOwner, releaseRepo)
+}
+
+// getJSON performs the request and returns the body and status.
+func getJSON(ctx context.Context, url string) ([]byte, int, error) {
+	res, err := httpGet(ctx, url)
+	if err != nil {
+		return nil, 0, fmt.Errorf("ask GitHub about releases: %w", err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	if err != nil {
+		return nil, 0, err
+	}
+	return body, res.StatusCode, nil
+}
+
+// ghStatusError turns a non-OK GitHub status into a useful error.
+func ghStatusError(status int, body []byte) error {
+	switch status {
+	case http.StatusOK:
+		return nil
+	case http.StatusForbidden, http.StatusTooManyRequests:
+		return fmt.Errorf("GitHub rate-limited this check; try again later, or set GITHUB_TOKEN")
+	default:
+		return fmt.Errorf("GitHub returned status %d: %s", status, strings.TrimSpace(string(body)))
+	}
 }
 
 // ─── versions ────────────────────────────────────────────────────────
@@ -374,10 +459,10 @@ type selfUpdateResult struct {
 
 // selfUpdate compares this build against the latest release and, when it is
 // older, installs the new one. force allows replacing an unreleased build.
-func selfUpdate(ctx context.Context, out io.Writer, force bool) (selfUpdateResult, error) {
+func selfUpdate(ctx context.Context, out io.Writer, force, pre bool) (selfUpdateResult, error) {
 	res := selfUpdateResult{Checked: true}
 
-	rel, err := latestRelease(ctx)
+	rel, err := latestRelease(ctx, pre)
 	if err != nil {
 		return res, err
 	}
@@ -428,13 +513,17 @@ func selfUpdate(ctx context.Context, out io.Writer, force bool) (selfUpdateResul
 }
 
 // checkOnly reports whether a newer release exists, changing nothing.
-func checkOnly(ctx context.Context, out io.Writer) error {
-	rel, err := latestRelease(ctx)
+func checkOnly(ctx context.Context, out io.Writer, pre bool) error {
+	rel, err := latestRelease(ctx, pre)
 	if err != nil {
 		return err
 	}
+	channel := "stable"
+	if pre {
+		channel = "including prereleases"
+	}
 	fmt.Fprintf(out, "installed: %s\n", version)
-	fmt.Fprintf(out, "latest:    %s\n", rel.TagName)
+	fmt.Fprintf(out, "latest:    %s (%s)\n", rel.TagName, channel)
 	if rel.HTMLURL != "" {
 		fmt.Fprintf(out, "notes:     %s\n", rel.HTMLURL)
 	}
@@ -448,9 +537,20 @@ func checkOnly(ctx context.Context, out io.Writer) error {
 		fmt.Fprintf(out, "\nThis is not a released build, so there is nothing to compare.\n")
 		fmt.Fprintln(out, "Run `anamnesia update --force` to install the latest release.")
 	case compareVersions(current, latest) < 0:
-		fmt.Fprintf(out, "\nAn update is available. Run `anamnesia update`.\n")
+		if pre {
+			fmt.Fprintf(out, "\nAn update is available. Run `anamnesia update --pre`.\n")
+		} else {
+			fmt.Fprintf(out, "\nAn update is available. Run `anamnesia update`.\n")
+		}
 	default:
 		fmt.Fprintln(out, "\nUp to date.")
+		if !pre {
+			if newer, err := newestOfAllReleases(ctx); err == nil && newer.Prerelease {
+				if v, ok := parseVersion(newer.TagName); ok && compareVersions(v, current) > 0 {
+					fmt.Fprintf(out, "%s is available as a prerelease: `anamnesia update --pre`.\n", newer.TagName)
+				}
+			}
+		}
 	}
 	if _, ok := rel.assetURL(platformAsset()); latestOK && !ok {
 		fmt.Fprintf(out, "\nNote: that release has no binary for %s/%s.\n", runtime.GOOS, runtime.GOARCH)
