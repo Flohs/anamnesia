@@ -97,6 +97,47 @@ were rebuilt around being verifiable.
 
 ### Added
 
+- **The server can now say what it is doing, and why.** It kept no record of
+  its own reasoning: which loop ran last, what the extractor decided about a
+  checkpoint, why a retrieval returned what it did. An install that was
+  quietly extracting nothing looked exactly like one with nothing to extract.
+  An in-memory recorder now holds one record per worker loop and a bounded
+  ring of traces, served read-only at `GET /v1/activity`,
+  `/v1/activity/{id}` and `/v1/activity/stream`.
+
+  An ingest trace carries the source that arrived, the gate verdict with the
+  score and reason behind it, the memories fetched as context, the model's own
+  response, the operations it asked for and the rows written. A retrieve trace
+  carries the query, both halves of the search, the fused ranking and what the
+  reranker did to it. Consolidation and session start are traced too. Nothing
+  is persisted: a restart empties it, which is what makes it cost no schema
+  and no write on the hot path. `activity.enabled` turns it off, and
+  `activity.traces` sizes the ring.
+
+- **Every worker tick now says what it did.** The six loops report "1 source,
+  2 operations" or "nothing to embed" rather than only proving the process is
+  alive.
+
+- **The memory itself is readable over HTTP.** `/v1/facts`,
+  `/v1/experiences`, `/v1/skills`, `/v1/entities`, `/v1/edges`, `/v1/sources`
+  and `/v1/working` list and page their tables, each with a detail route and
+  the filters that domain actually has. Paging is keyset rather than offset,
+  so a list that is still being written to does not shift under a reader.
+  Alongside them: `/v1/stats` for counts per domain including embedding
+  coverage, `/v1/projects` and `/v1/users` with counts and last activity,
+  `/v1/stats/activity` for writes per day, `/v1/embedding-map` for stored
+  vectors projected onto two components, `/v1/config` for the resolved
+  settings with secrets masked, and `/v1/hooks` for the parsed hook log.
+
+  All of it is read-only, and it means it: these routes resolve `?user=` and
+  `?project=` by lookup, so a typo is a `404` rather than a newly created user.
+
+- **The forgetting policy is configurable.** The decay half-lives were
+  constants nothing could reach, so the rate at which memory fades could not
+  be tuned and nothing could report it. They are now
+  `decay.half_life_case`, `decay.half_life_strategy` and
+  `decay.half_life_hybrid`, with the values the worker was already using.
+
 - **`anamnesia update` updates itself.** It compares the running build against
   the latest GitHub release and, when a newer one exists, downloads that
   release's binary for the platform, verifies its SHA-256 against the
@@ -158,6 +199,12 @@ were rebuilt around being verifiable.
   verifies a real stack.
 
 ### Changed
+
+- **`config list` no longer claims every setting came from the environment.**
+  `anamnesia start` hands the server its own configuration as environment
+  variables, so inside the server every configured value looked like an
+  environment override of itself. An environment value equal to what the files
+  already resolved to is now reported as coming from the file it came from.
 
 - **The server runs as a host process, not a container.** There is no
   Anamnesia image and no compose file. `docker-compose.yml`, `Dockerfile` and
