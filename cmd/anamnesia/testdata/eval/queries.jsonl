@@ -1,0 +1,4 @@
+{"id":"q-001","text":"why were the nightly stock counts off by a day","relevant":["src-001"],"note":"the timezone cause; src-005 and src-006 are near misses"}
+{"id":"q-002","text":"how did we fix the warehouse timestamp problem","relevant":["src-002"],"note":"the decision, not the diagnosis"}
+{"id":"q-003","text":"what is our convention for storing datetimes","relevant":["src-003"]}
+{"id":"q-004","text":"what did we change about generating invoices","relevant":["src-004"]}
