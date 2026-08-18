@@ -37,6 +37,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -81,6 +82,11 @@ type Deps struct {
 	EmbedDims     int
 	LLMProvider   string
 	LLMModel      string
+
+	// shuttingDown is closed when the server begins stopping. Only
+	// NewServer sets it, so a Deps built by hand leaves it nil, and a nil
+	// channel in a select simply never fires.
+	shuttingDown <-chan struct{}
 }
 
 // NewServer returns a configured *http.Server bound to addr.
@@ -88,6 +94,11 @@ func NewServer(addr string, d Deps) *http.Server {
 	if d.Started.IsZero() {
 		d.Started = time.Now().UTC()
 	}
+	// Shutdown waits for in-flight requests, and a stream is in flight
+	// until its client goes away. A browser left on the console would
+	// otherwise hold every stop open for the whole shutdown budget.
+	stopping := make(chan struct{})
+	d.shuttingDown = stopping
 	mux := http.NewServeMux()
 
 	mux.Handle("/v1/health", http.HandlerFunc(d.handleHealth))
@@ -127,7 +138,7 @@ func NewServer(addr string, d Deps) *http.Server {
 		mux.Handle("/mcp/", d.protect(d.MCPHandler))
 	}
 
-	return &http.Server{
+	srv := &http.Server{
 		Addr:              addr,
 		Handler:           withLogging(d.Log, mux),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -135,6 +146,10 @@ func NewServer(addr string, d Deps) *http.Server {
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
+	// Shutdown and Close both run these, so closing once is not optional.
+	var once sync.Once
+	srv.RegisterOnShutdown(func() { once.Do(func() { close(stopping) }) })
+	return srv
 }
 
 func (d Deps) protect(next http.Handler) http.Handler {

@@ -95,6 +95,20 @@ were rebuilt around being verifiable.
 - `trimLine` no longer splits multi-byte characters.
 - Claude Code's config files are backed up before they are first modified.
 
+- **`restart` could leave nothing running.** `stop` sent SIGTERM and gave up
+  after 15 seconds, while the server allows itself 30 to finish in-flight work.
+  `/v1/activity/stream` is in flight until its client goes away, so a browser
+  left open on the console held shutdown for the full budget every time. `stop`
+  reported a server that would not exit, `restart` returned before it ever
+  started one, and the server then exited on its own a few seconds later,
+  leaving a stale pid file and no server.
+
+  Two things were wrong. Shutdown now closes the streams instead of waiting for
+  the browser: they watch for it alongside their client's disconnect. And the
+  server's budget is a declared setting (`server.shutdown_wait`) rather than a
+  literal in two packages, which is how the two came to disagree; `stop` waits
+  it out plus a margin, whatever it is set to.
+
 ### Added
 
 - **The server can now say what it is doing, and why.** It kept no record of

@@ -168,6 +168,10 @@ func (d Deps) handleActivityStream(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-d.shuttingDown:
+			// The server is stopping. Leaving would otherwise be the
+			// client's decision alone, and it is not watching for one.
+			return
 		case ev, ok := <-events:
 			if !ok {
 				return

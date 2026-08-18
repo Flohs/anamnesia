@@ -91,6 +91,11 @@ type Config struct {
 // text-embedding-3-small and the schema built by the migrations.
 const DefaultEmbedDims = 1536
 
+// DefaultShutdownWait is how long the server may take to stop. The CLI
+// waits for it to exit, so it has to know the same number: exported
+// rather than written twice.
+const DefaultShutdownWait = 30 * time.Second
+
 // Load reads the environment and produces a Config. Every parse failure is
 // reported rather than defaulted, and all of them are collected so one run
 // surfaces every problem instead of one per attempt.
@@ -159,7 +164,7 @@ func Load() (*Config, error) {
 	c := &Config{
 		HTTPAddr:         str("ANAMNESIA_HTTP_ADDR", "127.0.0.1:8181"),
 		ServerToken:      os.Getenv("ANAMNESIA_SERVER_TOKEN"),
-		ShutdownWait:     dur("ANAMNESIA_SHUTDOWN_WAIT", 30*time.Second),
+		ShutdownWait:     dur("ANAMNESIA_SHUTDOWN_WAIT", DefaultShutdownWait),
 		DatabaseURL:      os.Getenv("ANAMNESIA_DATABASE_URL"),
 		DefaultUser:      str("ANAMNESIA_DEFAULT_USER", "default"),
 		DefaultProject:   os.Getenv("ANAMNESIA_DEFAULT_PROJECT"),

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -320,5 +321,45 @@ func TestStreamedTraceFrameCarriesStepTimings(t *testing.T) {
 	}
 	if timings[0].(map[string]any)["name"] != "vector" {
 		t.Errorf("timing = %v, want the vector step", timings[0])
+	}
+}
+
+// A stream handler returns when its client disconnects, and a browser
+// with a console tab open does not disconnect because the server was
+// asked to stop. Without a shutdown signal of its own, Shutdown waits out
+// its entire budget on every restart, and `anamnesia stop` gives up
+// before the server does.
+func TestShutdownDoesNotWaitForAnOpenActivityStream(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer("", Deps{Activity: activity.New(10)})
+	go srv.Serve(ln)
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/v1/activity/stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	// Read the opening frame, so the handler is provably inside its loop
+	// rather than still setting up.
+	stream := &sseReader{t: t, r: bufio.NewReader(resp.Body)}
+	if event, _ := stream.frame(); event != "snapshot" {
+		t.Fatalf("first event = %q, want snapshot", event)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Shutdown(ctx) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Shutdown returned %v, want a clean stop", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown is still waiting on an open activity stream")
 	}
 }

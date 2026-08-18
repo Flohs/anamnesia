@@ -113,6 +113,8 @@ var settings = []setting{
 		Doc: "Optional shared secret. Required in practice whenever server.addr is not loopback."},
 	{Key: "server.autostart", Kind: kBool, Def: "true", Env: "",
 		Doc: "Let hooks start the stack on demand when it is not running, so a new session heals itself instead of silently losing memory."},
+	{Key: "server.shutdown_wait", Kind: kDuration, Def: "30s", Env: "ANAMNESIA_SHUTDOWN_WAIT",
+		Doc: "How long the server may take to finish in-flight work when asked to stop. `stop` and `restart` wait this out before reporting a server that will not exit."},
 
 	// ─── postgres ────────────────────────────────────────────────────
 	{Key: "postgres.url", Kind: kString, Def: "", Env: "",

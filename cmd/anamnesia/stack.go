@@ -29,6 +29,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/flohs/anamnesia/internal/config"
 	"github.com/flohs/anamnesia/internal/httpapi"
 )
 
@@ -244,7 +245,8 @@ func stopServer(hc *hostConfig, out io.Writer) error {
 	if err := proc.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return fmt.Errorf("signal server: %w", err)
 	}
-	deadline := time.Now().Add(15 * time.Second)
+	wait := stopWait(hc)
+	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		if !processAlive(pid) {
 			fmt.Fprintf(out, "  server stopped (pid %d)\n", pid)
@@ -252,7 +254,23 @@ func stopServer(hc *hostConfig, out io.Writer) error {
 		}
 		time.Sleep(150 * time.Millisecond)
 	}
-	return fmt.Errorf("server (pid %d) did not exit within 15s", pid)
+	return fmt.Errorf("server (pid %d) did not exit within %s", pid, wait)
+}
+
+// stopWaitGrace is what stop allows the server on top of its own
+// shutdown budget, for the exit itself once the budget is spent.
+const stopWaitGrace = 5 * time.Second
+
+// stopWait is how long stop waits after SIGTERM. It has to outlast the
+// budget the server gives itself, or stop reports a failure while the
+// server is still doing exactly what it was asked to do — and `restart`,
+// which stops before it starts, then never starts anything.
+func stopWait(hc *hostConfig) time.Duration {
+	budget := hc.Dur("server.shutdown_wait")
+	if budget <= 0 {
+		budget = config.DefaultShutdownWait
+	}
+	return budget + stopWaitGrace
 }
 
 // ─── liveness ────────────────────────────────────────────────────────

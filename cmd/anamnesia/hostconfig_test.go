@@ -566,3 +566,41 @@ func TestDecaySettingsReachTheServer(t *testing.T) {
 		}
 	}
 }
+
+func TestShutdownWaitDefaultMatchesTheServer(t *testing.T) {
+	// The CLI waits for the server to exit, and the server decides how
+	// long it may take. Two literals in two packages is how they came to
+	// disagree, so this fails the moment they drift again.
+	s, ok := settingByKey["server.shutdown_wait"]
+	if !ok {
+		t.Fatal("the server's shutdown budget is not a declared setting")
+	}
+	got, err := time.ParseDuration(s.Def)
+	if err != nil {
+		t.Fatalf("server.shutdown_wait default %q is not a duration: %v", s.Def, err)
+	}
+	if got != config.DefaultShutdownWait {
+		t.Errorf("server.shutdown_wait defaults to %s, but the server waits %s",
+			got, config.DefaultShutdownWait)
+	}
+}
+
+func TestStopWaitsLongerThanTheServerMayTake(t *testing.T) {
+	// `stop` sending SIGTERM and then giving up before the server's own
+	// budget expires leaves nothing running and, in `restart`, nothing
+	// restarted. Whatever the budget is, stop outlasts it.
+	for _, budget := range []string{"", "30s", "120s"} {
+		hc := testHostConfig(t)
+		if budget != "" {
+			hc.values["server.shutdown_wait"] = budget
+		}
+		want := config.DefaultShutdownWait
+		if budget != "" {
+			want, _ = time.ParseDuration(budget)
+		}
+		if got := stopWait(hc); got <= want {
+			t.Errorf("with a %s budget, stop gives up after %s: the server may still be shutting down",
+				want, got)
+		}
+	}
+}
