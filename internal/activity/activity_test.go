@@ -397,3 +397,29 @@ func TestStepTimingsKeepOnlyTheLabellingDetail(t *testing.T) {
 		t.Errorf("llm timing detail = %v, want the model alone", timings[2].Detail)
 	}
 }
+
+func TestQueueDepthReachesSubscribers(t *testing.T) {
+	// Depth arrives once in the snapshot and then only when it changes.
+	// Without an event for it, a console tile shows the depth at connect
+	// time for as long as the page stays open.
+	r := New(4)
+	events, unsubscribe := r.Subscribe()
+	defer unsubscribe()
+
+	r.PublishQueues(2, 7)
+
+	select {
+	case ev := <-events:
+		if ev.Kind != "queues" {
+			t.Fatalf("event kind = %q, want queues", ev.Kind)
+		}
+		if ev.Queues == nil {
+			t.Fatal("queues event carries no depth")
+		}
+		if ev.Queues.Extract != 2 || ev.Queues.Embed != 7 {
+			t.Errorf("depth = %+v, want extract 2 embed 7", *ev.Queues)
+		}
+	default:
+		t.Fatal("no event was published")
+	}
+}

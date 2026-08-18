@@ -133,6 +133,18 @@ were rebuilt around being verifiable.
   without pulling every trace in full. A step that has a model or a gate
   verdict carries that too, and nothing else.
 
+- **Queue depth now moves on the stream.** It arrived in the opening
+  snapshot and never again, because the recorder could emit `trace`, `step`
+  and `loops` events and nothing else. A console tile therefore showed the
+  depth at the moment the page connected for as long as it stayed open: an
+  embedding finished, the worker lane said so, and the tile kept reporting
+  work that was already done. There is a `queues` event now, published from
+  the three places depth actually changes — a source arriving, the extractor
+  draining one, the embed worker backfilling a batch — and not on a timer, so
+  an idle install stays silent instead of counting rows once a second to
+  report a number that has not moved. It carries the same two fields under
+  the same names the snapshot uses, server-wide as the snapshot is.
+
 - **Every worker tick now says what it did.** The six loops report "1 source,
   2 operations" or "nothing to embed" rather than only proving the process is
   alive.

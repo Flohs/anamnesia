@@ -166,6 +166,7 @@ func (w *Worker) tickEmbed(ctx context.Context) (string, error) {
 	if len(facts) == 0 && len(exps) == 0 {
 		return "nothing to embed", nil
 	}
+	w.publishQueues(ctx)
 	return fmt.Sprintf("embedded %d facts, %d experiences", len(facts), len(exps)), nil
 }
 
@@ -240,11 +241,27 @@ func (w *Worker) tickExtract(ctx context.Context) (string, error) {
 			w.Log.Info("extracted", "source", src.ID, "kind", src.Kind, "ops", ops)
 		}
 	}
+	w.publishQueues(ctx)
 	result := fmt.Sprintf("%d sources, %d operations", len(pending), operations)
 	if failed > 0 {
 		result += fmt.Sprintf(", %d failed", failed)
 	}
 	return result, nil
+}
+
+// publishQueues announces the new queue depth to anyone watching the
+// stream. Called from the ticks that drain a queue, never from one that
+// found nothing to do: an idle install would otherwise run two COUNTs a
+// second to report a number that has not moved.
+func (w *Worker) publishQueues(ctx context.Context) {
+	if w.Activity == nil || w.Store == nil {
+		return
+	}
+	extract, embed, err := w.Store.QueuePendingAll(ctx)
+	if err != nil {
+		return // depth is a nicety; failing to read it is not worth a log line
+	}
+	w.Activity.PublishQueues(extract, embed)
 }
 
 func (w *Worker) tickPurgeSources(ctx context.Context) (string, error) {

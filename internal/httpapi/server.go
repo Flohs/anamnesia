@@ -729,6 +729,14 @@ func (d Deps) handleIngest(w http.ResponseWriter, r *http.Request) {
 		"bytes":     len(content),
 	})
 	tr.End("ok", fmt.Sprintf("Queued a %s %s source", humanBytes(len(content)), req.Kind))
+	// Arrival is the third occasion depth changes, and the only one the
+	// worker cannot see: without this the tile stays flat until the next
+	// extract tick drains what just landed.
+	if d.Activity != nil && d.Store != nil {
+		if extract, embed, err := d.Store.QueuePendingAll(r.Context()); err == nil {
+			d.Activity.PublishQueues(extract, embed)
+		}
+	}
 	writeJSON(w, http.StatusAccepted, IngestResponse{
 		SourceID: src.ID, Queued: true, ExpiresAt: src.ExpiresAt,
 	})

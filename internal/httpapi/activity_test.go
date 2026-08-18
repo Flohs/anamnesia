@@ -363,3 +363,27 @@ func TestShutdownDoesNotWaitForAnOpenActivityStream(t *testing.T) {
 		t.Fatal("Shutdown is still waiting on an open activity stream")
 	}
 }
+
+func TestStreamedQueuesFrameMatchesTheSnapshotShape(t *testing.T) {
+	// The console reads depth from the snapshot first and the event
+	// afterwards. Different field names would make the second source
+	// unusable without special-casing it.
+	name, payload := sseFrame(activity.Event{
+		Kind:   "queues",
+		Queues: &activity.QueueDepth{Extract: 0, Embed: 2},
+	})
+	if name != "queues" {
+		t.Fatalf("frame = %q, want queues", name)
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["extract_pending"] != float64(0) || got["embed_pending"] != float64(2) {
+		t.Errorf("frame = %v, want the snapshot's own field names", got)
+	}
+}

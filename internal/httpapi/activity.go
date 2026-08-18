@@ -241,6 +241,16 @@ func sseFrame(ev activity.Event) (string, any) {
 			return "", nil
 		}
 		return "step", stepEvent{TraceID: ev.TraceID.String(), Step: viewStep(*ev.Step)}
+	case "queues":
+		if ev.Queues == nil {
+			return "", nil
+		}
+		// The same shape the snapshot carries, so a reader needs no
+		// second code path for the refresh.
+		return "queues", QueuePendingResponse{
+			ExtractPending: ev.Queues.Extract,
+			EmbedPending:   ev.Queues.Embed,
+		}
 	case "loops":
 		loops := make([]loopView, 0, len(ev.Loops))
 		for _, l := range ev.Loops {

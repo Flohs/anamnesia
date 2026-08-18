@@ -91,11 +91,21 @@ const subscriberBuffer = 64
 
 // Event is one thing that happened, delivered to stream subscribers.
 type Event struct {
-	Kind    string // trace | step | loops
+	Kind    string // trace | step | loops | queues
 	Trace   *Trace
 	TraceID uuid.UUID
 	Step    *Step
 	Loops   []LoopState
+	Queues  *QueueDepth
+}
+
+// QueueDepth is how much background work is outstanding, server-wide.
+// Server-wide because that is what the snapshot reports, and a reader
+// refreshing the snapshot's number with a differently scoped one would
+// watch a tile alternate between two quantities.
+type QueueDepth struct {
+	Extract int
+	Embed   int
 }
 
 // Snapshot is the recorder's whole state at one instant.
@@ -380,6 +390,19 @@ func (r *Recorder) LoopStart(name string) func(result string, err error) {
 		}
 		r.publish(Event{Kind: "loops", Loops: r.loopStates()})
 	}
+}
+
+// PublishQueues announces queue depth. Called after work that can have
+// changed it, rather than every tick: depth moves on exactly three
+// occasions and the rest of the time this would be two COUNTs answering
+// a question nobody asked.
+func (r *Recorder) PublishQueues(extract, embed int) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.publish(Event{Kind: "queues", Queues: &QueueDepth{Extract: extract, Embed: embed}})
 }
 
 // loop returns the named loop's state, creating it on first sight. Must
