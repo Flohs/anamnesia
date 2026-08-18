@@ -82,6 +82,16 @@ were rebuilt around being verifiable.
   recorded run of a verb was a failure, and doctor reported it as a fault while
   everything else passed. A failure older than the running server is now shown
   as history rather than counted against the install.
+- **`update` said "Update complete" after failing to replace the binary.** When
+  the install directory needs elevated permissions, the self-update is skipped
+  and the rest of the installation is still reconciled, which is deliberate.
+  Ending with "Update complete" made that read as a successful upgrade, and is
+  how someone ends up believing they are running a version they are not. It now
+  states that the binary was not updated, and which version is still installed.
+- **The sudo suggestion dropped the flags that chose the release.** Someone who
+  ran `update --pre` was told to run `sudo anamnesia update`, which consults the
+  stable channel and would not find the prerelease they were installing. The
+  suggestion now carries `--pre` and `--force` through.
 - `trimLine` no longer splits multi-byte characters.
 - Claude Code's config files are backed up before they are first modified.
 

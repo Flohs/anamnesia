@@ -93,9 +93,11 @@ func runUpdate(cmd *cobra.Command, _ []string) error {
 	// Replace the binary first, then hand the rest of the update to it. The
 	// steps that follow write the version into Claude Code's hooks and enforce
 	// the schema, so they have to run as the version that will actually serve.
+	selfUpdateFailed := false
 	if !updateNoSelf && updateHandedOffBy == "" {
 		result, err := selfUpdate(ctx, out, updateForceSelf, updatePre)
 		if err != nil {
+			selfUpdateFailed = true
 			// Failing to upgrade the binary is not a reason to abandon the
 			// reconcile: the local install may still need repairing, and often
 			// that is why someone ran this. Say plainly that the binary did not
@@ -165,6 +167,15 @@ func runUpdate(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	fmt.Fprintln(out)
+	if selfUpdateFailed {
+		// The installation was reconciled, but the binary is the one we
+		// started with. Saying "update complete" here reads as a successful
+		// upgrade and is how someone ends up believing they are on a version
+		// they are not.
+		fmt.Fprintf(out, "Reconciled, but the binary was NOT updated: still %s.\n", version)
+		fmt.Fprintf(out, "To finish upgrading, run: %s\n", sudoRetryCommand(updateForceSelf, updatePre))
+		return nil
+	}
 	fmt.Fprintln(out, "Update complete. Run `anamnesia doctor` for a full check.")
 	return nil
 }

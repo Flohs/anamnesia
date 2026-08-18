@@ -406,7 +406,7 @@ func verifyDownloadedVersion(ctx context.Context, path, tag string) error {
 // The replacement is a rename within the destination directory, so it is
 // atomic and never leaves a half-written executable. Replacing a running
 // binary this way is safe on Unix: the running process keeps the old inode.
-func installBinary(src, dest string) error {
+func installBinary(src, dest, retryCmd string) error {
 	dir := filepath.Dir(dest)
 	staged := filepath.Join(dir, ".anamnesia-update-"+filepath.Base(dest))
 
@@ -419,7 +419,7 @@ func installBinary(src, dest string) error {
 		mode = info.Mode().Perm()
 	}
 	if err := os.WriteFile(staged, data, mode); err != nil {
-		return installPermissionError(dest, err)
+		return installPermissionError(dest, retryCmd, err)
 	}
 	if err := os.Chmod(staged, mode); err != nil {
 		_ = os.Remove(staged)
@@ -427,22 +427,39 @@ func installBinary(src, dest string) error {
 	}
 	if err := os.Rename(staged, dest); err != nil {
 		_ = os.Remove(staged)
-		return installPermissionError(dest, err)
+		return installPermissionError(dest, retryCmd, err)
 	}
 	return nil
 }
 
 // installPermissionError turns an opaque EACCES into the actual next step.
 // Anamnesia does not escalate privileges on its own.
-func installPermissionError(dest string, cause error) error {
+//
+// retryCmd is the command the user actually needs, flags and all. Suggesting a
+// bare `sudo anamnesia update` to someone who ran `--pre` sends them to a
+// command that will not find the release they were installing.
+func installPermissionError(dest, retryCmd string, cause error) error {
 	if !os.IsPermission(cause) {
 		return fmt.Errorf("install to %s: %w", dest, cause)
 	}
 	return fmt.Errorf(`cannot write to %s: %w
 
 That location needs elevated permissions. Either:
-  sudo anamnesia update
-or install somewhere you own and update there instead`, dest, cause)
+  %s
+or install somewhere you own and update there instead`, dest, cause, retryCmd)
+}
+
+// sudoRetryCommand renders the invocation that would get past a permission
+// failure, preserving the flags that chose what to install.
+func sudoRetryCommand(force, pre bool) string {
+	cmd := "sudo anamnesia update"
+	if pre {
+		cmd += " --pre"
+	}
+	if force {
+		cmd += " --force"
+	}
+	return cmd
 }
 
 // ─── the self-update step ────────────────────────────────────────────
@@ -504,7 +521,7 @@ func selfUpdate(ctx context.Context, out io.Writer, force, pre bool) (selfUpdate
 	if err != nil {
 		return res, err
 	}
-	if err := installBinary(verified, self); err != nil {
+	if err := installBinary(verified, self, sudoRetryCommand(force, pre)); err != nil {
 		return res, err
 	}
 	res.Replaced = true

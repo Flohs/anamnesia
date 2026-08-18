@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -324,7 +325,7 @@ func TestInstallBinaryReplacesAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := installBinary(src, dest); err != nil {
+	if err := installBinary(src, dest, "sudo anamnesia update"); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(dest)
@@ -538,5 +539,50 @@ func TestNoStableReleasePointsAtThePrerelease(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("message does not mention %q: %v", want, err)
 		}
+	}
+}
+
+// TestSudoRetryCommandKeepsFlags: suggesting a bare `sudo anamnesia update` to
+// someone who ran --pre sends them to a command that will not find the release
+// they were installing.
+func TestSudoRetryCommandKeepsFlags(t *testing.T) {
+	cases := []struct {
+		force, pre bool
+		want       string
+	}{
+		{false, false, "sudo anamnesia update"},
+		{false, true, "sudo anamnesia update --pre"},
+		{true, false, "sudo anamnesia update --force"},
+		{true, true, "sudo anamnesia update --pre --force"},
+	}
+	for _, c := range cases {
+		if got := sudoRetryCommand(c.force, c.pre); got != c.want {
+			t.Errorf("sudoRetryCommand(force=%v, pre=%v) = %q, want %q", c.force, c.pre, got, c.want)
+		}
+	}
+}
+
+// TestInstallPermissionErrorNamesTheRetryCommand keeps the instruction and the
+// suggestion from drifting apart. The error is constructed directly rather than
+// provoked with a read-only directory, because tests often run as root, where
+// permissions are not enforced and the failure would never occur.
+func TestInstallPermissionErrorNamesTheRetryCommand(t *testing.T) {
+	err := installPermissionError("/usr/local/bin/anamnesia", "sudo anamnesia update --pre", os.ErrPermission)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{"/usr/local/bin/anamnesia", "sudo anamnesia update --pre"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not mention %q: %v", want, err)
+		}
+	}
+
+	// A failure that is not about permissions must not suggest sudo.
+	other := installPermissionError("/tmp/x", "sudo anamnesia update", errors.New("disk full"))
+	if strings.Contains(other.Error(), "sudo") {
+		t.Errorf("a non-permission error suggested sudo: %v", other)
+	}
+	if !strings.Contains(other.Error(), "disk full") {
+		t.Errorf("underlying cause lost: %v", other)
 	}
 }
