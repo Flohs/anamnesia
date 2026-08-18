@@ -308,7 +308,17 @@ func runEval(cmd *cobra.Command, _ []string) error {
 	}
 	report.At = time.Now().UTC().Format(time.RFC3339)
 
-	if evalJSON {
+	return writeEvalResult(out, cmd.ErrOrStderr(), evalJSON, report, evalBaseline)
+}
+
+// writeEvalResult writes the report to out — JSON or the rendered text,
+// matching jsonMode — and, if baselinePath is set, compares against it and
+// writes the explanation to errOut, never to out. A --json run is meant to
+// be piped to a file (`eval --json --baseline old.json > new.json` is the
+// CI invocation this is for), and anything but the report on out breaks
+// that redirect the same way the progress line above once did.
+func writeEvalResult(out, errOut io.Writer, jsonMode bool, report evalReport, baselinePath string) error {
+	if jsonMode {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(report); err != nil {
@@ -318,23 +328,24 @@ func runEval(cmd *cobra.Command, _ []string) error {
 		renderReport(out, report)
 	}
 
-	if evalBaseline != "" {
-		raw, err := os.ReadFile(evalBaseline)
-		if err != nil {
-			return fmt.Errorf("read baseline: %w", err)
-		}
-		var base evalReport
-		if err := json.Unmarshal(raw, &base); err != nil {
-			return fmt.Errorf("parse baseline %s: %w", evalBaseline, err)
-		}
-		regressed, lines := compareToBaseline(base, report)
-		fmt.Fprintln(out)
-		for _, l := range lines {
-			fmt.Fprintln(out, l)
-		}
-		if regressed {
-			return errors.New("retrieval regressed against the baseline")
-		}
+	if baselinePath == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(baselinePath)
+	if err != nil {
+		return fmt.Errorf("read baseline: %w", err)
+	}
+	var base evalReport
+	if err := json.Unmarshal(raw, &base); err != nil {
+		return fmt.Errorf("parse baseline %s: %w", baselinePath, err)
+	}
+	regressed, lines := compareToBaseline(base, report)
+	fmt.Fprintln(errOut)
+	for _, l := range lines {
+		fmt.Fprintln(errOut, l)
+	}
+	if regressed {
+		return errors.New("retrieval regressed against the baseline")
 	}
 	return nil
 }

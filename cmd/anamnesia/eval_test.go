@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -48,5 +51,35 @@ func TestBaselineComparisonAcceptsAnImprovement(t *testing.T) {
 	now := evalReport{Aggregate: aggregateScore{RecallAt: map[int]float64{5: 0.71}, PrecisionAt: map[int]float64{5: 0.5}}}
 	if regressed, _ := compareToBaseline(base, now); regressed {
 		t.Error("an improvement was reported as a regression")
+	}
+}
+
+func TestJSONRunSendsOnlyTheReportToStdout(t *testing.T) {
+	// The bug this guards against: `eval --json --baseline old.json >
+	// new.json` is the natural CI invocation (capture the artifact and
+	// gate in one call), and anything besides the report reaching out
+	// makes the redirected file invalid JSON.
+	path := filepath.Join(t.TempDir(), "baseline.json")
+	base := evalReport{Aggregate: aggregateScore{RecallAt: map[int]float64{5: 0.9}, PrecisionAt: map[int]float64{5: 0.5}}}
+	raw, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	now := evalReport{Queries: 1, Aggregate: aggregateScore{RecallAt: map[int]float64{5: 0.9}, PrecisionAt: map[int]float64{5: 0.5}}}
+	var out, errOut strings.Builder
+	if err := writeEvalResult(&out, &errOut, true, now, path); err != nil {
+		t.Fatalf("writeEvalResult: %v", err)
+	}
+
+	var decoded evalReport
+	if err := json.Unmarshal([]byte(out.String()), &decoded); err != nil {
+		t.Errorf("stdout was not valid JSON: %v\nstdout:\n%s", err, out.String())
+	}
+	if errOut.Len() == 0 {
+		t.Error("the baseline comparison did not reach stderr")
 	}
 }
