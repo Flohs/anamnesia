@@ -14,6 +14,7 @@ package activity
 
 import (
 	"encoding/json"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -287,9 +288,18 @@ func bound(detail map[string]any, budget int) (map[string]any, int) {
 			truncated = true
 		}
 		size := valueSize(v)
-		if size > maxDetailValue || spent+size > budget {
-			truncated = true
-			continue
+		room := min(maxDetailValue, budget-spent)
+		if size > room {
+			// A list is shortened rather than dropped: the head of a
+			// ranked list or a scope list is the part worth keeping, and
+			// dropping the value outright leaves a step saying only that
+			// something existed.
+			shorter, shorterSize, ok := headThatFits(v, room)
+			if !ok {
+				truncated = true
+				continue
+			}
+			v, size, truncated = shorter, shorterSize, true
 		}
 		spent += size
 		out[k] = v
@@ -432,4 +442,28 @@ func (r *Recorder) publish(ev Event) {
 			r.dropped++
 		}
 	}
+}
+
+// headThatFits keeps as many leading elements of a slice as the budget
+// allows. Reports false for anything that is not a slice, or a slice
+// whose first element alone is already too big.
+func headThatFits(v any, budget int) (any, int, bool) {
+	rv := reflect.ValueOf(v)
+	if !rv.IsValid() || rv.Kind() != reflect.Slice {
+		return nil, 0, false
+	}
+	out := reflect.MakeSlice(rv.Type(), 0, rv.Len())
+	spent := 2 // the brackets
+	for i := 0; i < rv.Len(); i++ {
+		size := valueSize(rv.Index(i).Interface()) + 1 // and the comma
+		if spent+size > budget {
+			break
+		}
+		out = reflect.Append(out, rv.Index(i))
+		spent += size
+	}
+	if out.Len() == 0 {
+		return nil, 0, false
+	}
+	return out.Interface(), spent, true
 }

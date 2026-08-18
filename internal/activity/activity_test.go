@@ -2,6 +2,7 @@ package activity
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -296,5 +297,46 @@ func TestNilRecorderNeverPanics(t *testing.T) {
 	cancel()
 	if _, ok := <-ch; ok {
 		t.Error("Subscribe on a nil recorder delivered an event")
+	}
+}
+
+func TestOversizedListKeepsAsManyEntriesAsFit(t *testing.T) {
+	// A ranked list of candidates, or the scopes a consolidation pass
+	// covered, can pass the per-value cap. Dropping the whole value
+	// leaves a step that says a list existed and nothing about it, which
+	// is worse than a short list: the first entries are the ones that
+	// matter in every list this records.
+	r := New(2)
+	tr := r.Begin("retrieve", "alice", "proj")
+	hits := make([]map[string]any, 300)
+	for i := range hits {
+		hits[i] = map[string]any{
+			"id":    fmt.Sprintf("hit-%03d", i),
+			"title": "a memory with a title of some length",
+			"score": 0.5,
+		}
+	}
+	tr.Step("fuse", "RRF fused 300 candidates", map[string]any{"ranked": hits})
+	tr.End("ok", "done")
+
+	got, _ := r.Trace(tr.ID)
+	kept, ok := got.Steps[0].Detail["ranked"].([]map[string]any)
+	if !ok {
+		t.Fatalf("ranked = %T, want the list to survive in part", got.Steps[0].Detail["ranked"])
+	}
+	if len(kept) == 0 {
+		t.Fatal("the whole list was dropped")
+	}
+	if len(kept) == len(hits) {
+		t.Fatal("nothing was dropped, so the cap did not apply")
+	}
+	if kept[0]["id"] != "hit-000" {
+		t.Errorf("first kept entry = %v, want the head of the list", kept[0])
+	}
+	if got.Steps[0].Detail["truncated"] != true {
+		t.Error("a shortened list has to say so")
+	}
+	if size := valueSize(kept); size > maxDetailValue {
+		t.Errorf("kept %d bytes, want at most %d", size, maxDetailValue)
 	}
 }

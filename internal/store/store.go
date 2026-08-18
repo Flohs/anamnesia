@@ -115,6 +115,35 @@ func (s *Store) EnsureProject(ctx context.Context, userID uuid.UUID, slug string
 }
 
 // LookupUserHandle returns the handle for a user id.
+// LookupUser resolves a handle without creating it. The read API needs
+// this: EnsureUser would turn ?user=typo into a row, and an endpoint
+// that promises to change nothing has to mean it.
+func (s *Store) LookupUser(ctx context.Context, handle string) (uuid.UUID, bool, error) {
+	var id uuid.UUID
+	err := s.Pool.QueryRow(ctx, `SELECT id FROM users WHERE handle = $1`, handle).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	return id, true, nil
+}
+
+// LookupProject resolves a slug within a user without creating it.
+func (s *Store) LookupProject(ctx context.Context, userID uuid.UUID, slug string) (uuid.UUID, bool, error) {
+	var id uuid.UUID
+	err := s.Pool.QueryRow(ctx,
+		`SELECT id FROM projects WHERE user_id = $1 AND slug = $2`, userID, slug).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	return id, true, nil
+}
+
 func (s *Store) LookupUserHandle(ctx context.Context, id uuid.UUID) (string, error) {
 	var h string
 	err := s.Pool.QueryRow(ctx, `SELECT handle FROM users WHERE id = $1`, id).Scan(&h)

@@ -14,6 +14,14 @@
 //	GET  /v1/activity/stream the same, as server-sent events
 //	GET  /v1/config          resolved settings, secrets masked
 //	GET  /v1/hooks           parsed tail of ~/.anamnesia/hooks.log
+//	GET  /v1/stats           counts per domain for one scope
+//	GET  /v1/projects        projects with counts and last activity
+//	GET  /v1/users           users with counts
+//	GET  /v1/{domain}        one page of facts, experiences, skills,
+//	                         entities, edges, sources or working memory
+//	GET  /v1/{domain}/{id}   one row of it
+//	GET  /v1/stats/activity  writes per day per project
+//	GET  /v1/embedding-map   embeddings projected onto two components
 //	POST /mcp                MCP transport (streamable-http)
 //
 // Auth is optional: if Config.ServerToken is set, every request must
@@ -104,6 +112,15 @@ func NewServer(addr string, d Deps) *http.Server {
 	mux.Handle("GET /v1/activity/{id}", d.protect(http.HandlerFunc(d.handleActivityTrace)))
 	mux.Handle("GET /v1/config", d.protect(http.HandlerFunc(d.handleConfig)))
 	mux.Handle("GET /v1/hooks", d.protect(http.HandlerFunc(d.handleHooks)))
+	mux.Handle("GET /v1/stats", d.protect(http.HandlerFunc(d.handleStats)))
+	mux.Handle("GET /v1/projects", d.protect(http.HandlerFunc(d.handleProjects)))
+	mux.Handle("GET /v1/users", d.protect(http.HandlerFunc(d.handleUsers)))
+	mux.Handle("GET /v1/stats/activity", d.protect(http.HandlerFunc(d.handleActivityBuckets)))
+	mux.Handle("GET /v1/embedding-map", d.protect(http.HandlerFunc(d.handleEmbeddingMap)))
+	for _, domain := range browseDomains {
+		mux.Handle("GET /v1/"+domain, d.protect(d.browseHandler(domain)))
+		mux.Handle("GET /v1/"+domain+"/{id}", d.protect(d.detailHandler(domain)))
+	}
 
 	if d.MCPHandler != nil {
 		mux.Handle("/mcp", d.protect(d.MCPHandler))
@@ -355,21 +372,41 @@ func (d Deps) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 	if ev.MaxExperiences <= 0 {
 		ev.MaxExperiences = 10
 	}
+	// What a session starts with is worth recording: an empty session
+	// start is the symptom every "is this thing on?" question begins
+	// from, and this says whether it was empty because nothing was found
+	// or because nothing was asked for.
+	tr := d.Activity.Begin("session-start", d.userName(ev.User), d.projectName(ev.Project))
 	facts, err := d.Store.ListFacts(r.Context(), scope, "", ev.MaxFacts)
 	if err != nil {
+		tr.Fail("load", err)
+		tr.End("failed", "Could not load memory for this session")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	exps, err := d.Store.ListExperiences(r.Context(), scope, ev.MaxExperiences)
 	if err != nil {
+		tr.Fail("load", err)
+		tr.End("failed", "Could not load memory for this session")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	id, err := d.Store.GetIdentity(r.Context(), scope)
 	if err != nil {
+		tr.Fail("load", err)
+		tr.End("failed", "Could not load memory for this session")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	tr.Step("load", fmt.Sprintf("Loaded %d facts and %d experiences into the session",
+		len(facts), len(exps)), map[string]any{
+		"facts":       len(facts),
+		"experiences": len(exps),
+		"persona":     id.SystemPrompt != "",
+		"limits":      map[string]any{"max_facts": ev.MaxFacts, "max_experiences": ev.MaxExperiences},
+	})
+	tr.End("ok", fmt.Sprintf("Started a session with %d facts and %d experiences",
+		len(facts), len(exps)))
 	writeJSON(w, http.StatusOK, SessionStartResp{
 		Facts: facts, Experiences: exps, PersonaBlock: id.SystemPrompt,
 	})
@@ -663,6 +700,20 @@ func (d Deps) handleIngest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Ingest is asynchronous: this hands the source to the extractor and
+	// returns, and the extractor opens its own trace on a later tick.
+	// So the arrival gets a trace of its own, carrying the source id
+	// that joins the two. Without it a checkpoint is invisible for up to
+	// a whole extract interval, which reads as nothing having happened.
+	tr := d.Activity.Begin("queued", d.userName(req.User), d.projectName(req.Project))
+	tr.Step("queued", fmt.Sprintf("Queued a %s %s source for extraction",
+		humanBytes(len(content)), req.Kind), map[string]any{
+		"source_id": src.ID.String(),
+		"kind":      req.Kind,
+		"title":     req.Title,
+		"bytes":     len(content),
+	})
+	tr.End("ok", fmt.Sprintf("Queued a %s %s source", humanBytes(len(content)), req.Kind))
 	writeJSON(w, http.StatusAccepted, IngestResponse{
 		SourceID: src.ID, Queued: true, ExpiresAt: src.ExpiresAt,
 	})

@@ -193,7 +193,7 @@ func (w *Worker) tickConsolidate(ctx context.Context) (string, error) {
 	if w.LLM == nil {
 		return "no llm configured", nil
 	}
-	if err := ConsolidationRun(ctx, w.Store, w.LLM, w.Cfg.Consolidate, w.Log, w.Cfg.ConsolidateEvery); err != nil {
+	if err := ConsolidationRun(ctx, w.Store, w.LLM, w.Cfg.Consolidate, w.Log, w.Cfg.ConsolidateEvery, w.Activity); err != nil {
 		return "", err
 	}
 	return "consolidation pass complete", nil

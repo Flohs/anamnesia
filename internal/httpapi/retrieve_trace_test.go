@@ -102,3 +102,84 @@ func TestRetrieveRecordsATrace(t *testing.T) {
 		t.Errorf("result step = %v, want what was handed back to the caller", result)
 	}
 }
+
+func TestSessionStartRecordsWhatItLoaded(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	rec := activity.New(4)
+	st, scope, _, _, base := dbServer(t, rec)
+	if err := st.RecordExperience(context.Background(), &anamnesia.Experience{
+		Scope: scope, Kind: anamnesia.ExperienceCase, Title: "a memory", Body: "body",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(map[string]any{})
+	resp, err := http.Post(base+"/v1/sessions/start", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	snap := rec.Snapshot()
+	if len(snap.Traces) != 1 {
+		t.Fatalf("traces = %d, want one", len(snap.Traces))
+	}
+	tr, _ := rec.Trace(snap.Traces[0].ID)
+	if tr.Kind != "session-start" || tr.Status != "ok" {
+		t.Errorf("trace = %s/%s, want session-start/ok", tr.Kind, tr.Status)
+	}
+	if len(tr.Steps) != 1 || tr.Steps[0].Name != "load" {
+		t.Fatalf("steps = %+v, want one load step", tr.Steps)
+	}
+	detail := tr.Steps[0].Detail
+	if detail["experiences"] != 1 {
+		t.Errorf("load detail = %v, want the one experience counted", detail)
+	}
+}
+
+func TestIngestRecordsItsArrival(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	rec := activity.New(4)
+	_, _, _, _, base := dbServer(t, rec)
+
+	body, _ := json.Marshal(map[string]any{
+		"kind": "chat-turn", "content": "a checkpoint that will be extracted later",
+	})
+	resp, err := http.Post(base+"/v1/ingest", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+	var ingested map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&ingested); err != nil {
+		t.Fatal(err)
+	}
+
+	snap := rec.Snapshot()
+	if len(snap.Traces) != 1 {
+		t.Fatalf("traces = %d, want the arrival recorded", len(snap.Traces))
+	}
+	tr, _ := rec.Trace(snap.Traces[0].ID)
+	if tr.Kind != "queued" {
+		t.Errorf("kind = %q, want queued: the extractor opens the ingest trace later", tr.Kind)
+	}
+	if len(tr.Steps) != 1 || tr.Steps[0].Name != "queued" {
+		t.Fatalf("steps = %+v", tr.Steps)
+	}
+	// The source id is what joins this to the extractor's own trace.
+	if tr.Steps[0].Detail["source_id"] != ingested["source_id"] {
+		t.Errorf("source_id = %v, want %v", tr.Steps[0].Detail["source_id"], ingested["source_id"])
+	}
+}

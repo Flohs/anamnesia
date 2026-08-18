@@ -82,6 +82,9 @@ func TestActivityReportsLoopsAndTraces(t *testing.T) {
 	if _, ok := trace["steps"]; ok {
 		t.Error("the list view carries step_count, not the steps themselves")
 	}
+	if _, ok := got["queues"]; ok {
+		t.Error("queue counts need a database, and this server has none")
+	}
 }
 
 func TestActivityTraceDetailCarriesSteps(t *testing.T) {

@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/flohs/anamnesia/internal/activity"
 	"github.com/flohs/anamnesia/internal/llm"
 	"github.com/flohs/anamnesia/internal/store"
 	"github.com/flohs/anamnesia/pkg/anamnesia"
@@ -41,7 +42,7 @@ type cluster struct {
 
 // ConsolidationRun executes one consolidation pass across every active
 // (user, project) scope touched in the last `since` window.
-func ConsolidationRun(ctx context.Context, st *store.Store, lm llm.Client, cfg ConsolidateConfig, log *slog.Logger, since time.Duration) error {
+func ConsolidationRun(ctx context.Context, st *store.Store, lm llm.Client, cfg ConsolidateConfig, log *slog.Logger, since time.Duration, rec *activity.Recorder) error {
 	cfg = applyConsolidateDefaults(cfg)
 	if since <= 0 {
 		since = cfg.Window
@@ -51,17 +52,57 @@ func ConsolidationRun(ctx context.Context, st *store.Store, lm llm.Client, cfg C
 	if err != nil {
 		return fmt.Errorf("active scopes: %w", err)
 	}
+	// One trace per pass. Consolidation is the least visible thing the
+	// server does and the most destructive-looking: it supersedes rows
+	// the user wrote. Being able to read why is the point.
+	tr := rec.Begin("consolidate", "", "")
+	tr.Step("scopes", fmt.Sprintf("%d scopes active in the last %s", len(scopes), since),
+		map[string]any{"scopes": scopeDetails(ctx, st, scopes), "window": since.String()})
+	if len(scopes) == 0 {
+		tr.End("skipped", "Nothing has been written recently enough to consolidate")
+		return nil
+	}
+	written := 0
 	for _, sc := range scopes {
-		if err := consolidateScope(ctx, st, lm, cfg, log, sc); err != nil {
+		n, err := consolidateScope(ctx, st, lm, cfg, log, sc, tr)
+		written += n
+		if err != nil {
 			if log != nil {
 				log.Warn("consolidate scope failed",
 					"user_id", sc.UserID, "project_id", sc.ProjectID, "err", err)
 			}
+			tr.Fail("scope", err)
 			// Continue with other scopes — one bad scope shouldn't block
 			// the rest.
 		}
 	}
+	if written == 0 {
+		tr.End("skipped", "No cluster was large enough to distil")
+	} else {
+		tr.End("ok", fmt.Sprintf("Distilled %d new insights", written))
+	}
 	return nil
+}
+
+// scopeDetails labels the scopes a pass covers. Consolidation runs
+// server-wide, so a trace that only carried ids would need a lookup per
+// row to be readable.
+func scopeDetails(ctx context.Context, st *store.Store, scopes []anamnesia.Scope) []map[string]any {
+	out := make([]map[string]any, 0, len(scopes))
+	for _, sc := range scopes {
+		entry := map[string]any{"user_id": sc.UserID.String()}
+		if handle, err := st.LookupUserHandle(ctx, sc.UserID); err == nil {
+			entry["user"] = handle
+		}
+		if sc.ProjectID != nil {
+			entry["project_id"] = sc.ProjectID.String()
+			if slug, err := st.LookupProjectSlug(ctx, *sc.ProjectID); err == nil {
+				entry["project"] = slug
+			}
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // activeScopes returns the (user_id, project_id) pairs that have any
@@ -90,26 +131,66 @@ func activeScopes(ctx context.Context, st *store.Store, since time.Duration) ([]
 	return out, rows.Err()
 }
 
-func consolidateScope(ctx context.Context, st *store.Store, lm llm.Client, cfg ConsolidateConfig, log *slog.Logger, scope anamnesia.Scope) error {
+func consolidateScope(ctx context.Context, st *store.Store, lm llm.Client, cfg ConsolidateConfig, log *slog.Logger, scope anamnesia.Scope, tr *activity.Trace) (int, error) {
 	// Only consolidate abstraction=0 (raw trajectories). Higher levels
 	// are already distilled.
 	cands, err := candidatesForConsolidation(ctx, st, scope, cfg.Window, cfg.BatchLimit)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if len(cands) < cfg.MinCluster {
-		return nil
+		return 0, nil
 	}
 	clusters := buildClusters(cands, cfg.SimThreshold, cfg.MaxCluster)
+	eligible := 0
 	for _, cl := range clusters {
+		if len(cl.members) >= cfg.MinCluster {
+			eligible++
+		}
+	}
+	tr.Step("cluster", fmt.Sprintf("Formed %d clusters from %d experiences", eligible, len(cands)),
+		map[string]any{
+			"candidates": len(cands),
+			"threshold":  cfg.SimThreshold,
+			"clusters":   clusterDetails(clusters, cfg.MinCluster),
+		})
+	written := 0
+	for i, cl := range clusters {
 		if len(cl.members) < cfg.MinCluster {
 			continue
 		}
-		if err := distilCluster(ctx, st, lm, scope, cl, log); err != nil {
-			return err
+		if err := distilCluster(ctx, st, lm, scope, cl, log, tr, i); err != nil {
+			return written, err
 		}
+		written++
 	}
-	return nil
+	return written, nil
+}
+
+// clusterDetails renders the clusters a pass formed, with the similarity
+// that held each one together. Only the ones that will be distilled: a
+// cluster of one is the ordinary case and would drown the rest.
+func clusterDetails(clusters []cluster, minCluster int) []map[string]any {
+	out := make([]map[string]any, 0, len(clusters))
+	for i, cl := range clusters {
+		if len(cl.members) < minCluster {
+			continue
+		}
+		members := make([]map[string]any, 0, len(cl.members))
+		lowest := 1.0
+		for _, m := range cl.members {
+			members = append(members, map[string]any{"id": m.ID.String(), "title": m.Title})
+			if sim := cosine(cl.centroid, m.Embedding); sim < lowest {
+				lowest = sim
+			}
+		}
+		out = append(out, map[string]any{
+			"index":               i,
+			"members":             members,
+			"centroid_similarity": lowest,
+		})
+	}
+	return out
 }
 
 // candidatesForConsolidation pulls abstraction=0 experiences in scope
@@ -318,7 +399,7 @@ type distilled struct {
 
 // distilCluster builds the LLM prompt, calls Distill, persists the
 // distilled record as abstraction=1, and supersedes the source rows.
-func distilCluster(ctx context.Context, st *store.Store, lm llm.Client, scope anamnesia.Scope, cl cluster, log *slog.Logger) error {
+func distilCluster(ctx context.Context, st *store.Store, lm llm.Client, scope anamnesia.Scope, cl cluster, log *slog.Logger, tr *activity.Trace, index int) error {
 	type srcRow struct {
 		ID         string  `json:"id"`
 		Title      string  `json:"title,omitempty"`
@@ -338,13 +419,23 @@ func distilCluster(ctx context.Context, st *store.Store, lm llm.Client, scope an
 		return fmt.Errorf("marshal user payload: %w", err)
 	}
 	var out distilled
+	started := time.Now()
 	if err := lm.Distill(ctx, llm.DistillInput{
 		System: consolidateSystemPrompt,
 		User:   string(userJSON),
 		MaxTok: 1024,
 	}, &out); err != nil {
+		tr.Fail("distil", err)
 		return fmt.Errorf("llm: %w", err)
 	}
+	tr.Step("distil", fmt.Sprintf("Distilled %d experiences into one insight", len(cl.members)),
+		map[string]any{
+			"cluster_index": index,
+			"model":         lm.Model(),
+			"latency_ms":    time.Since(started).Milliseconds(),
+			"result_title":  out.Title,
+			"result_body":   out.Body,
+		})
 	kind := anamnesia.ExperienceKind(out.Kind)
 	if !kind.Valid() {
 		kind = inferKindFromCluster(cl.members)
@@ -372,8 +463,20 @@ func distilCluster(ctx context.Context, st *store.Store, lm llm.Client, scope an
 		},
 	}
 	if err := st.RecordExperience(ctx, newExp); err != nil {
+		tr.Fail("write", err)
 		return fmt.Errorf("record distilled: %w", err)
 	}
+	// Consolidation is additive, so the trace says what was added and
+	// what it was derived from, and never implies the sources went away.
+	tr.Step("write", fmt.Sprintf("Wrote 1 abstraction-1 experience from %d sources", len(cl.members)),
+		map[string]any{
+			"written": []map[string]any{{
+				"target":      "experience",
+				"id":          newExp.ID.String(),
+				"abstraction": 1,
+			}},
+			"derived_from": collectIDs(cl.members),
+		})
 	// Note: source experiences (abstraction=0) are NOT superseded here.
 	// Consolidation is additive — the summary is a derived layer for
 	// callers that want a thematic overview; the sources remain active

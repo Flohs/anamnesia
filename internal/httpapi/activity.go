@@ -12,6 +12,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,7 +31,11 @@ type activityResponse struct {
 	Server   serverInfo   `json:"server"`
 	Recorder recorderInfo `json:"recorder"`
 	Loops    []loopView   `json:"loops"`
-	Traces   []traceView  `json:"traces"`
+	// Queues is server-wide and needs a database, so it is absent rather
+	// than zeroed when there is none: "0 pending" and "not measured" are
+	// different statements.
+	Queues *QueuePendingResponse `json:"queues,omitempty"`
+	Traces []traceView           `json:"traces"`
 }
 
 type serverInfo struct {
@@ -93,7 +98,7 @@ func (d Deps) handleActivity(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	writeJSON(w, http.StatusOK, d.activitySnapshot())
+	writeJSON(w, http.StatusOK, d.activitySnapshot(r.Context()))
 }
 
 func (d Deps) handleActivityTrace(w http.ResponseWriter, r *http.Request) {
@@ -141,7 +146,7 @@ func (d Deps) handleActivityStream(w http.ResponseWriter, r *http.Request) {
 	events, unsubscribe := d.Activity.Subscribe()
 	defer unsubscribe()
 
-	if err := writeSSE(w, "snapshot", d.activitySnapshot()); err != nil {
+	if err := writeSSE(w, "snapshot", d.activitySnapshot(r.Context())); err != nil {
 		return
 	}
 	if err := rc.Flush(); err != nil {
@@ -179,7 +184,7 @@ func (d Deps) handleActivityStream(w http.ResponseWriter, r *http.Request) {
 // activitySnapshot builds the /v1/activity body, which is also the
 // stream's opening frame: one connection is then enough to render the
 // whole screen.
-func (d Deps) activitySnapshot() activityResponse {
+func (d Deps) activitySnapshot(ctx context.Context) activityResponse {
 	snap := d.Activity.Snapshot()
 	resp := activityResponse{
 		Server: serverInfo{
@@ -200,6 +205,11 @@ func (d Deps) activitySnapshot() activityResponse {
 	}
 	for _, t := range snap.Traces {
 		resp.Traces = append(resp.Traces, viewTrace(t, false))
+	}
+	if d.Store != nil {
+		if extract, embed, err := d.Store.QueuePendingAll(ctx); err == nil {
+			resp.Queues = &QueuePendingResponse{ExtractPending: extract, EmbedPending: embed}
+		}
 	}
 	return resp
 }
@@ -301,4 +311,12 @@ func rfc3339(t time.Time) string {
 		return ""
 	}
 	return t.UTC().Format(time.RFC3339)
+}
+
+// humanBytes renders a size the way a sentence would.
+func humanBytes(n int) string {
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	return fmt.Sprintf("%.1f kB", float64(n)/1024)
 }
