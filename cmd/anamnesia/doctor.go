@@ -565,14 +565,27 @@ func checkHookActivity() check {
 			time.Since(lastOK[v]).Round(time.Second)))
 	}
 
-	var failing []string
+	// A failure the current server's start has already resolved is history, not
+	// a fault. Hooks fire before the server exists on every first install, so
+	// treating that as a failure would make doctor cry wolf exactly when a new
+	// user is looking at it.
+	startedAt, serverUp := serverStartedAt()
+
+	var failing, superseded []string
 	for verb, e := range lastErr {
 		// Only complain when the most recent run of that verb failed.
-		if ok, seen := lastOK[verb]; !seen || e.At.After(ok) {
-			failing = append(failing, fmt.Sprintf("%s is failing: %s", verb, firstLine(e.Error)))
+		if ok, seen := lastOK[verb]; seen && !e.At.After(ok) {
+			continue
 		}
+		if serverUp && e.At.Before(startedAt) {
+			superseded = append(superseded, fmt.Sprintf("%s failed before the server was started, and has not run since", verb))
+			continue
+		}
+		failing = append(failing, fmt.Sprintf("%s is failing: %s", verb, firstLine(e.Error)))
 	}
 	sort.Strings(failing)
+	sort.Strings(superseded)
+	c.Details = append(c.Details, superseded...)
 	if len(failing) > 0 {
 		c.Status = statusFail
 		c.Details = append(c.Details, failing...)

@@ -461,6 +461,25 @@ func clearPID() error {
 	return nil
 }
 
+// serverStartedAt reports when the running server was started, taken from the
+// pid file's timestamp. Used to tell a current fault from one the server's
+// start has already resolved.
+func serverStartedAt() (time.Time, bool) {
+	pid, err := readPID()
+	if err != nil || !processAlive(pid) {
+		return time.Time{}, false
+	}
+	path, err := serverPIDPath()
+	if err != nil {
+		return time.Time{}, false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return info.ModTime(), true
+}
+
 // processAlive reports whether a pid is a live process. Signal 0 performs
 // the permission and existence checks without delivering anything.
 func processAlive(pid int) bool {

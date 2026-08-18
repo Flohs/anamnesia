@@ -77,6 +77,11 @@ were rebuilt around being verifiable.
 - `start` distinguishes its own server from one it did not start, instead of
   reporting "already running" for a process that may be running different
   configuration.
+- **`doctor` failed on a hook error the server's own start had already fixed.**
+  Hooks fire before the server exists on every first install, so the newest
+  recorded run of a verb was a failure, and doctor reported it as a fault while
+  everything else passed. A failure older than the running server is now shown
+  as history rather than counted against the install.
 - `trimLine` no longer splits multi-byte characters.
 - Claude Code's config files are backed up before they are first modified.
 

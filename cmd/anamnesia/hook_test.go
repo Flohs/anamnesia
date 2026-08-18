@@ -281,3 +281,63 @@ func TestEveryHookVerbIsRoutable(t *testing.T) {
 		}
 	}
 }
+
+// writePIDForTest records this test process as the running server, with a
+// chosen start time.
+func writePIDForTest(t *testing.T, startedAt time.Time) {
+	t.Helper()
+	if err := writePID(os.Getpid()); err != nil {
+		t.Fatal(err)
+	}
+	path, err := serverPIDPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, startedAt, startedAt); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDoctorIgnoresHookFailuresFromBeforeTheServerStarted covers a false alarm
+// every first install would otherwise produce: hooks fire before the server
+// exists, so the newest recorded run of a verb is a failure that starting the
+// server has already resolved.
+func TestDoctorIgnoresHookFailuresFromBeforeTheServerStarted(t *testing.T) {
+	t.Setenv(homeEnv, t.TempDir())
+
+	failedAt := time.Now().Add(-10 * time.Minute)
+	logHook("retrieve", failedAt, errServerUnreachable, "")
+	// Rewrite the entry's timestamp: logHook stamps "now".
+	path, err := hookLogPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var e hookLogEntry
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &e); err != nil {
+		t.Fatal(err)
+	}
+	e.At = failedAt
+	fixed, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(fixed, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Server started after that failure: the fault is history.
+	writePIDForTest(t, failedAt.Add(time.Minute))
+	if got := checkHookActivity(); got.Status == statusFail {
+		t.Errorf("a failure predating the server start was reported as a fault: %+v", got)
+	}
+
+	// Server started before it: still outstanding, so still a failure.
+	writePIDForTest(t, failedAt.Add(-time.Minute))
+	if got := checkHookActivity(); got.Status != statusFail {
+		t.Errorf("an unresolved hook failure was not reported: %+v", got)
+	}
+}
