@@ -1,4 +1,25 @@
-{"id":"q-001","text":"why were the nightly stock counts off by a day","relevant":["src-001"],"note":"the timezone cause; src-005 and src-006 are near misses"}
-{"id":"q-002","text":"how did we fix the warehouse timestamp problem","relevant":["src-002"],"note":"the decision, not the diagnosis"}
-{"id":"q-003","text":"what is our convention for storing datetimes","relevant":["src-003"]}
-{"id":"q-004","text":"what did we change about generating invoices","relevant":["src-004"]}
+{"id":"q-001","text":"why were the nightly stock counts off by a day","relevant":["src-001","src-011"],"note":"the timezone cause at both Rotterdam and Katowice; src-005 and src-006 are near misses"}
+{"id":"q-002","text":"how did we fix the warehouse timestamp problem","relevant":["src-002","src-003"],"note":"expanded from src-002 alone: the read-time normalisation was the immediate fix, and the UTC-everywhere convention adopted days later existed specifically to stop it recurring, so both count as the fix. src-001 (diagnosis only) and src-011 (a later recurrence) are near misses"}
+{"id":"q-003","text":"what is our convention for storing datetimes","relevant":["src-003"],"note":"src-007 is a near miss: a different, unrelated datetime-storage decision, not the general convention"}
+{"id":"q-004","text":"what did we change about generating invoices","relevant":["src-004","src-010"],"note":"two separate changes to invoice generation, memory and rendering; src-008 is a near miss about payment terms, not generation"}
+{"id":"q-005","text":"why did Katowice have the same stock count problem as Rotterdam","relevant":["src-011"],"note":"near miss: src-001 explains Rotterdam's cause, not Katowice's legacy-adapter cause"}
+{"id":"q-006","text":"why do items show as available in the picking app when the shelf is actually empty","relevant":["src-016"],"note":"near misses: src-017 and src-037 describe fixes, not the cause; src-018 is an unrelated picking-app bug"}
+{"id":"q-007","text":"how did we fix overselling caused by phantom stock","relevant":["src-017","src-037"],"note":"the partial fix and the later extension to all SKUs; src-016 (diagnosis only) is a near miss"}
+{"id":"q-008","text":"do we apply real-time stock decrement to every SKU now","relevant":["src-037"],"note":"near miss: src-017 is the earlier, superseded high-velocity-only version"}
+{"id":"q-009","text":"why did we increase the safety stock buffer for Nordwind Fasteners","relevant":["src-013"],"note":"near miss: src-034 is the later, opposite decision"}
+{"id":"q-010","text":"is Nordwind's shipping reliable again","relevant":["src-034"],"note":"near miss: src-013 is the earlier, opposite decision"}
+{"id":"q-011","text":"how do we handle stock that arrives broken from the supplier","relevant":["src-020"],"note":"near misses: src-022 (customer returns, not inbound damage) and src-027 (the write-off dollar threshold, not the handling process)"}
+{"id":"q-012","text":"how do we decide which orders get combined into one shipment","relevant":["src-023"],"note":"near miss: src-024 is delivery route planning, not pick-wave batching"}
+{"id":"q-013","text":"what's the single source of truth for product dimensions","relevant":["src-014"],"note":"near misses: src-015 (currency, not dimensions) and src-031 (a bug caused by not reading the source of truth, not a statement of what it is)"}
+{"id":"q-014","text":"why were shipping quotes wrong for oversized items","relevant":["src-014","src-031"],"note":"the decision and the bug that violated it; src-015 is a near miss (pricing engine, but currency conversion)"}
+{"id":"q-015","text":"why did the nightly backup time change","relevant":["src-009"],"note":"near miss: src-006 mentions the backup's old time but not why it moved"}
+{"id":"q-016","text":"why were barcode scans failing on the loading dock","relevant":["src-025"],"note":"near misses: src-018 and src-026 are unrelated picking-app tablet changes"}
+{"id":"q-017","text":"why was demand forecasting inaccurate for seasonal items","relevant":["src-012","src-021"],"note":"the retrain and the follow-up override list; src-030 is a near miss (replenishment job, but a performance fix)"}
+{"id":"q-018","text":"how does the system account for one-off sales events when predicting stock needs","relevant":["src-021"],"note":"near miss: src-012 addresses seasonal accuracy generally, not one-off promotions"}
+{"id":"q-019","text":"why were we undercharging VAT on some orders","relevant":["src-019"],"note":"near miss: src-015 is a different rate, currency conversion, not tax"}
+{"id":"q-020","text":"what's the dollar threshold for writing off damaged stock without approval","relevant":["src-027"],"note":"near miss: src-020 is the QC handling process, not the dollar threshold"}
+{"id":"q-021","text":"why do fast-selling items get flagged for reorder sooner than before","relevant":["src-028"],"note":"near miss: src-029 changed the alert channel, not the threshold"}
+{"id":"q-022","text":"why did shipment confirmations start failing with the carrier","relevant":["src-032"],"note":"near miss: src-033 is a routine, unrelated credential rotation with the same carrier"}
+{"id":"q-023","text":"what came out of the quarter-end physical count","relevant":["src-035"],"note":"near miss: src-036 is the follow-up policy change, not the count result itself"}
+{"id":"q-024","text":"how often do we cycle count high-value SKUs","relevant":["src-036"],"note":"near miss: src-035 is the count that prompted the change, not the new frequency"}
+{"id":"q-025","text":"how do we handle peak season order backlog","relevant":["src-038"],"note":"near miss: src-039 is an unrelated staffing trial outside peak season"}
