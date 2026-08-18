@@ -224,3 +224,8 @@ were rebuilt around being verifiable.
   and `stop`.
 - Removed the unused `ANAMNESIA_WORKER_IN_PROCESS` setting, which was parsed
   and documented but never read.
+- The extractor now asks the model to name an experience, not only describe
+  it. `ADD_EXPERIENCE` arrived without a title often enough that a list of
+  memories read as a column of body text, and an untitled experience is a
+  weaker search target: `experiences.title` feeds the tsvector lexical
+  retrieval uses.

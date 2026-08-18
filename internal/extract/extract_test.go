@@ -287,3 +287,40 @@ func TestCommitmentPromptGating(t *testing.T) {
 		}
 	})
 }
+
+// The console lists memories by title. An ADD_EXPERIENCE that arrives
+// without one reads as a column of body text, and the missing title also
+// weakens the tsvector lexical retrieval feeds on.
+func TestExperienceInstructionsAskForATitle(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct{ name, kind string }{
+		{"default prompt", "chat-turn"},
+		{"liberal prompt", "benchmark"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeLLM{Ops: []Operation{{Op: "NOOP"}}}
+			ex := &Extractor{LLM: fake}
+			src := &anamnesia.Source{
+				Scope:      anamnesia.Scope{UserID: uuid.New()},
+				Kind:       tc.kind,
+				OccurredAt: time.Now().UTC(),
+				RawContent: "Some content long enough to clear the min-content gate.",
+			}
+			if _, err := ex.Run(ctx, src); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			line := ""
+			for _, l := range strings.Split(fake.System, "\n") {
+				if strings.HasPrefix(l, "- ADD_EXPERIENCE:") {
+					line = l
+				}
+			}
+			if line == "" {
+				t.Fatalf("no ADD_EXPERIENCE instruction in the system prompt:\n%s", fake.System)
+			}
+			if !strings.Contains(line, "title") {
+				t.Errorf("ADD_EXPERIENCE instruction never asks for a title:\n%s", line)
+			}
+		})
+	}
+}

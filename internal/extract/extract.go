@@ -726,7 +726,7 @@ You can emit these operations:
 - ADD_FACT: a stable, durable claim about the user, project, or environment (preference, decision, configuration). Use fact_scope=user|project|environment.
 - UPDATE_FACT: replace an existing fact's value. Provide its id from "candidates".
 - DELETE_FACT: invalidate an existing fact. Provide its id.
-- ADD_EXPERIENCE: a noteworthy event, trajectory, strategy, or insight worth remembering as a narrative. Use kind=case|strategy|hybrid. Provide a 1-2 sentence body.
+- ADD_EXPERIENCE: a noteworthy event, trajectory, strategy, or insight worth remembering as a narrative. Use kind=case|strategy|hybrid. Provide a "title" and a 1-2 sentence "body". The title is a short noun phrase, under 60 characters, no trailing full stop, naming the conclusion rather than the activity: "Hook ordering is guaranteed by the client", not "Discussion about hooks".
 - NOOP: nothing worth keeping.
 
 Rules:
@@ -755,7 +755,7 @@ You can emit these operations:
 - ADD_FACT: a concrete claim. Use fact_scope=user for personal claims (degree, preference, plan), project for project-local facts, environment otherwise.
 - UPDATE_FACT: replace an existing fact when the source explicitly updates it. Provide the candidate id.
 - DELETE_FACT: invalidate an existing fact when the source explicitly retracts it.
-- ADD_EXPERIENCE: a multi-claim narrative or strategy worth remembering as one unit. Provide a 1-3 sentence body.
+- ADD_EXPERIENCE: a multi-claim narrative or strategy worth remembering as one unit. Provide a "title" and a 1-3 sentence "body". The title is a short noun phrase, under 60 characters, no trailing full stop, naming the conclusion rather than the activity: "Hook ordering is guaranteed by the client", not "Discussion about hooks".
 - NOOP: only when there is genuinely nothing concrete to extract (rare here).
 
 Rules:
