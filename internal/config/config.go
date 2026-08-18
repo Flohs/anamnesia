@@ -73,6 +73,11 @@ type Config struct {
 
 	// ExtractCommitments lets the extractor emit ADD_COMMITMENT ops.
 	ExtractCommitments bool // ANAMNESIA_EXTRACT_COMMITMENTS (default false)
+
+	// Activity recorder. ActivityEnabled off means no recorder at all,
+	// which is also what makes the /v1/activity routes 404.
+	ActivityEnabled bool // ANAMNESIA_ACTIVITY_ENABLED (default true)
+	ActivityTraces  int  // ANAMNESIA_ACTIVITY_TRACES (default 200)
 }
 
 // DefaultEmbedDims is the shipped embedding width. It matches
@@ -174,6 +179,9 @@ func Load() (*Config, error) {
 		EmbedBackfill:    dur("ANAMNESIA_EMBED_BACKFILL", time.Minute),
 
 		ExtractCommitments: boolean("ANAMNESIA_EXTRACT_COMMITMENTS", false),
+
+		ActivityEnabled: boolean("ANAMNESIA_ACTIVITY_ENABLED", true),
+		ActivityTraces:  num("ANAMNESIA_ACTIVITY_TRACES", 200),
 	}
 
 	if strings.TrimSpace(c.DatabaseURL) == "" {

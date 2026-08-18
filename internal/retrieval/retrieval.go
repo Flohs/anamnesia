@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pgvector/pgvector-go"
 
+	"github.com/flohs/anamnesia/internal/activity"
 	"github.com/flohs/anamnesia/internal/embed"
 	"github.com/flohs/anamnesia/internal/store"
 	"github.com/flohs/anamnesia/pkg/anamnesia"
@@ -42,7 +43,21 @@ type Query struct {
 	// flows). Leave false for context injection where thematic summaries
 	// are useful.
 	OnlyRaw bool
+	// Trace, when set, records the stages of this search: what was
+	// searched for, what each half returned, how fusion ranked it and
+	// what the reranker did to that order.
+	//
+	// Only the retrieve endpoint sets it. The extractor calls Search
+	// twice per source, for its gate and its candidate fetch, and
+	// tracing those would bury the real traces under parasitic ones.
+	Trace *activity.Trace
 }
+
+// tracedRanking caps how many fused candidates a trace records. The
+// recorder drops any single detail value over its size limit, so an
+// uncapped ranking would silently vanish from the trace rather than
+// merely be long.
+const tracedRanking = 25
 
 // Search runs vector + lexical retrieval per requested domain and fuses
 // the results with reciprocal-rank fusion.
@@ -66,10 +81,23 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 		q.Domains = []anamnesia.Domain{anamnesia.DomainFact, anamnesia.DomainExperience, anamnesia.DomainSkill}
 	}
 
+	if q.Trace != nil {
+		q.Trace.Step("query", fmt.Sprintf("Retrieving for %q", q.Text), map[string]any{
+			"prompt": q.Text,
+			"scope":  scopeDetail(q.Scope),
+			"limits": map[string]any{
+				"k": q.K, "vector_k": q.VectorK, "lexical_k": q.LexicalK,
+				"rrf_const": q.RRFConst, "only_raw": q.OnlyRaw,
+			},
+		})
+	}
+
 	// Embed query text. Skip if no embedder or empty text.
 	var qvec []float32
+	var embedErr error
 	if e.Embedder != nil && strings.TrimSpace(q.Text) != "" {
 		v, err := e.Embedder.Embed(ctx, []string{q.Text})
+		embedErr = err
 		if err == nil && len(v) > 0 {
 			qvec = v[0]
 		}
@@ -81,10 +109,18 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 		lRk int
 	}
 	byID := map[string]*ranked{}
+	var vectorHits, lexicalHits []anamnesia.SearchHit
 
 	add := func(domain anamnesia.Domain, items []anamnesia.SearchHit, vector bool) {
 		for i, h := range items {
 			h.Domain = domain
+			if q.Trace != nil {
+				if vector {
+					vectorHits = append(vectorHits, h)
+				} else {
+					lexicalHits = append(lexicalHits, h)
+				}
+			}
 			key := string(domain) + ":" + h.ID().String()
 			r, ok := byID[key]
 			if !ok {
@@ -140,6 +176,20 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 		}
 	}
 
+	if q.Trace != nil {
+		if qvec == nil {
+			q.Trace.Step("vector", "No vector search ran", map[string]any{
+				"skipped": true,
+				"reason":  noVectorReason(e.Embedder != nil, q.Text, embedErr),
+			})
+		} else {
+			q.Trace.Step("vector", fmt.Sprintf("%d vector hits", len(vectorHits)),
+				map[string]any{"hits": HitDetails(vectorHits)})
+		}
+		q.Trace.Step("lexical", fmt.Sprintf("%d full-text hits", len(lexicalHits)),
+			map[string]any{"hits": HitDetails(lexicalHits)})
+	}
+
 	out := make([]anamnesia.SearchHit, 0, len(byID))
 	for _, r := range byID {
 		score := 0.0
@@ -167,6 +217,11 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
 
+	if q.Trace != nil {
+		q.Trace.Step("fuse", fmt.Sprintf("RRF fused %d candidates", len(out)),
+			map[string]any{"ranked": rankedDetails(out)})
+	}
+
 	// Take a candidate set 4× the requested K into the reranker so the
 	// final ordering has room to reshuffle. If no reranker is wired,
 	// just cap at K.
@@ -177,11 +232,31 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 	if len(out) > candK {
 		out = out[:candK]
 	}
+	before := order(out)
+	applied := false
+	var rerankErr error
 	if e.Reranker != nil && strings.TrimSpace(q.Text) != "" {
 		reranked, err := e.Reranker.Rerank(ctx, q.Text, out)
 		if err == nil {
 			out = reranked
+			applied = true
+		} else {
+			rerankErr = err
 		}
+	}
+	if q.Trace != nil {
+		detail := map[string]any{
+			"applied": applied,
+			"before":  before,
+			"after":   order(out),
+		}
+		if e.Reranker == nil {
+			detail["reason"] = "no reranker is configured"
+		}
+		if rerankErr != nil {
+			detail["error"] = rerankErr.Error()
+		}
+		q.Trace.Step("rerank", rerankSummary(applied, before, order(out), rerankErr), detail)
 	}
 	if len(out) > q.K {
 		out = out[:q.K]
@@ -319,4 +394,123 @@ func (e *Engine) lexicalSkills(ctx context.Context, scope anamnesia.Scope, text 
 		out[i] = anamnesia.SearchHit{Domain: anamnesia.DomainSkill, Skill: sk}
 	}
 	return out, nil
+}
+
+// ─── trace detail ────────────────────────────────────────────────────
+//
+// These render search internals for a trace step. They are only built
+// when a trace is attached, so a search nobody is watching pays nothing
+// for them.
+
+func scopeDetail(scope anamnesia.Scope) map[string]any {
+	d := map[string]any{"user_id": scope.UserID.String()}
+	if scope.ProjectID != nil {
+		d["project_id"] = scope.ProjectID.String()
+	}
+	return d
+}
+
+func noVectorReason(hasEmbedder bool, text string, err error) string {
+	switch {
+	case err != nil:
+		return "embedding the query failed: " + err.Error()
+	case !hasEmbedder:
+		return "no embedder is configured, so nothing is embedded and vector search cannot run"
+	case strings.TrimSpace(text) == "":
+		return "the query carries no text to embed"
+	}
+	return "the embedder returned no vector"
+}
+
+func hitTitle(h anamnesia.SearchHit) string {
+	switch h.Domain {
+	case anamnesia.DomainFact:
+		if h.Fact != nil {
+			return h.Fact.Key
+		}
+	case anamnesia.DomainExperience:
+		if h.Experience != nil {
+			if h.Experience.Title != "" {
+				return h.Experience.Title
+			}
+			body := h.Experience.Body
+			if i := strings.IndexByte(body, '\n'); i >= 0 {
+				body = body[:i]
+			}
+			if len(body) > 120 {
+				body = body[:120]
+			}
+			return body
+		}
+	case anamnesia.DomainSkill:
+		if h.Skill != nil {
+			return h.Skill.Name
+		}
+	}
+	return ""
+}
+
+// HitDetails renders search hits for a trace step: enough to see what
+// was found, without the row itself. Exported because the extractor and
+// the HTTP layer show the same thing.
+func HitDetails(hits []anamnesia.SearchHit) []map[string]any {
+	out := make([]map[string]any, 0, len(hits))
+	for _, h := range hits {
+		out = append(out, map[string]any{
+			"id":    h.ID().String(),
+			"kind":  string(h.Domain),
+			"title": hitTitle(h),
+			"score": h.Score,
+		})
+	}
+	return out
+}
+
+// rankedDetails renders the fused ranking, which is the one thing that
+// makes rank movement legible. Capped, and it says when it capped.
+func rankedDetails(hits []anamnesia.SearchHit) []map[string]any {
+	n := len(hits)
+	capped := false
+	if n > tracedRanking {
+		n, capped = tracedRanking, true
+	}
+	out := make([]map[string]any, 0, n+1)
+	for _, h := range hits[:n] {
+		out = append(out, map[string]any{
+			"id":           h.ID().String(),
+			"kind":         string(h.Domain),
+			"title":        hitTitle(h),
+			"rrf_score":    h.Score,
+			"vector_rank":  h.VectorRank,
+			"lexical_rank": h.LexicalRank,
+		})
+	}
+	if capped {
+		out = append(out, map[string]any{"capped_after": tracedRanking, "of": len(hits)})
+	}
+	return out
+}
+
+// order is the id sequence of a result list, which is all the rerank
+// step needs to show what moved.
+func order(hits []anamnesia.SearchHit) []string {
+	out := make([]string, 0, len(hits))
+	for _, h := range hits {
+		out = append(out, h.ID().String())
+	}
+	return out
+}
+
+func rerankSummary(applied bool, before, after []string, err error) string {
+	switch {
+	case err != nil:
+		return "Rerank failed, keeping the fused order"
+	case !applied:
+		return "No rerank ran, so the fused order stands"
+	case len(before) == 0 || len(after) == 0:
+		return "Reranked an empty candidate set"
+	case before[0] == after[0]:
+		return "Reranked, top result unchanged"
+	}
+	return "Reranked, a new top result"
 }

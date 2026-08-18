@@ -9,6 +9,11 @@
 //	POST /v1/ingest          Stop / PreCompact hook + generic write (async extraction)
 //	POST /v1/experience      direct experience write (RAG mode — bypass extractor)
 //	GET  /v1/queue/pending   pending counts for one user (extract + embed)
+//	GET  /v1/activity        loops + recent traces (read-only)
+//	GET  /v1/activity/{id}   one trace with its steps
+//	GET  /v1/activity/stream the same, as server-sent events
+//	GET  /v1/config          resolved settings, secrets masked
+//	GET  /v1/hooks           parsed tail of ~/.anamnesia/hooks.log
 //	POST /mcp                MCP transport (streamable-http)
 //
 // Auth is optional: if Config.ServerToken is set, every request must
@@ -28,6 +33,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/flohs/anamnesia/internal/activity"
 	"github.com/flohs/anamnesia/internal/jobs"
 	"github.com/flohs/anamnesia/internal/pii"
 	"github.com/flohs/anamnesia/internal/retrieval"
@@ -47,6 +53,18 @@ type Deps struct {
 	ServerToken    string // empty = no auth required
 	Log            *slog.Logger
 
+	// Activity is the in-memory recorder. Nil means recording is off,
+	// which is what makes every /v1/activity route a 404.
+	Activity *activity.Recorder
+	// Config is the resolved, already-masked configuration. Settings are
+	// declared in package main, which this package cannot import, so
+	// serve.go passes them in as data.
+	Config []ConfigItem
+	// HookLogPath is ~/.anamnesia/hooks.log, resolved host-side.
+	HookLogPath string
+	// Started is when the server came up, reported as uptime.
+	Started time.Time
+
 	// Reported by /v1/health so `anamnesia doctor` can compare what is
 	// running against what the caller expects.
 	Version       string
@@ -59,6 +77,9 @@ type Deps struct {
 
 // NewServer returns a configured *http.Server bound to addr.
 func NewServer(addr string, d Deps) *http.Server {
+	if d.Started.IsZero() {
+		d.Started = time.Now().UTC()
+	}
 	mux := http.NewServeMux()
 
 	mux.Handle("/v1/health", http.HandlerFunc(d.handleHealth))
@@ -75,6 +96,14 @@ func NewServer(addr string, d Deps) *http.Server {
 	mux.Handle("/v1/commitments", d.protect(http.HandlerFunc(d.handleCommitments)))
 	mux.Handle("/v1/commitments/resolve", d.protect(http.HandlerFunc(d.handleCommitmentResolve)))
 	mux.Handle("/v1/audit", d.protect(http.HandlerFunc(d.handleAudit)))
+
+	// Read-only observability. Registered with methods, so a stray write
+	// is a 405 rather than something the handler has to guard against.
+	mux.Handle("GET /v1/activity", d.protect(http.HandlerFunc(d.handleActivity)))
+	mux.Handle("GET /v1/activity/stream", d.protect(http.HandlerFunc(d.handleActivityStream)))
+	mux.Handle("GET /v1/activity/{id}", d.protect(http.HandlerFunc(d.handleActivityTrace)))
+	mux.Handle("GET /v1/config", d.protect(http.HandlerFunc(d.handleConfig)))
+	mux.Handle("GET /v1/hooks", d.protect(http.HandlerFunc(d.handleHooks)))
 
 	if d.MCPHandler != nil {
 		mux.Handle("/mcp", d.protect(d.MCPHandler))
@@ -128,6 +157,13 @@ type statusRecorder struct {
 }
 
 func (s *statusRecorder) WriteHeader(c int) { s.status = c; s.ResponseWriter.WriteHeader(c) }
+
+// Unwrap lets http.ResponseController reach the real writer underneath.
+// Without it a wrapped response can neither flush nor clear its write
+// deadline, which the activity stream needs to do both of: otherwise it
+// buffers until the 60s WriteTimeout above severs it, and no error is
+// reported anywhere.
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 // ─── health ──────────────────────────────────────────────────────────
 
@@ -244,6 +280,26 @@ type HookEvent struct {
 	// (verbatim sources). Set by benchmarks / citation flows; leave
 	// false for context injection where summaries are useful.
 	OnlyRaw bool `json:"only_raw,omitempty"`
+}
+
+// userName and projectName are the display names a trace carries. They
+// apply the same defaulting as resolveScope without touching the
+// database, because a trace label is not worth a query.
+func (d Deps) userName(user string) string {
+	if user != "" {
+		return user
+	}
+	if d.DefaultUser != "" {
+		return d.DefaultUser
+	}
+	return "default"
+}
+
+func (d Deps) projectName(project string) string {
+	if project != "" {
+		return project
+	}
+	return d.DefaultProject
 }
 
 func (d Deps) resolveScope(ctx context.Context, ev *HookEvent) (anamnesia.Scope, error) {
@@ -390,10 +446,17 @@ func (d Deps) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 	if k <= 0 {
 		k = 10
 	}
+	// One trace per prompt. The engine fills in the stages; this handler
+	// owns the ends of it, because what was handed back to Claude (the
+	// cross-project contrast included) is a property of the request
+	// rather than of the search.
+	tr := d.Activity.Begin("retrieve", d.userName(ev.User), d.projectName(ev.Project))
 	hits, err := d.Retrieval.Search(r.Context(), retrieval.Query{
-		Scope: scope, Text: ev.Prompt, K: k, OnlyRaw: ev.OnlyRaw,
+		Scope: scope, Text: ev.Prompt, K: k, OnlyRaw: ev.OnlyRaw, Trace: tr,
 	})
 	if err != nil {
+		tr.Fail("search", err)
+		tr.End("failed", "Retrieval failed, so this prompt got no memory")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -403,6 +466,12 @@ func (d Deps) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 	if scope.ProjectID != nil {
 		resp.CrossProject = d.crossProjectHits(r.Context(), scope, ev.Prompt, ev.OnlyRaw)
 	}
+	tr.Step("result", fmt.Sprintf("Returned %d hits and %d cross-project hits",
+		len(resp.Hits), len(resp.CrossProject)), map[string]any{
+		"hits":          retrieval.HitDetails(resp.Hits),
+		"cross_project": resp.CrossProject,
+	})
+	tr.End("ok", fmt.Sprintf("Returned %d memories for %q", len(resp.Hits), ev.Prompt))
 	writeJSON(w, http.StatusOK, resp)
 }
 

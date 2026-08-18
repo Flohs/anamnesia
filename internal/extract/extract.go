@@ -31,6 +31,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/flohs/anamnesia/internal/activity"
 	"github.com/flohs/anamnesia/internal/embed"
 	"github.com/flohs/anamnesia/internal/llm"
 	"github.com/flohs/anamnesia/internal/retrieval"
@@ -69,6 +70,9 @@ type Extractor struct {
 	Retrieval *retrieval.Engine
 	LLM       llm.Client
 	Log       *slog.Logger
+	// Activity records the reasoning behind one extraction. Nil is a
+	// working no-op: nothing here depends on being watched.
+	Activity *activity.Recorder
 }
 
 // applyDefaults fills zero fields without mutating the caller's config.
@@ -163,7 +167,23 @@ func bytesTrimSpace(b []byte) []byte {
 func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (int, error) {
 	cfg := e.Cfg.applyDefaults()
 	content := strings.TrimSpace(src.RawContent)
+
+	// One trace per source: what arrived, what the gate decided, what the
+	// model was shown, what it asked for, and what was written. This is
+	// the only record of why a checkpoint became a memory or did not.
+	user, project := e.scopeNames(ctx, src.Scope)
+	tr := e.Activity.Begin("ingest", user, project)
+	tr.Step("source", fmt.Sprintf("Received a %s %s source", humanBytes(len(content)), src.Kind),
+		map[string]any{
+			"source_id": src.ID.String(),
+			"kind":      src.Kind,
+			"title":     src.Title,
+			"bytes":     len(content),
+			"excerpt":   content,
+		})
+
 	if len(content) < cfg.MinContentLen {
+		tr.End("skipped", fmt.Sprintf("Nothing to extract from %d characters", len(content)))
 		return 0, nil
 	}
 
@@ -173,26 +193,58 @@ func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (int, error)
 	// the agent that something changed), or when the source kind is
 	// tagged as an evaluation / benchmark stream that should retain
 	// every passing mention (LongMemEval and similar).
-	if !hasTemporalMarker(content) && !bypassGate(src.Kind) {
-		skip, err := e.surpriseGate(ctx, src.Scope, content, cfg.SurpriseThreshold)
-		if err != nil {
+	switch {
+	case hasTemporalMarker(content):
+		tr.Step("gate", "Kept: the content says something just changed", map[string]any{
+			"verdict": "keep",
+			"reason":  "a temporal marker in the content bypasses the gate",
+		})
+	case bypassGate(src.Kind):
+		tr.Step("gate", "Kept: this source kind is never gated", map[string]any{
+			"verdict": "keep",
+			"reason":  "source kind " + src.Kind + " is an evaluation stream and bypasses the gate",
+		})
+	default:
+		skip, score, reason, err := e.surpriseGate(ctx, src.Scope, content, cfg.SurpriseThreshold)
+		switch {
+		case err != nil:
 			// Gate failure is non-fatal — fall through to full extraction.
 			if e.Log != nil {
 				e.Log.Warn("extractor: surprise gate failed", "err", err)
 			}
-		} else if skip {
+			tr.Step("gate", "Kept: the gate could not run", map[string]any{
+				"verdict": "keep",
+				"reason":  "the gate failed and extraction continued anyway: " + err.Error(),
+			})
+		case skip:
+			tr.Step("gate", "Skipped: an existing memory already covers this", map[string]any{
+				"verdict": "skip",
+				"reason":  reason,
+				"score":   score,
+			})
+			tr.End("skipped", "Already covered by an existing memory")
 			return 0, nil
+		default:
+			tr.Step("gate", "Kept: "+reason, map[string]any{
+				"verdict": "keep",
+				"reason":  reason,
+				"score":   score,
+			})
 		}
 	}
 
 	// Step 2: candidate fetch. Hybrid search across facts + experiences.
-	candidates, err := e.candidates(ctx, src.Scope, content, cfg.CandidateK)
+	candidates, hits, err := e.candidates(ctx, src.Scope, content, cfg.CandidateK)
 	if err != nil {
 		// Soft failure — extract without candidates rather than block ingest.
 		if e.Log != nil {
 			e.Log.Warn("extractor: candidate fetch failed", "err", err)
 		}
 		candidates = nil
+		tr.Fail("similar", err)
+	} else {
+		tr.Step("similar", fmt.Sprintf("Fetched %d similar memories as context", len(candidates)),
+			map[string]any{"hits": retrieval.HitDetails(hits)})
 	}
 
 	// Step 3: LLM call. We pass a JSON schema so OpenAI's structured
@@ -224,16 +276,29 @@ func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (int, error)
 		schema = operationSchemaWithCommitments
 	}
 	prompt := e.userPrompt(src, content, candidates)
-	var resp opsResponse
+	captured := &capturedOps{}
+	started := time.Now()
 	if err := e.LLM.Extract(ctx, llm.DistillInput{
 		System:     systemPrompt,
 		User:       prompt,
 		MaxTok:     maxTok,
 		Schema:     schema,
 		SchemaName: "anamnesia_operations",
-	}, &resp); err != nil {
+	}, captured); err != nil {
+		tr.Fail("llm", err)
+		tr.End("failed", "The model call failed, so the source stays pending")
 		return 0, fmt.Errorf("llm extract: %w", err)
 	}
+	resp := captured.resp
+	tr.Step("llm", fmt.Sprintf("%s returned %d operations", e.LLM.Model(), len(resp.Operations)),
+		map[string]any{
+			"model":            e.LLM.Model(),
+			"latency_ms":       time.Since(started).Milliseconds(),
+			"prompt_chars":     len(systemPrompt) + len(prompt),
+			"completion_chars": len(captured.raw),
+			"raw_response":     string(captured.raw),
+		})
+
 	maxOps := cfg.MaxOps
 	if bypassGate(src.Kind) {
 		// Benchmark / evaluation streams legitimately decompose lists
@@ -247,7 +312,8 @@ func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (int, error)
 	// Step 4: execute. Each operation is decoded independently — a
 	// malformed op should not nuke its siblings. NOOPs don't count
 	// toward executed.
-	executed := 0
+	decoded := make([]Operation, 0, len(resp.Operations))
+	labels := make([]string, 0, len(resp.Operations))
 	for i, raw := range resp.Operations {
 		var op Operation
 		if err := json.Unmarshal(raw, &op); err != nil {
@@ -256,18 +322,137 @@ func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (int, error)
 			}
 			continue
 		}
+		decoded = append(decoded, op)
+		if !isNoop(op.Op) {
+			labels = append(labels, strings.ToUpper(strings.TrimSpace(op.Op)))
+		}
+	}
+	opsSummary := "Nothing worth keeping"
+	if len(labels) > 0 {
+		opsSummary = strings.Join(labels, ", ")
+	}
+	tr.Step("ops", opsSummary, map[string]any{"operations": resp.Operations})
+
+	executed := 0
+	written := make([]map[string]any, 0, len(decoded))
+	failures := make([]string, 0)
+	for _, op := range decoded {
 		if isNoop(op.Op) {
 			continue
 		}
-		if err := e.executeOp(ctx, src, op); err != nil {
+		done, err := e.executeOp(ctx, src, op)
+		if err != nil {
 			if e.Log != nil {
 				e.Log.Warn("extractor: op failed", "op", op.Op, "err", err)
 			}
+			failures = append(failures, op.Op+": "+err.Error())
 			continue
 		}
 		executed++
+		if done.Target != "" {
+			written = append(written, map[string]any{"target": done.Target, "id": done.ID.String()})
+		}
+	}
+	if executed > 0 || len(failures) > 0 {
+		tr.Step("apply", writtenSummary(written, failures), map[string]any{
+			"written": written,
+			"errors":  failures,
+		})
+	}
+	if executed == 0 {
+		tr.End("skipped", "The model found nothing worth keeping")
+	} else {
+		tr.End("ok", fmt.Sprintf("Extracted %d operations from a %s %s source",
+			executed, humanBytes(len(content)), src.Kind))
 	}
 	return executed, nil
+}
+
+// capturedOps decodes the operations envelope while keeping the exact
+// JSON the model produced. Every provider hands `out` to json.Unmarshal,
+// so implementing Unmarshaler is enough to see the document without
+// changing the llm package or any provider in it.
+type capturedOps struct {
+	raw  json.RawMessage
+	resp opsResponse
+}
+
+func (c *capturedOps) UnmarshalJSON(b []byte) error {
+	c.raw = append(c.raw[:0], b...)
+	return json.Unmarshal(b, &c.resp)
+}
+
+// applied is what one executed operation produced, so the trace can name
+// the row that was written rather than only the operation that asked for
+// it.
+type applied struct {
+	Target string // fact | experience | commitment
+	ID     uuid.UUID
+}
+
+// scopeNames resolves a scope to the handle and slug a trace displays.
+// Two indexed lookups per source, and only when someone is recording.
+func (e *Extractor) scopeNames(ctx context.Context, scope anamnesia.Scope) (string, string) {
+	if e.Store == nil || e.Activity == nil {
+		return "", ""
+	}
+	user, err := e.Store.LookupUserHandle(ctx, scope.UserID)
+	if err != nil {
+		user = ""
+	}
+	project := ""
+	if scope.ProjectID != nil {
+		if slug, err := e.Store.LookupProjectSlug(ctx, *scope.ProjectID); err == nil {
+			project = slug
+		}
+	}
+	return user, project
+}
+
+func writtenSummary(written []map[string]any, failures []string) string {
+	counts := map[string]int{}
+	for _, w := range written {
+		counts[w["target"].(string)]++
+	}
+	parts := make([]string, 0, len(counts))
+	for _, target := range []string{"fact", "experience", "commitment"} {
+		if n := counts[target]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, plural(target, n)))
+		}
+	}
+	summary := "Wrote nothing"
+	if len(parts) > 0 {
+		summary = "Wrote " + joinWords(parts)
+	}
+	if len(failures) > 0 {
+		summary += fmt.Sprintf(", %d failed", len(failures))
+	}
+	return summary
+}
+
+func plural(word string, n int) string {
+	if n == 1 {
+		return word
+	}
+	return word + "s"
+}
+
+func joinWords(parts []string) string {
+	switch len(parts) {
+	case 0:
+		return ""
+	case 1:
+		return parts[0]
+	}
+	return strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1]
+}
+
+// humanBytes renders a size the way a sentence would.
+func humanBytes(n int) string {
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	return fmt.Sprintf("%.1f kB", float64(n)/1024)
 }
 
 // bypassGateKinds is the set of source kinds whose stream should not be
@@ -344,12 +529,16 @@ func isNoop(op string) bool {
 	return false
 }
 
-// surpriseGate returns true if both the nearest fact and the nearest
-// experience are above the cosine threshold — meaning "we've seen this
-// already, nothing to extract".
-func (e *Extractor) surpriseGate(ctx context.Context, scope anamnesia.Scope, content string, threshold float64) (bool, error) {
+// surpriseGate returns true if the nearest existing memory is above the
+// threshold — meaning "we've seen this already, nothing to extract".
+//
+// It also returns the score it judged on and the reason in plain words.
+// Without those the trace could only say "kept" or "skipped", and the
+// most common answer here is "no judgement was possible at all", which
+// is worth being able to say out loud.
+func (e *Extractor) surpriseGate(ctx context.Context, scope anamnesia.Scope, content string, threshold float64) (skip bool, score float64, reason string, err error) {
 	if e.Embedder == nil || e.Retrieval == nil {
-		return false, nil
+		return false, 0, "nothing was compared: no embedder or retrieval is configured", nil
 	}
 	hits, err := e.Retrieval.Search(ctx, retrieval.Query{
 		Scope: scope,
@@ -357,11 +546,11 @@ func (e *Extractor) surpriseGate(ctx context.Context, scope anamnesia.Scope, con
 		K:     1,
 	})
 	if err != nil {
-		return false, err
+		return false, 0, "", err
 	}
 	// If retrieval found nothing similar, definitely extract.
 	if len(hits) == 0 {
-		return false, nil
+		return false, 0, "no similar memory exists yet", nil
 	}
 	// The reranker mutates Score; without it, RRF scores are tiny.
 	// Fall back to recomputing a cosine ourselves on the candidate.
@@ -369,10 +558,15 @@ func (e *Extractor) surpriseGate(ctx context.Context, scope anamnesia.Scope, con
 	// reranker put the candidate first with a high score (close to 1)
 	// we treat that as "seen". Otherwise we always extract. This is
 	// conservative; tune later when we have data.
-	if hits[0].RerankerRank > 0 && hits[0].Score >= threshold {
-		return true, nil
+	if hits[0].RerankerRank == 0 {
+		return false, hits[0].Score, "no reranker ran, so the gate had no absolute score to judge with", nil
 	}
-	return false, nil
+	if hits[0].Score >= threshold {
+		return true, hits[0].Score, fmt.Sprintf(
+			"the nearest memory scores %.2f, at or above the %.2f threshold", hits[0].Score, threshold), nil
+	}
+	return false, hits[0].Score, fmt.Sprintf(
+		"the nearest memory scores %.2f, below the %.2f threshold", hits[0].Score, threshold), nil
 }
 
 // candidates pulls top-K similar facts + experiences as the LLM's
@@ -384,15 +578,19 @@ type candidate struct {
 	Meta   map[string]any `json:"meta,omitempty"`
 }
 
-func (e *Extractor) candidates(ctx context.Context, scope anamnesia.Scope, text string, k int) ([]candidate, error) {
+// The hits are returned alongside so a trace can show the scores. They
+// are deliberately not folded into candidate: that struct is marshalled
+// into the model's prompt, and the prompt must not change shape because
+// something started watching.
+func (e *Extractor) candidates(ctx context.Context, scope anamnesia.Scope, text string, k int) ([]candidate, []anamnesia.SearchHit, error) {
 	if e.Retrieval == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	hits, err := e.Retrieval.Search(ctx, retrieval.Query{
 		Scope: scope, Text: text, K: k,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	out := make([]candidate, 0, len(hits))
 	for _, h := range hits {
@@ -421,7 +619,7 @@ func (e *Extractor) candidates(ctx context.Context, scope anamnesia.Scope, text 
 		}
 		out = append(out, c)
 	}
-	return out, nil
+	return out, hits, nil
 }
 
 // userPrompt assembles the JSON payload sent to the LLM. The system
@@ -575,11 +773,12 @@ Rules:
 - Keep importance/trust in [0,1]. Default importance 0.7, trust 0.8 — this content is benchmark-grade.
 - Cap output at 20 operations. Higher cap because list-decomposition can legitimately emit many facts.`
 
-// executeOp runs one operation against the store.
-func (e *Extractor) executeOp(ctx context.Context, src *anamnesia.Source, op Operation) error {
+// executeOp runs one operation against the store, reporting the row it
+// touched so the trace can link to it.
+func (e *Extractor) executeOp(ctx context.Context, src *anamnesia.Source, op Operation) (applied, error) {
 	switch strings.ToUpper(op.Op) {
 	case "", "NOOP":
-		return nil
+		return applied{}, nil
 	case "ADD_FACT":
 		return e.addFact(ctx, src, op)
 	case "UPDATE_FACT":
@@ -593,21 +792,21 @@ func (e *Extractor) executeOp(ctx context.Context, src *anamnesia.Source, op Ope
 		// is on, but guard here too so a stray op is a no-op rather than
 		// an unexpected write.
 		if !e.Cfg.ExtractCommitments {
-			return nil
+			return applied{}, nil
 		}
 		return e.addCommitment(ctx, src, op)
 	default:
-		return fmt.Errorf("unknown op %q", op.Op)
+		return applied{}, fmt.Errorf("unknown op %q", op.Op)
 	}
 }
 
-func (e *Extractor) addFact(ctx context.Context, src *anamnesia.Source, op Operation) error {
+func (e *Extractor) addFact(ctx context.Context, src *anamnesia.Source, op Operation) (applied, error) {
 	key := op.Key
 	if key == "" {
 		key = deriveFactKey(op.Value, op.Body, op.Title)
 	}
 	if key == "" {
-		return errors.New("ADD_FACT: key required and could not be derived")
+		return applied{}, errors.New("ADD_FACT: key required and could not be derived")
 	}
 	op.Key = key
 	scope := anamnesia.FactScope(op.FactScope)
@@ -629,17 +828,20 @@ func (e *Extractor) addFact(ctx context.Context, src *anamnesia.Source, op Opera
 		SourceID: &sourceID,
 		Trust:    trust,
 	}
-	return e.Store.UpsertFact(ctx, f)
+	if err := e.Store.UpsertFact(ctx, f); err != nil {
+		return applied{}, err
+	}
+	return applied{Target: "fact", ID: f.ID}, nil
 }
 
-func (e *Extractor) updateFact(ctx context.Context, src *anamnesia.Source, op Operation) error {
+func (e *Extractor) updateFact(ctx context.Context, src *anamnesia.Source, op Operation) (applied, error) {
 	id, err := uuid.Parse(op.ID)
 	if err != nil {
-		return fmt.Errorf("UPDATE_FACT: %w", err)
+		return applied{}, fmt.Errorf("UPDATE_FACT: %w", err)
 	}
 	prev, err := e.Store.GetFact(ctx, id)
 	if err != nil {
-		return fmt.Errorf("UPDATE_FACT: %w", err)
+		return applied{}, fmt.Errorf("UPDATE_FACT: %w", err)
 	}
 	if len(op.Value) > 0 {
 		prev.Value = valueToMap(op.Value)
@@ -650,21 +852,27 @@ func (e *Extractor) updateFact(ctx context.Context, src *anamnesia.Source, op Op
 	prev.Source = strOr(op.Source, "extracted")
 	sourceID := src.ID
 	prev.SourceID = &sourceID
-	return e.Store.UpsertFact(ctx, prev)
+	if err := e.Store.UpsertFact(ctx, prev); err != nil {
+		return applied{}, err
+	}
+	return applied{Target: "fact", ID: prev.ID}, nil
 }
 
-func (e *Extractor) deleteFact(ctx context.Context, op Operation) error {
+func (e *Extractor) deleteFact(ctx context.Context, op Operation) (applied, error) {
 	id, err := uuid.Parse(op.ID)
 	if err != nil {
-		return fmt.Errorf("DELETE_FACT: %w", err)
+		return applied{}, fmt.Errorf("DELETE_FACT: %w", err)
 	}
-	return e.Store.ForgetFact(ctx, id)
+	if err := e.Store.ForgetFact(ctx, id); err != nil {
+		return applied{}, err
+	}
+	return applied{Target: "fact", ID: id}, nil
 }
 
-func (e *Extractor) addExperience(ctx context.Context, src *anamnesia.Source, op Operation) error {
+func (e *Extractor) addExperience(ctx context.Context, src *anamnesia.Source, op Operation) (applied, error) {
 	body := op.Body
 	if body == "" {
-		return errors.New("ADD_EXPERIENCE: body required")
+		return applied{}, errors.New("ADD_EXPERIENCE: body required")
 	}
 	kind := anamnesia.ExperienceKind(op.Kind)
 	if !kind.Valid() {
@@ -691,13 +899,16 @@ func (e *Extractor) addExperience(ctx context.Context, src *anamnesia.Source, op
 		Provenance:   map[string]any{"source_kind": src.Kind, "source_ref": src.ExternalRef},
 		Meta:         map[string]any{"extracted": true, "source_id": src.ID},
 	}
-	return e.Store.RecordExperience(ctx, exp)
+	if err := e.Store.RecordExperience(ctx, exp); err != nil {
+		return applied{}, err
+	}
+	return applied{Target: "experience", ID: exp.ID}, nil
 }
 
-func (e *Extractor) addCommitment(ctx context.Context, src *anamnesia.Source, op Operation) error {
+func (e *Extractor) addCommitment(ctx context.Context, src *anamnesia.Source, op Operation) (applied, error) {
 	body := op.Body
 	if body == "" {
-		return errors.New("ADD_COMMITMENT: body required")
+		return applied{}, errors.New("ADD_COMMITMENT: body required")
 	}
 	srcID := src.ID
 	c := &anamnesia.Commitment{
@@ -713,7 +924,10 @@ func (e *Extractor) addCommitment(ctx context.Context, src *anamnesia.Source, op
 			c.DueAt = &t
 		}
 	}
-	return e.Store.RecordCommitment(ctx, c)
+	if err := e.Store.RecordCommitment(ctx, c); err != nil {
+		return applied{}, err
+	}
+	return applied{Target: "commitment", ID: c.ID}, nil
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────

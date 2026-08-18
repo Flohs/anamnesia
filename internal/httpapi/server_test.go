@@ -1,6 +1,11 @@
 package httpapi
 
 import (
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -71,4 +76,31 @@ func TestCrossFields(t *testing.T) {
 			t.Fatal("skill hits should not be surfaced cross-project")
 		}
 	})
+}
+
+// The activity stream is served through withLogging like every other
+// route. If its wrapper hides the underlying writer, the stream cannot
+// flush and cannot clear the 60s write deadline, so it buffers until the
+// server severs it. Both are silent failures, hence this test.
+func TestLoggingWrapperStaysFlushable(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := withLogging(log, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		fmt.Fprintf(w, "deadline=%v flush=%v", rc.SetWriteDeadline(time.Time{}), rc.Flush())
+	}))
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(body), "deadline=<nil> flush=<nil>"; got != want {
+		t.Errorf("through withLogging: %s; want %s", got, want)
+	}
 }

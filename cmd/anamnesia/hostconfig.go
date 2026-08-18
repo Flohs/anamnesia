@@ -95,8 +95,17 @@ func loadHostConfig() (*hostConfig, error) {
 			if err != nil {
 				return nil, fmt.Errorf("environment %s: %w", s.Env, err)
 			}
+			// An environment value equal to what the files already
+			// resolved to is not an override. `anamnesia start` hands
+			// the server its own config as environment variables, so
+			// without this every configured setting would report itself
+			// as an environment override inside the server, and both
+			// `config list` and /v1/config would misdescribe where the
+			// value was actually set.
+			if norm != hc.values[s.Key] {
+				hc.origins[s.Key] = fromEnv
+			}
 			hc.values[s.Key] = norm
-			hc.origins[s.Key] = fromEnv
 		}
 	}
 	// ANAMNESIA_URL is the historical name for the server location and

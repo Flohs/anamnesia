@@ -395,3 +395,107 @@ func TestSanitizeSlug(t *testing.T) {
 		}
 	}
 }
+
+func TestActivitySettingsReachTheServer(t *testing.T) {
+	isolatedHome(t)
+	hc, err := loadHostConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hc.Get("activity.enabled"); got != "true" {
+		t.Errorf("activity.enabled default = %q, want true", got)
+	}
+	if got := hc.Get("activity.traces"); got != "200" {
+		t.Errorf("activity.traces default = %q, want 200", got)
+	}
+	env := strings.Join(hc.ServerEnv(), "\n")
+	for _, want := range []string{"ANAMNESIA_ACTIVITY_ENABLED=true", "ANAMNESIA_ACTIVITY_TRACES=200"} {
+		if !strings.Contains(env, want) {
+			t.Errorf("server environment is missing %s", want)
+		}
+	}
+}
+
+func TestActivityTracesRejectsZero(t *testing.T) {
+	// The recorder is switched off with activity.enabled, not with a
+	// ring of size zero: every numeric setting rejects non-positive
+	// values, and that check is worth more than the shorthand.
+	if _, err := settingByKey["activity.traces"].validate("0"); err == nil {
+		t.Error("activity.traces accepted 0")
+	}
+}
+
+func TestConfigSnapshotMasksSecrets(t *testing.T) {
+	home := isolatedHome(t)
+	writeConfig(t, filepath.Join(home, "config.toml"), `
+[openrouter]
+api_key = "sk-or-v1-supersecretvalue"
+[llm]
+provider = "openrouter"
+`)
+	hc, err := loadHostConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	byKey := map[string]string{}
+	source := map[string]string{}
+	for _, item := range configSnapshot(hc) {
+		byKey[item.Key] = item.Value
+		source[item.Key] = item.Source
+		if item.Key == "openrouter.api_key" && !item.Secret {
+			t.Error("openrouter.api_key is not flagged as a secret")
+		}
+	}
+	if got := byKey["openrouter.api_key"]; strings.Contains(got, "supersecret") {
+		t.Fatalf("the API key reached the snapshot unmasked: %q", got)
+	}
+	if got := byKey["llm.provider"]; got != "openrouter" {
+		t.Errorf("llm.provider = %q, want openrouter", got)
+	}
+	if got := source["llm.provider"]; got != "global" {
+		t.Errorf("llm.provider source = %q, want global", got)
+	}
+	if got := source["embed.dims"]; got != "default" {
+		t.Errorf("embed.dims source = %q, want default", got)
+	}
+}
+
+func TestEnvMatchingTheFileKeepsTheFileOrigin(t *testing.T) {
+	// `anamnesia start` hands the server its own config as environment
+	// variables, so inside the server process every configured setting
+	// would otherwise report itself as an environment override. That
+	// makes `config list` and /v1/config lie about where a value came
+	// from. An environment value equal to the file's is not an override.
+	home := isolatedHome(t)
+	writeConfig(t, filepath.Join(home, "config.toml"), "[llm]\nmodel = \"claude-sonnet-4-6\"\n")
+	t.Setenv("ANAMNESIA_LLM_MODEL", "claude-sonnet-4-6")
+
+	hc, err := loadHostConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hc.Origin("llm.model"); got != fromGlobal {
+		t.Errorf("origin = %q, want %q when the environment merely echoes the file", got, fromGlobal)
+	}
+	if got := hc.Get("llm.model"); got != "claude-sonnet-4-6" {
+		t.Errorf("value = %q", got)
+	}
+}
+
+func TestEnvDifferingFromTheFileIsStillAnOverride(t *testing.T) {
+	home := isolatedHome(t)
+	writeConfig(t, filepath.Join(home, "config.toml"), "[llm]\nmodel = \"claude-sonnet-4-6\"\n")
+	t.Setenv("ANAMNESIA_LLM_MODEL", "gpt-4o-mini")
+
+	hc, err := loadHostConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hc.Origin("llm.model"); got != fromEnv {
+		t.Errorf("origin = %q, want %q for a real override", got, fromEnv)
+	}
+	if got := hc.Get("llm.model"); got != "gpt-4o-mini" {
+		t.Errorf("value = %q, want the environment to win", got)
+	}
+}

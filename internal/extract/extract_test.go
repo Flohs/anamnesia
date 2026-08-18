@@ -282,7 +282,7 @@ func TestCommitmentPromptGating(t *testing.T) {
 		// With the flag off, even a stray ADD_COMMITMENT op must not reach
 		// the (nil) store. executeOp returns nil before touching it.
 		ex := &Extractor{Cfg: Config{ExtractCommitments: false}}
-		if err := ex.executeOp(ctx, src, Operation{Op: "ADD_COMMITMENT", Body: "x"}); err != nil {
+		if _, err := ex.executeOp(ctx, src, Operation{Op: "ADD_COMMITMENT", Body: "x"}); err != nil {
 			t.Errorf("disabled ADD_COMMITMENT should be a no-op, got %v", err)
 		}
 	})

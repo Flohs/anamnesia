@@ -153,6 +153,12 @@ var settings = []setting{
 		Doc: "How often similar experiences are clustered and distilled."},
 	{Key: "worker.extract_commitments", Kind: kBool, Def: "false", Env: "ANAMNESIA_EXTRACT_COMMITMENTS",
 		Doc: "Also record open obligations (\"I'll send X by Friday\") in the commitments ledger."},
+
+	// ─── activity ────────────────────────────────────────────────────
+	{Key: "activity.enabled", Kind: kBool, Def: "true", Env: "ANAMNESIA_ACTIVITY_ENABLED",
+		Doc: "Record what the server is doing, in memory, and serve it on /v1/activity. Off makes those routes 404 and every recording call a no-op."},
+	{Key: "activity.traces", Kind: kInt, Def: "200", Env: "ANAMNESIA_ACTIVITY_TRACES",
+		Doc: "How many recent traces to keep. They live in memory only, so a restart clears them. Use activity.enabled to switch recording off; this is a size, and sizes are positive."},
 }
 
 // settingByKey indexes settings for lookup.

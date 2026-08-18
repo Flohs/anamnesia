@@ -18,6 +18,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/flohs/anamnesia/internal/activity"
 	"github.com/flohs/anamnesia/internal/config"
 	"github.com/flohs/anamnesia/internal/embed"
 	"github.com/flohs/anamnesia/internal/extract"
@@ -101,14 +102,36 @@ func openStore(ctx context.Context, cfg *config.Config) (*store.Store, error) {
 	return st, nil
 }
 
+// configSnapshot renders the resolved settings for /v1/config. Secrets
+// are masked here, on the host side: settings live in this package and
+// internal/httpapi cannot import it, so the HTTP layer is handed data it
+// can serve rather than a configuration it could read a key out of.
+func configSnapshot(hc *hostConfig) []httpapi.ConfigItem {
+	items := make([]httpapi.ConfigItem, 0, len(settings))
+	for _, s := range settings {
+		items = append(items, httpapi.ConfigItem{
+			Key:    s.Key,
+			Value:  s.mask(hc.Get(s.Key)),
+			Source: string(hc.Origin(s.Key)),
+			Secret: s.Kind == kSecret,
+		})
+	}
+	return items
+}
+
 func runServe(cmd *cobra.Command, _ []string) error {
-	if _, err := applyHostEnv(); err != nil {
+	hc, err := applyHostEnv()
+	if err != nil {
 		return err
 	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
+	// Best effort: without a resolvable home there is no hook log to
+	// serve, and /v1/hooks says so rather than the server refusing to
+	// start over it.
+	hookLog, _ := hookLogPath()
 	log := rf.log
 	log.Info("anamnesia booting", "cfg", cfg.String(), "version", version)
 
@@ -182,6 +205,14 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	// The recorder is what /v1/activity serves. Nil when recording is
+	// switched off, which every call site tolerates and which makes the
+	// activity routes 404 rather than pretend to be empty.
+	var recorder *activity.Recorder
+	if cfg.ActivityEnabled {
+		recorder = activity.New(cfg.ActivityTraces)
+	}
+
 	retr := &retrieval.Engine{Store: st, Embedder: emb, Reranker: reranker}
 	briefer := &jobs.Briefer{LLM: llmc}
 
@@ -205,6 +236,10 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		ServerToken:    cfg.ServerToken,
 		Log:            log,
 		Version:        version,
+		Activity:       recorder,
+		Started:        time.Now().UTC(),
+		Config:         configSnapshot(hc),
+		HookLogPath:    hookLog,
 		EmbedProvider:  cfg.EmbedProvider,
 		EmbedModel:     cfg.EmbedModel,
 		EmbedDims:      cfg.EmbedDims,
@@ -229,6 +264,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 			LLM:       llmc,
 			Retrieval: retr,
 			Log:       log,
+			Activity:  recorder,
 		}
 		go func() { workerErr <- worker.Run(ctx) }()
 	}

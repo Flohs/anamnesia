@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/flohs/anamnesia/internal/activity"
 	"github.com/flohs/anamnesia/internal/decay"
 	"github.com/flohs/anamnesia/internal/embed"
 	"github.com/flohs/anamnesia/internal/extract"
@@ -42,6 +43,9 @@ type Worker struct {
 	LLM       llm.Client
 	Retrieval *retrieval.Engine
 	Log       *slog.Logger
+	// Activity records how each tick went. Nil is a working no-op, so
+	// the worker never depends on anyone watching.
+	Activity *activity.Recorder
 }
 
 // Run blocks until ctx is cancelled. Each loop sleeps independently.
@@ -79,33 +83,42 @@ func (w *Worker) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (w *Worker) loop(ctx context.Context, name string, every time.Duration, fn func(context.Context) error) {
+func (w *Worker) loop(ctx context.Context, name string, every time.Duration, fn func(context.Context) (string, error)) {
+	w.Activity.SetInterval(name, every)
 	t := time.NewTicker(every)
 	defer t.Stop()
 	// Fire once immediately on start.
-	if err := fn(ctx); err != nil {
-		w.Log.Warn("worker tick", "loop", name, "err", err)
-	}
+	w.tick(ctx, name, fn)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := fn(ctx); err != nil {
-				w.Log.Warn("worker tick", "loop", name, "err", err)
-			}
+			w.tick(ctx, name, fn)
 		}
 	}
 }
 
-func (w *Worker) tickEmbed(ctx context.Context) error {
+// tick runs one pass and records how it went. Every tick returns a short
+// sentence saying what it did, which is the difference between a worker
+// lane that reads and one that only proves the process is alive.
+func (w *Worker) tick(ctx context.Context, name string, fn func(context.Context) (string, error)) {
+	done := w.Activity.LoopStart(name)
+	result, err := fn(ctx)
+	done(result, err)
+	if err != nil {
+		w.Log.Warn("worker tick", "loop", name, "err", err)
+	}
+}
+
+func (w *Worker) tickEmbed(ctx context.Context) (string, error) {
 	if w.Embedder == nil {
-		return nil
+		return "no embedder configured", nil
 	}
 	// Backfill facts.
 	facts, err := w.Store.FactsMissingEmbedding(ctx, w.Cfg.EmbedBatch)
 	if err != nil {
-		return fmt.Errorf("fetch facts: %w", err)
+		return "", fmt.Errorf("fetch facts: %w", err)
 	}
 	if len(facts) > 0 {
 		texts := make([]string, len(facts))
@@ -114,7 +127,7 @@ func (w *Worker) tickEmbed(ctx context.Context) error {
 		}
 		vecs, err := w.Embedder.Embed(ctx, texts)
 		if err != nil {
-			return fmt.Errorf("embed facts: %w", err)
+			return "", fmt.Errorf("embed facts: %w", err)
 		}
 		for i, f := range facts {
 			if i >= len(vecs) || vecs[i] == nil {
@@ -129,7 +142,7 @@ func (w *Worker) tickEmbed(ctx context.Context) error {
 	// Backfill experiences.
 	exps, err := w.Store.ExperiencesMissingEmbedding(ctx, w.Cfg.EmbedBatch)
 	if err != nil {
-		return fmt.Errorf("fetch experiences: %w", err)
+		return "", fmt.Errorf("fetch experiences: %w", err)
 	}
 	if len(exps) > 0 {
 		texts := make([]string, len(exps))
@@ -138,7 +151,7 @@ func (w *Worker) tickEmbed(ctx context.Context) error {
 		}
 		vecs, err := w.Embedder.Embed(ctx, texts)
 		if err != nil {
-			return fmt.Errorf("embed experiences: %w", err)
+			return "", fmt.Errorf("embed experiences: %w", err)
 		}
 		for i, e := range exps {
 			if i >= len(vecs) || vecs[i] == nil {
@@ -150,42 +163,52 @@ func (w *Worker) tickEmbed(ctx context.Context) error {
 		}
 		w.Log.Info("embedded experiences", "n", len(exps))
 	}
-	return nil
+	if len(facts) == 0 && len(exps) == 0 {
+		return "nothing to embed", nil
+	}
+	return fmt.Sprintf("embedded %d facts, %d experiences", len(facts), len(exps)), nil
 }
 
-func (w *Worker) tickForget(ctx context.Context) error {
+func (w *Worker) tickForget(ctx context.Context) (string, error) {
 	n, err := w.Store.PurgeExpiredWorking(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if n > 0 {
-		w.Log.Info("purged expired working memory", "n", n)
+	if n == 0 {
+		return "nothing expired", nil
 	}
-	return nil
+	w.Log.Info("purged expired working memory", "n", n)
+	return fmt.Sprintf("purged %d expired working entries", n), nil
 }
 
-func (w *Worker) tickDecay(ctx context.Context) error {
+func (w *Worker) tickDecay(ctx context.Context) (string, error) {
 	d := &decay.Worker{Store: w.Store, Log: w.Log, Cfg: w.Cfg.Decay}
-	return d.Tick(ctx)
-}
-
-func (w *Worker) tickConsolidate(ctx context.Context) error {
-	if w.LLM == nil {
-		return nil
+	if err := d.Tick(ctx); err != nil {
+		return "", err
 	}
-	return ConsolidationRun(ctx, w.Store, w.LLM, w.Cfg.Consolidate, w.Log, w.Cfg.ConsolidateEvery)
+	return "recomputed experience relevance", nil
 }
 
-func (w *Worker) tickExtract(ctx context.Context) error {
+func (w *Worker) tickConsolidate(ctx context.Context) (string, error) {
 	if w.LLM == nil {
-		return nil
+		return "no llm configured", nil
+	}
+	if err := ConsolidationRun(ctx, w.Store, w.LLM, w.Cfg.Consolidate, w.Log, w.Cfg.ConsolidateEvery); err != nil {
+		return "", err
+	}
+	return "consolidation pass complete", nil
+}
+
+func (w *Worker) tickExtract(ctx context.Context) (string, error) {
+	if w.LLM == nil {
+		return "no llm configured", nil
 	}
 	pending, err := w.Store.ListPendingSources(ctx, w.Cfg.ExtractBatch)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if len(pending) == 0 {
-		return nil
+		return "no pending sources", nil
 	}
 	ex := &extract.Extractor{
 		Cfg:       w.Cfg.Extract,
@@ -194,10 +217,13 @@ func (w *Worker) tickExtract(ctx context.Context) error {
 		Retrieval: w.Retrieval,
 		LLM:       w.LLM,
 		Log:       w.Log,
+		Activity:  w.Activity,
 	}
+	operations, failed := 0, 0
 	for _, src := range pending {
 		ops, err := ex.Run(ctx, src)
 		if err != nil {
+			failed++
 			if w.Log != nil {
 				w.Log.Warn("extract failed", "source", src.ID, "err", err)
 			}
@@ -209,22 +235,30 @@ func (w *Worker) tickExtract(ctx context.Context) error {
 		} else {
 			_ = w.Store.MarkExtracted(ctx, src.ID, ops)
 		}
+		operations += ops
 		if w.Log != nil && ops > 0 {
 			w.Log.Info("extracted", "source", src.ID, "kind", src.Kind, "ops", ops)
 		}
 	}
-	return nil
+	result := fmt.Sprintf("%d sources, %d operations", len(pending), operations)
+	if failed > 0 {
+		result += fmt.Sprintf(", %d failed", failed)
+	}
+	return result, nil
 }
 
-func (w *Worker) tickPurgeSources(ctx context.Context) error {
+func (w *Worker) tickPurgeSources(ctx context.Context) (string, error) {
 	n, err := w.Store.PurgeExpiredSourceContent(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if n > 0 && w.Log != nil {
+	if n == 0 {
+		return "nothing to purge", nil
+	}
+	if w.Log != nil {
 		w.Log.Info("purged expired source content", "n", n)
 	}
-	return nil
+	return fmt.Sprintf("purged raw content from %d sources", n), nil
 }
 
 func factText(key string, value map[string]any) string {
