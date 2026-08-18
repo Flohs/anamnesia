@@ -391,7 +391,7 @@ func TestCorpusRejectsAnEmptyRelevantSet(t *testing.T) {
 ```bash
 docker run --rm -v "$PWD":/src:ro -v /tmp/gocache:/gocache \
   -e GOCACHE=/gocache/build -e GOMODCACHE=/gocache/mod -e GOFLAGS=-mod=mod \
-  -w /src golang:1.26 go test ./cmd/anamnesia/ -run TestCorpus -v
+  -w /src golang:1.26 go test ./cmd/anamnesia/ -run 'TestShippedCorpusIsValid|TestCorpus' -v
 ```
 
 Expected: build failure — `undefined: loadCorpus`, `undefined: parseCorpus`.
@@ -1225,7 +1225,7 @@ Append sources to `corpus.jsonl` with sequential ids continuing from `src-006`, 
 ```bash
 docker run --rm -v "$PWD":/src:ro -v /tmp/gocache:/gocache \
   -e GOCACHE=/gocache/build -e GOMODCACHE=/gocache/mod -e GOFLAGS=-mod=mod \
-  -w /src golang:1.26 go test ./cmd/anamnesia/ -run TestCorpus -v
+  -w /src golang:1.26 go test ./cmd/anamnesia/ -run 'TestShippedCorpusIsValid|TestCorpus' -v
 ```
 
 Expected: PASS. A failure names the offending id.
