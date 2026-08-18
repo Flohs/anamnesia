@@ -154,8 +154,12 @@ func (s *Store) LookupUserHandle(ctx context.Context, id uuid.UUID) (string, err
 }
 
 // DeleteUser removes a user and, by cascade, every row that belongs to
-// it. Only `anamnesia eval` calls this, to clean up the scope it created;
-// nothing on the memory path deletes a user.
+// it — except commitments: commitments.user_id has no ON DELETE CASCADE,
+// so a user with commitment rows makes this DELETE abort atomically and
+// nothing is removed. Callers that may have created commitments must
+// delete those rows themselves first. Only `anamnesia eval` calls this,
+// to clean up the scope it created; nothing on the memory path deletes a
+// user.
 func (s *Store) DeleteUser(ctx context.Context, handle string) (bool, error) {
 	tag, err := s.Pool.Exec(ctx, `DELETE FROM users WHERE handle = $1`, handle)
 	if err != nil {

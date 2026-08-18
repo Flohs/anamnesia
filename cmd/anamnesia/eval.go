@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/flohs/anamnesia/internal/httpapi"
@@ -36,9 +37,29 @@ const (
 
 type evalReport struct {
 	At        string         `json:"at"`
+	K         int            `json:"k"`
 	Queries   int            `json:"queries"`
 	Aggregate aggregateScore `json:"aggregate"`
 	PerQuery  []queryScore   `json:"per_query"`
+}
+
+// evalMetricKs returns the recall/precision cutoffs to report for a run
+// that requested k hits per query. A cutoff above k would label a metric
+// computed over a truncated hit list with a k it was never given — the
+// bug this guards against is `eval --k 5` reporting a "recall@10" that is
+// really recall@5. If every standard cutoff exceeds k, k itself is kept
+// so the report is never empty.
+func evalMetricKs(k int) []int {
+	var ks []int
+	for _, v := range []int{1, 5, 10} {
+		if v <= k {
+			ks = append(ks, v)
+		}
+	}
+	if len(ks) == 0 {
+		ks = []int{k}
+	}
+	return ks
 }
 
 // runEvalPass ingests the corpus, waits for the queues to drain, runs
@@ -67,7 +88,7 @@ func runEvalPass(ctx context.Context, hc *hostConfig, sources []evalSource, quer
 		return evalReport{}, err
 	}
 
-	ks := []int{1, 5, 10}
+	ks := evalMetricKs(k)
 	scores := make([]queryScore, 0, len(queries))
 	for _, q := range queries {
 		var resp httpapi.RetrieveResp
@@ -94,6 +115,7 @@ func runEvalPass(ctx context.Context, hc *hostConfig, sources []evalSource, quer
 	}
 
 	return evalReport{
+		K:         k,
 		Queries:   len(queries),
 		Aggregate: aggregate(scores, ks),
 		PerQuery:  scores,
@@ -339,7 +361,10 @@ func writeEvalResult(out, errOut io.Writer, jsonMode bool, report evalReport, ba
 	if err := json.Unmarshal(raw, &base); err != nil {
 		return fmt.Errorf("parse baseline %s: %w", baselinePath, err)
 	}
-	regressed, lines := compareToBaseline(base, report)
+	regressed, lines, err := compareToBaseline(base, report)
+	if err != nil {
+		return err
+	}
 	fmt.Fprintln(errOut)
 	for _, l := range lines {
 		fmt.Fprintln(errOut, l)
@@ -355,7 +380,14 @@ func writeEvalResult(out, errOut io.Writer, jsonMode bool, report evalReport, ba
 func renderReport(w io.Writer, r evalReport) {
 	a := r.Aggregate
 	fmt.Fprintf(w, "\n%d queries over the fixture corpus\n\n", a.Queries)
-	for _, k := range []int{1, 5, 10} {
+	// Only the cutoffs the run actually computed: a run made with --k 5
+	// never fetched enough hits to say anything about recall@10.
+	ks := make([]int, 0, len(a.RecallAt))
+	for k := range a.RecallAt {
+		ks = append(ks, k)
+	}
+	sort.Ints(ks)
+	for _, k := range ks {
 		fmt.Fprintf(w, "  recall@%-3d %.3f      precision@%-3d %.3f\n",
 			k, a.RecallAt[k], k, a.PrecisionAt[k])
 	}
@@ -379,8 +411,21 @@ func renderReport(w io.Writer, r evalReport) {
 const regressionTolerance = 0.02
 
 // compareToBaseline reports whether the run got worse, and explains every
-// metric either way.
-func compareToBaseline(base, now evalReport) (bool, []string) {
+// metric either way. It refuses to compare runs of different shape: a
+// baseline taken with a different --k, or over a different query set,
+// measured different things, and comparing them metric-by-metric would
+// silently report on numbers that were never asking the same question.
+// This also catches a baseline written before K was recorded — it reads
+// as K 0, which now differs from any real run instead of comparing as if
+// every one of its metrics were a genuine 0.0.
+func compareToBaseline(base, now evalReport) (bool, []string, error) {
+	if base.K != now.K {
+		return false, nil, fmt.Errorf("baseline was run with --k %d, this run used --k %d: cannot compare", base.K, now.K)
+	}
+	if base.Queries != now.Queries {
+		return false, nil, fmt.Errorf("baseline covered %d queries, this run covered %d: cannot compare", base.Queries, now.Queries)
+	}
+
 	var lines []string
 	regressed := false
 	type metric struct {
@@ -388,7 +433,12 @@ func compareToBaseline(base, now evalReport) (bool, []string) {
 		base, curr float64
 	}
 	var metrics []metric
-	for _, k := range []int{1, 5, 10} {
+	ks := make([]int, 0, len(now.Aggregate.RecallAt))
+	for k := range now.Aggregate.RecallAt {
+		ks = append(ks, k)
+	}
+	sort.Ints(ks)
+	for _, k := range ks {
 		metrics = append(metrics,
 			metric{fmt.Sprintf("recall@%d", k), base.Aggregate.RecallAt[k], now.Aggregate.RecallAt[k]},
 			metric{fmt.Sprintf("precision@%d", k), base.Aggregate.PrecisionAt[k], now.Aggregate.PrecisionAt[k]},
@@ -404,5 +454,5 @@ func compareToBaseline(base, now evalReport) (bool, []string) {
 		}
 		lines = append(lines, fmt.Sprintf("%s %-14s %.3f -> %.3f  (%+.3f)", mark, m.name, m.base, m.curr, delta))
 	}
-	return regressed, lines
+	return regressed, lines, nil
 }

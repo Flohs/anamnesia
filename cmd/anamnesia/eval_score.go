@@ -111,7 +111,9 @@ func aggregate(scores []queryScore, ks []int) aggregateScore {
 	return agg
 }
 
-// percentile takes the nearest-rank value from a sorted slice.
+// percentile returns the value at index p*(len-1) of a sorted slice,
+// truncated toward zero rather than interpolated between the two
+// neighbouring ranks.
 func percentile(sorted []int64, p float64) int64 {
 	if len(sorted) == 0 {
 		return 0
