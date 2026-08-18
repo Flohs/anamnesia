@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -39,7 +40,8 @@ type HookLogEntry struct {
 	Error string    `json:"error,omitempty"`
 }
 
-// hookLogTail is how many entries /v1/hooks returns at most.
+// hookLogTail is how many entries /v1/hooks returns at most, and the
+// ceiling on ?limit.
 const hookLogTail = 200
 
 func (d Deps) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -60,7 +62,18 @@ func (d Deps) handleHooks(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no hook log path is configured", http.StatusNotFound)
 		return
 	}
-	items, err := readHookLog(d.HookLogPath, hookLogTail)
+	n := hookLogTail
+	if v := r.URL.Query().Get("limit"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || parsed <= 0 {
+			http.Error(w, "limit must be a positive number", http.StatusBadRequest)
+			return
+		}
+		// The tail is what bounds the response, so asking for more than
+		// it is not an error, it is just the tail.
+		n = min(parsed, hookLogTail)
+	}
+	items, err := readHookLog(d.HookLogPath, n)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

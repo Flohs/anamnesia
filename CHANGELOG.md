@@ -95,6 +95,12 @@ were rebuilt around being verifiable.
 - `trimLine` no longer splits multi-byte characters.
 - Claude Code's config files are backed up before they are first modified.
 
+- **`/v1/hooks` ignored `limit`.** It returned the whole tail whatever was
+  asked for, so a panel wanting the last five entries was sent two hundred.
+  Every other list route honours `limit`; this one now does too, rejecting a
+  non-positive value the way they do and treating the tail as the ceiling
+  rather than an error.
+
 - **`restart` could leave nothing running.** `stop` sent SIGTERM and gave up
   after 15 seconds, while the server allows itself 30 to finish in-flight work.
   `/v1/activity/stream` is in flight until its client goes away, so a browser
