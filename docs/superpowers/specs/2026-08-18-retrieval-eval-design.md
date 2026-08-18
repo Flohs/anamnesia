@@ -2,10 +2,16 @@
 
 Written 2026-08-18 against `v0.1.0-rc7` (commit f9bb1be).
 
-**Build this first.** The other two designs — [graph
+**Build this first.** The other three designs — [segmented
+ingest](./2026-08-18-segmented-ingest-design.md), [graph
 extraction](./2026-08-18-graph-extraction-design.md) and [working-memory
-folding](./2026-08-18-working-memory-fold-design.md) — both claim to improve
-retrieval, and neither claim can currently be checked.
+folding](./2026-08-18-working-memory-fold-design.md) — all claim to improve
+what memory returns, and none of those claims can currently be checked.
+
+Note that segmented ingest changes the *corpus*, not the ranking. This eval
+covers it because the fixture corpus is ingested through `/v1/ingest` rather
+than inserted directly, so a change to what gets extracted shows up in the
+same numbers.
 
 ---
 

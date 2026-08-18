@@ -6,6 +6,11 @@ Depends on [the retrieval eval](./2026-08-18-retrieval-eval-design.md). The
 whole justification for this work is better recall, and without the eval that
 claim cannot be checked.
 
+**Reordered 2026-08-18: this is now third.** [Segmented
+ingest](./2026-08-18-segmented-ingest-design.md) comes first, because a graph
+built over 21 rows connects almost nothing. A denser corpus makes this design
+worth more, not less.
+
 ---
 
 ## The problem

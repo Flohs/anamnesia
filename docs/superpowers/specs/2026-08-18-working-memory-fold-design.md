@@ -2,7 +2,13 @@
 
 Written 2026-08-18 against `v0.1.0-rc7` (commit f9bb1be).
 
-Smallest of the three designs, and independent of the other two.
+Smallest of the four designs, and independent of the others.
+
+**Reordered 2026-08-18: this is now last, and it is the one to drop if
+something has to go.** It adds a write path nothing currently uses
+(`working_memory` holds 0 rows), where [segmented
+ingest](./2026-08-18-segmented-ingest-design.md) improves the write path that
+carries all real traffic.
 
 ---
 
