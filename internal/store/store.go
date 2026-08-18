@@ -153,6 +153,17 @@ func (s *Store) LookupUserHandle(ctx context.Context, id uuid.UUID) (string, err
 	return h, err
 }
 
+// DeleteUser removes a user and, by cascade, every row that belongs to
+// it. Only `anamnesia eval` calls this, to clean up the scope it created;
+// nothing on the memory path deletes a user.
+func (s *Store) DeleteUser(ctx context.Context, handle string) (bool, error) {
+	tag, err := s.Pool.Exec(ctx, `DELETE FROM users WHERE handle = $1`, handle)
+	if err != nil {
+		return false, fmt.Errorf("delete user %q: %w", handle, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // LookupProjectSlug returns the slug for a project id.
 func (s *Store) LookupProjectSlug(ctx context.Context, id uuid.UUID) (string, error) {
 	var s2 string
