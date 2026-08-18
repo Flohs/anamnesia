@@ -54,6 +54,20 @@ func TestScoreWithNoHitsAtAll(t *testing.T) {
 	closeTo(t, s.MRR, 0.0, "MRR")
 }
 
+func TestPrecisionIsNotPunishedForHitsThatDoNotExist(t *testing.T) {
+	// Only 3 hits came back and all 3 are relevant. Nothing irrelevant
+	// was injected, so precision is perfect regardless of how many more
+	// hits k=10 would have allowed.
+	ranked := []string{"src-a", "src-b", "src-c"}
+	s := score("q6", ranked, []string{"src-a", "src-b", "src-c"}, []int{10}, 0)
+	closeTo(t, s.PrecisionAt[10], 1.0, "precision@10")
+}
+
+func TestPrecisionWithNoHitsIsZeroNotNaN(t *testing.T) {
+	s := score("q7", nil, []string{"src-a"}, []int{5}, 0)
+	closeTo(t, s.PrecisionAt[5], 0.0, "precision@5")
+}
+
 func TestMRRUsesTheFirstRelevantRank(t *testing.T) {
 	s := score("q5", []string{"src-x", "src-y", "src-a"}, []string{"src-a"}, []int{5}, 0)
 	closeTo(t, s.MRR, 1.0/3.0, "MRR")
@@ -73,6 +87,9 @@ func TestAggregateReportsZeroHitQueriesAndPercentiles(t *testing.T) {
 		t.Errorf("ZeroHit = %d, want 1: query b found nothing relevant", agg.ZeroHit)
 	}
 	closeTo(t, agg.RecallAt[1], 2.0/3.0, "mean recall@1")
+	// a and c each retrieve their one relevant source at k=1 (precision
+	// 1.0); b retrieves s9, which isn't relevant (precision 0.0).
+	closeTo(t, agg.PrecisionAt[1], 2.0/3.0, "mean precision@1")
 	if agg.P50MS != 200 {
 		t.Errorf("P50MS = %d, want 200", agg.P50MS)
 	}

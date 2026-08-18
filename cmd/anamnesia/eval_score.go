@@ -61,8 +61,8 @@ func score(id string, ranked, relevant []string, ks []int, latencyMS int64) quer
 		if len(want) > 0 {
 			s.RecallAt[k] = float64(hits) / float64(len(want))
 		}
-		if k > 0 {
-			s.PrecisionAt[k] = float64(hits) / float64(k)
+		if n > 0 {
+			s.PrecisionAt[k] = float64(hits) / float64(n)
 		}
 	}
 	for i, src := range distinct {
