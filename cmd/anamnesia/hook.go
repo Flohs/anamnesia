@@ -396,12 +396,13 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 	}
 	sent := 0
 	var lastEnd int64
+	segStart := offset
 	for i, seg := range segs {
 		at := seg.At
 		payload := ingestPayload{
 			Kind:        kind,
 			Title:       title,
-			ExternalRef: fmt.Sprintf("%s#%d", input.SessionID, i),
+			ExternalRef: fmt.Sprintf("%s#%d", input.SessionID, segStart),
 			Content:     seg.Content,
 			User:        hc.User(),
 			Project:     hc.Project(),
@@ -410,7 +411,7 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 				"cwd":         input.CWD,
 				"stop_reason": input.StopReason,
 				"trigger":     input.Trigger,
-				"byte_range":  fmt.Sprintf("%d-%d", offset, next),
+				"byte_range":  fmt.Sprintf("%d-%d", segStart, seg.EndOffset),
 				"segment":     i,
 				"segments":    len(segs),
 			},
@@ -435,6 +436,7 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 		}
 		sent++
 		lastEnd = seg.EndOffset
+		segStart = seg.EndOffset
 	}
 	if err := writeOffset(input.SessionID, input.TranscriptPath, next); err != nil {
 		return fmt.Sprintf("ingested %d segments, offset not saved", sent), err

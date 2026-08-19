@@ -399,6 +399,31 @@ func segLines(t *testing.T, turns ...[3]string) string {
 	return path
 }
 
+// appendSegLines appends more turns to an existing transcript, the way a
+// session that keeps going after a checkpoint would.
+func appendSegLines(t *testing.T, path string, turns ...[3]string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, tr := range turns {
+		rec := map[string]any{
+			"type":      tr[1],
+			"timestamp": tr[0],
+			"message":   map[string]any{"role": tr[1], "content": tr[2]},
+		}
+		b, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write(append(b, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestSegmentsCutOnALongGap(t *testing.T) {
 	// Two exchanges 40 minutes apart. A pause is the cheapest signal we have
 	// that the subject changed.
@@ -732,5 +757,126 @@ func TestSegmentWithNoTimestampOmitsOccurredAt(t *testing.T) {
 	}
 	if _, present := (*got)[0]["occurred_at"]; present {
 		t.Errorf("occurred_at present with no source timestamp: %v", (*got)[0]["occurred_at"])
+	}
+}
+
+// TestCheckpointByteRangesAreContiguousPerSegment: byte_range is the field
+// that maps a stored memory back to a place in the transcript. Every
+// segment in a checkpoint must carry its own range, not the whole batch's,
+// or all but the last segment lie about where they came from.
+func TestCheckpointByteRangesAreContiguousPerSegment(t *testing.T) {
+	hc, got := captureIngests(t)
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+	)
+	wantSegs, next, err := readTranscriptFrom(path, 0, hc.Dur("ingest.segment_gap"), hc.Int("ingest.segment_max_bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wantSegs) != 2 {
+		t.Fatalf("test setup: got %d segments, want 2", len(wantSegs))
+	}
+
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "s6"}, "claude-session"); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if len(*got) != 2 {
+		t.Fatalf("posted %d sources, want 2", len(*got))
+	}
+
+	firstRange, _ := (*got)[0]["metadata"].(map[string]any)["byte_range"].(string)
+	secondRange, _ := (*got)[1]["metadata"].(map[string]any)["byte_range"].(string)
+	wantFirst := fmt.Sprintf("0-%d", wantSegs[0].EndOffset)
+	wantSecond := fmt.Sprintf("%d-%d", wantSegs[0].EndOffset, wantSegs[1].EndOffset)
+	if firstRange != wantFirst {
+		t.Errorf("first byte_range = %q, want %q", firstRange, wantFirst)
+	}
+	if secondRange != wantSecond {
+		t.Errorf("second byte_range = %q, want %q", secondRange, wantSecond)
+	}
+	if wantSegs[1].EndOffset != next {
+		t.Fatalf("test setup: last segment EndOffset %d != next %d", wantSegs[1].EndOffset, next)
+	}
+}
+
+// TestCheckpointExternalRefsDoNotCollideAcrossCheckpoints is the point of
+// the fix: external_ref used to be "<session>#<index within this
+// checkpoint>", so a second checkpoint of the same session reused the
+// first checkpoint's refs for entirely different content. Keying on the
+// segment's starting byte offset instead makes every ref unique across the
+// whole session, because offsets never repeat.
+func TestCheckpointExternalRefsDoNotCollideAcrossCheckpoints(t *testing.T) {
+	hc, got := captureIngests(t)
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "s7"}, "claude-session"); err != nil {
+		t.Fatalf("first checkpoint: %v", err)
+	}
+	if len(*got) != 2 {
+		t.Fatalf("posted %d sources after the first checkpoint, want 2", len(*got))
+	}
+
+	appendSegLines(t, path,
+		[3]string{"2026-03-02T10:30:00Z", "user", "a third subject, raised well after the first checkpoint"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "s7"}, "claude-session"); err != nil {
+		t.Fatalf("second checkpoint: %v", err)
+	}
+	if len(*got) != 3 {
+		t.Fatalf("posted %d sources total, want 3", len(*got))
+	}
+
+	seen := map[string]bool{}
+	for _, body := range *got {
+		ref, _ := body["external_ref"].(string)
+		if ref == "" {
+			t.Fatal("external_ref missing")
+		}
+		if seen[ref] {
+			t.Errorf("external_ref %q reused across checkpoints", ref)
+		}
+		seen[ref] = true
+	}
+}
+
+// TestCheckpointByteRangeStartsAtResumeOffsetNotZero: the first segment of
+// a checkpoint that resumes mid-transcript must report its range starting
+// where the transcript was last left off, not from byte 0.
+func TestCheckpointByteRangeStartsAtResumeOffsetNotZero(t *testing.T) {
+	hc, got := captureIngests(t)
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "s8"}, "claude-session"); err != nil {
+		t.Fatalf("first checkpoint: %v", err)
+	}
+	resumeOffset := readOffset("s8", path)
+	if resumeOffset == 0 {
+		t.Fatal("test setup: offset did not advance after the first checkpoint")
+	}
+	*got = nil // isolate the second checkpoint's payloads
+
+	appendSegLines(t, path,
+		[3]string{"2026-03-02T10:30:00Z", "user", "a third subject, raised well after the first checkpoint"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "s8"}, "claude-session"); err != nil {
+		t.Fatalf("second checkpoint: %v", err)
+	}
+	if len(*got) != 1 {
+		t.Fatalf("posted %d sources on the second checkpoint, want 1", len(*got))
+	}
+	wantPrefix := fmt.Sprintf("%d-", resumeOffset)
+	gotRange, _ := (*got)[0]["metadata"].(map[string]any)["byte_range"].(string)
+	if !strings.HasPrefix(gotRange, wantPrefix) {
+		t.Errorf("byte_range = %q, want it to start at the resume offset %d", gotRange, resumeOffset)
 	}
 }
