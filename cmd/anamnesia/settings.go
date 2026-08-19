@@ -161,6 +161,12 @@ var settings = []setting{
 	{Key: "worker.extract_commitments", Kind: kBool, Def: "false", Env: "ANAMNESIA_EXTRACT_COMMITMENTS",
 		Doc: "Also record open obligations (\"I'll send X by Friday\") in the commitments ledger."},
 
+	// ─── ingest ──────────────────────────────────────────────────────
+	{Key: "ingest.segment_gap", Kind: kDuration, Def: "20m", Env: "",
+		Doc: "A pause longer than this starts a new segment when a checkpoint is cut up, so the surprise gate judges one subject at a time rather than a whole session. Set to 0 to send each checkpoint as a single source, which is what earlier versions did."},
+	{Key: "ingest.segment_max_bytes", Kind: kInt, Def: "32768", Env: "",
+		Doc: "A segment is cut when it grows past this, because a long unbroken session is still not one idea. Set to 0 to disable the size cut."},
+
 	// ─── decay ───────────────────────────────────────────────────────
 	{Key: "decay.half_life_case", Kind: kDuration, Def: "336h", Env: "ANAMNESIA_DECAY_HALF_LIFE_CASE",
 		Doc: "How long a remembered episode takes to lose half its relevance. Two weeks by default: what you did last fortnight matters, what you did last spring usually does not. Recomputed every worker.decay_every."},

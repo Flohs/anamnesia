@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,9 +55,13 @@ func TestReadTranscriptFromIsIncremental(t *testing.T) {
 	path := filepath.Join(dir, "transcript.jsonl")
 	writeTranscript(t, path, transcriptLine(t, "user", "first question"))
 
-	text, offset, err := readTranscriptFrom(path, 0)
+	segs, offset, err := readTranscriptFrom(path, 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var text string
+	if len(segs) > 0 {
+		text = segs[0].Content
 	}
 	if !strings.Contains(text, "first question") {
 		t.Fatalf("first read missed content: %q", text)
@@ -66,9 +71,13 @@ func TestReadTranscriptFromIsIncremental(t *testing.T) {
 	}
 
 	// Nothing new: a second checkpoint must send nothing at all.
-	text, sameOffset, err := readTranscriptFrom(path, offset)
+	segs, sameOffset, err := readTranscriptFrom(path, offset, 0, 0)
 	if err != nil {
 		t.Fatal(err)
+	}
+	text = ""
+	if len(segs) > 0 {
+		text = segs[0].Content
 	}
 	if text != "" {
 		t.Errorf("re-read returned content already sent: %q", text)
@@ -79,9 +88,13 @@ func TestReadTranscriptFromIsIncremental(t *testing.T) {
 
 	// Only the new turn should come back.
 	appendTranscript(t, path, transcriptLine(t, "assistant", "second answer"))
-	text, newOffset, err := readTranscriptFrom(path, offset)
+	segs, newOffset, err := readTranscriptFrom(path, offset, 0, 0)
 	if err != nil {
 		t.Fatal(err)
+	}
+	text = ""
+	if len(segs) > 0 {
+		text = segs[0].Content
 	}
 	if strings.Contains(text, "first question") {
 		t.Errorf("already-sent content repeated: %q", text)
@@ -101,9 +114,13 @@ func TestReadTranscriptFromHandlesReplacedFile(t *testing.T) {
 	path := filepath.Join(dir, "transcript.jsonl")
 	writeTranscript(t, path, transcriptLine(t, "user", "brand new session"))
 
-	text, _, err := readTranscriptFrom(path, 10_000)
+	segs, _, err := readTranscriptFrom(path, 10_000, 0, 0)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var text string
+	if len(segs) > 0 {
+		text = segs[0].Content
 	}
 	if !strings.Contains(text, "brand new session") {
 		t.Errorf("content lost after the file shrank: %q", text)
@@ -119,9 +136,13 @@ func TestReadTranscriptFromIgnoresPartialLines(t *testing.T) {
 	complete := transcriptLine(t, "user", "complete turn")
 	writeTranscript(t, path, complete+`{"type":"assistant","message":{"role":"assi`)
 
-	text, offset, err := readTranscriptFrom(path, 0)
+	segs, offset, err := readTranscriptFrom(path, 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var text string
+	if len(segs) > 0 {
+		text = segs[0].Content
 	}
 	if !strings.Contains(text, "complete turn") {
 		t.Errorf("complete line missing: %q", text)
@@ -132,9 +153,13 @@ func TestReadTranscriptFromIgnoresPartialLines(t *testing.T) {
 
 	// Finishing the line makes it available on the next read.
 	appendTranscript(t, path, `","content":[{"type":"text","text":"finished"}]}}`+"\n")
-	text, _, err = readTranscriptFrom(path, offset)
+	segs, _, err = readTranscriptFrom(path, offset, 0, 0)
 	if err != nil {
 		t.Fatal(err)
+	}
+	text = ""
+	if len(segs) > 0 {
+		text = segs[0].Content
 	}
 	if !strings.Contains(text, "finished") {
 		t.Errorf("completed line not picked up: %q", text)
@@ -165,9 +190,13 @@ func TestReadTranscriptFromSkipsToolNoise(t *testing.T) {
 			`{"type":"system","subtype":"hook"}`+"\n"+
 			transcriptLine(t, "assistant", "done, it worked"))
 
-	text, _, err := readTranscriptFrom(path, 0)
+	segs, _, err := readTranscriptFrom(path, 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var text string
+	if len(segs) > 0 {
+		text = segs[0].Content
 	}
 	if strings.Contains(text, "tool_use") || strings.Contains(text, "ls") {
 		t.Errorf("tool traffic leaked into the ingest: %q", text)
@@ -339,5 +368,169 @@ func TestDoctorIgnoresHookFailuresFromBeforeTheServerStarted(t *testing.T) {
 	writePIDForTest(t, failedAt.Add(-time.Minute))
 	if got := checkHookActivity(); got.Status != statusFail {
 		t.Errorf("an unresolved hook failure was not reported: %+v", got)
+	}
+}
+
+// segLines builds a transcript JSONL from (minutesFromStart, role, text).
+func segLines(t *testing.T, turns ...[3]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	var sb strings.Builder
+	for _, tr := range turns {
+		rec := map[string]any{
+			"type":      tr[1],
+			"timestamp": tr[0],
+			"message":   map[string]any{"role": tr[1], "content": tr[2]},
+		}
+		b, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sb.Write(b)
+		sb.WriteString("\n")
+	}
+	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestSegmentsCutOnALongGap(t *testing.T) {
+	// Two exchanges 40 minutes apart. A pause is the cheapest signal we have
+	// that the subject changed.
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "why are the stock counts off"},
+		[3]string{"2026-03-02T09:01:00Z", "assistant", "the Rotterdam site writes local time"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "unrelated: the invoice PDF job runs out of memory"},
+		[3]string{"2026-03-02T09:42:00Z", "assistant", "stream it page by page"},
+	)
+	segs, _, err := readTranscriptFrom(path, 0, 20*time.Minute, 32768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) != 2 {
+		t.Fatalf("segments = %d, want 2 across a 40 minute gap:\n%#v", len(segs), segs)
+	}
+	if !strings.Contains(segs[0].Content, "Rotterdam") || strings.Contains(segs[0].Content, "invoice") {
+		t.Errorf("first segment has the wrong turns:\n%s", segs[0].Content)
+	}
+	if !strings.Contains(segs[1].Content, "invoice") {
+		t.Errorf("second segment has the wrong turns:\n%s", segs[1].Content)
+	}
+}
+
+func TestSegmentsDoNotCutOnAShortGap(t *testing.T) {
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "why are the stock counts off by a day"},
+		[3]string{"2026-03-02T09:05:00Z", "assistant", "the Rotterdam site writes local time, everything else UTC"},
+	)
+	segs, _, err := readTranscriptFrom(path, 0, 20*time.Minute, 32768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) != 1 {
+		t.Errorf("segments = %d, want 1 for a five minute pause", len(segs))
+	}
+}
+
+func TestSegmentsCutOnSize(t *testing.T) {
+	// A four hour debugging session has no gaps and still is not one idea.
+	long := strings.Repeat("we traced the discrepancy through the reconciliation job. ", 20)
+	var turns [][3]string
+	for i := 0; i < 8; i++ {
+		turns = append(turns, [3]string{
+			fmt.Sprintf("2026-03-02T09:%02d:00Z", i), "user", long,
+		})
+	}
+	path := segLines(t, turns...)
+	segs, _, err := readTranscriptFrom(path, 0, 20*time.Minute, 2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) < 2 {
+		t.Fatalf("segments = %d, want several under a 2000 byte ceiling", len(segs))
+	}
+	for i, s := range segs {
+		if strings.Count(s.Content, "user:") == 0 {
+			t.Errorf("segment %d has no whole turn in it:\n%s", i, s.Content)
+		}
+	}
+}
+
+func TestSegmentCarriesItsFirstTurnsTime(t *testing.T) {
+	// An experience about an afternoon's work did not happen at the moment
+	// the session closed, and decay reads occurred_at.
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "first thing we looked at this morning, in some detail"},
+		[3]string{"2026-03-02T09:02:00Z", "assistant", "and the answer we reached about it, also in detail"},
+		[3]string{"2026-03-02T14:00:00Z", "user", "a completely separate thing in the afternoon, at length"},
+	)
+	segs, _, err := readTranscriptFrom(path, 0, 20*time.Minute, 32768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) != 2 {
+		t.Fatalf("segments = %d, want 2", len(segs))
+	}
+	if got, want := segs[0].At.UTC().Format(time.RFC3339), "2026-03-02T09:00:00Z"; got != want {
+		t.Errorf("first segment At = %s, want its first turn %s", got, want)
+	}
+	if got, want := segs[1].At.UTC().Format(time.RFC3339), "2026-03-02T14:00:00Z"; got != want {
+		t.Errorf("second segment At = %s, want its first turn %s", got, want)
+	}
+}
+
+func TestRecordsWithoutATimestampInheritTheLastOne(t *testing.T) {
+	// Summaries and meta records carry no timestamp. They must not look like
+	// a jump back to the zero time and cut the transcript at every one.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.jsonl")
+	body := `{"type":"user","timestamp":"2026-03-02T09:00:00Z","message":{"role":"user","content":"a question about the reconciliation job we ran"}}
+{"type":"assistant","message":{"role":"assistant","content":"an answer with no timestamp on its record at all"}}
+{"type":"user","timestamp":"2026-03-02T09:01:00Z","message":{"role":"user","content":"a follow up question one minute later"}}
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	segs, _, err := readTranscriptFrom(path, 0, 20*time.Minute, 32768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) != 1 {
+		t.Errorf("segments = %d, want 1: a missing timestamp must not force a cut", len(segs))
+	}
+}
+
+func TestBothSettingsZeroRestoresASingleSegment(t *testing.T) {
+	// The reversibility guarantee. An install that sets both to 0 gets exactly
+	// today's behaviour, without a downgrade.
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "one thing we discussed at some length this morning"},
+		[3]string{"2026-03-02T18:00:00Z", "user", "a completely different thing nine hours later, also at length"},
+	)
+	segs, _, err := readTranscriptFrom(path, 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) != 1 {
+		t.Errorf("segments = %d, want exactly 1 with both settings disabled", len(segs))
+	}
+}
+
+func TestAShortTrailingSegmentMergesBackwards(t *testing.T) {
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", strings.Repeat("a substantial first exchange. ", 20)},
+		[3]string{"2026-03-02T10:00:00Z", "user", "ok"},
+	)
+	segs, _, err := readTranscriptFrom(path, 0, 20*time.Minute, 32768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) != 1 {
+		t.Fatalf("segments = %d, want 1: a two word coda is not its own source", len(segs))
+	}
+	if !strings.Contains(segs[0].Content, "ok") {
+		t.Errorf("the short tail was dropped instead of merged:\n%s", segs[0].Content)
 	}
 }
