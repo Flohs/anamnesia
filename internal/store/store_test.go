@@ -91,7 +91,11 @@ func TestDeleteUserIsBlockedByACommitment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	// Registered before the row cleanup below so that LIFO order closes the
+	// pool last. `defer st.Close()` would run at function exit, which is
+	// BEFORE any t.Cleanup, leaving every cleanup to fail silently against
+	// a closed pool and leak its fixtures.
+	t.Cleanup(st.Close)
 
 	uid, err := st.EnsureUser(ctx, "eval-commitment-block-test")
 	if err != nil {
