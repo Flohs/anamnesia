@@ -267,3 +267,21 @@ func TestCorpusShortfallCounts(t *testing.T) {
 		t.Error("an empty corpusStats must report zeroes, not panic")
 	}
 }
+
+func TestRegressionToleranceExceedsMeasuredRunToRunNoise(t *testing.T) {
+	// Six back-to-back runs over the identical corpus and code, 2026-08-19,
+	// gpt-4o-mini + text-embedding-3-small, recall@5:
+	//   0.860 0.880 0.900 0.920 0.880 0.900   sd 0.0210, spread 0.060
+	// Extraction is a model call per source, so each run builds a slightly
+	// different corpus; the gate has to clear that noise or it fires on runs
+	// where nothing changed.
+	const measuredSD = 0.0210
+	if regressionTolerance < 2*measuredSD {
+		t.Errorf("tolerance %.3f is within 2 sd of measured noise (%.4f): the gate would fire on runs where nothing changed",
+			regressionTolerance, measuredSD)
+	}
+	// And not so loose it stops catching anything worth catching.
+	if regressionTolerance > 0.10 {
+		t.Errorf("tolerance %.3f is loose enough to miss a real regression", regressionTolerance)
+	}
+}
