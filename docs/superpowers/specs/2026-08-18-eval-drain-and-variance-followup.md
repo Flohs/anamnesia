@@ -1,5 +1,9 @@
 # Follow-up: make the eval's numbers trustworthy
 
+> **Done 2026-08-19.** All five items landed. What the measurement actually
+> showed is recorded at the end, including the two places this document's own
+> reasoning turned out to be wrong.
+
 Written 2026-08-18 against `feat/retrieval-eval`, from that branch's final
 whole-branch review. **Not started.** This is the first work after the eval
 merges.
@@ -106,3 +110,50 @@ The schema itself. `commitments.user_id` is the only `users(id)` foreign key
 without `ON DELETE CASCADE`, and `audit_log.user_id` has no foreign key at all.
 That is a latent bug for **any** caller deleting a user, not just the eval, and
 it deserves its own decision rather than being fixed as a side effect of this.
+
+---
+
+## Outcome, 2026-08-19
+
+**Items 1-5 are all done.** Six back-to-back runs over the identical corpus and
+code, with the source-state breakdown that item 1 added:
+
+```
+run   recall@5     MRR  zero  done  facts  exps
+A        0.860   0.846     1    40     21    31
+B        0.880   0.840     2    39     11    32
+3        0.900   0.829     1    38     15    32
+4        0.920   0.846     1    40     21    33
+5        0.880   0.873     2    40     20    33
+6        0.900   0.840     1    40     21    37
+```
+
+**The hypothesis was right.** Extraction is where the corpus differs: the fact
+count ranged 11 to 21 from identical input, and the surprise gate skipped a
+different number of sources each time. Neither the reranker nor ANN drift could
+produce that, which is what made item 1 the discriminating measurement.
+
+**The severity was wrong.** This document was written off two samples showing an
+0.18 spread on recall@5. Six samples give a spread of 0.060 and a standard
+deviation of 0.021. The 0.700 reading that prompted all of this sits well
+outside the range of the six and looks like a genuine outlier rather than the
+norm. `regressionTolerance` is 0.05 now — a little over two standard deviations,
+measured rather than guessed, with a test that fails if the constant and the
+measurement drift apart.
+
+**And the interesting finding was not one this document anticipated.** The run
+with 11 facts — nearly half the usual corpus of facts missing — scored recall@5
+of 0.880, squarely mid-pack. Fact count does not predict recall here at all,
+while experiences stayed far steadier at 31 to 37. On this corpus retrieval is
+carried by experiences and is close to indifferent to which facts extraction
+happened to produce.
+
+Hold that loosely: it is one corpus, and one whose queries may lean
+experience-shaped by construction. But it is now a hypothesis the eval can test,
+and it bears on segmented ingest — whose value may lie more in producing more
+experiences from a long session than more facts.
+
+**Still open:** "ingest once, query many" was this document's proposed design
+change if extraction was confirmed. It is confirmed, but the measured noise no
+longer justifies that scale of change on its own. Worth revisiting only if a
+tighter gate is wanted than 0.05.
