@@ -117,6 +117,45 @@ were rebuilt around being verifiable.
 
 ### Added
 
+- **A session checkpoint is cut into segments instead of sent as one blob.** The
+  extractor gets one LLM call per source with a fixed budget of eight
+  operations, so a long session spent that budget on whatever it had said most
+  often and never reached anything else. Measured on a 32.5 KB transcript of 25
+  subjects — 20 restating already-known facts, 5 genuinely novel — ingested both
+  ways against the same primed store:
+
+  ```
+  whole      1 source,  7 operations — all 7 re-derive the known topics
+                                       0 of 5 novel subjects survived
+  segmented 25 sources, 55 operations — 5 of 5 novel subjects survived
+  ```
+
+  The hook now cuts a checkpoint where the user paused for longer than
+  `ingest.segment_gap` (default 20m) or where a segment grows past
+  `ingest.segment_max_bytes` (default 32768), never inside a turn, and posts
+  each piece as its own source. Each one gets its own gate verdict and its own
+  operation budget. Set either setting to `0` to send checkpoints whole again,
+  which is exactly what earlier versions did.
+
+  Each segment also carries the timestamp of its first turn rather than the
+  moment the session closed. That matters beyond bookkeeping: decay reads
+  `occurred_at`, so a morning's work used to start ageing from the moment you
+  shut your laptop.
+
+  A checkpoint that fails partway now advances its offset to the last segment
+  that landed, rather than leaving it untouched. Leaving it meant the next
+  checkpoint re-read the same range plus whatever had accrued since, so the
+  range grew, the deadline arrived sooner, and memory silently stopped for that
+  session. Re-sending a segment is cheap; skipping one is not.
+
+  **The cost, stated plainly:** segmenting means each piece is judged
+  independently, so near-duplicates get through where one blob was judged once.
+  In the measurement above, 19 of 20 restatement segments produced their own
+  near-duplicate rows — 33 facts and 10 experiences for what is substantively 8
+  pieces of information. Consolidation and decay exist to compress that, and
+  nothing recovers content that was never extracted, so the trade is worth it —
+  but a fact count that climbs faster than before is expected, not a bug.
+
 - **`anamnesia eval` measures retrieval instead of arguing about it.** Every
   retrieval decision in the tree — RRF over score normalisation, the fusion
   constant, the candidate widths, reranking the top 4×K — rested on reasoning
