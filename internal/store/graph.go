@@ -70,6 +70,35 @@ func (s *Store) LookupEntity(ctx context.Context, scope anamnesia.Scope, kind, n
 	return scanEntity(row)
 }
 
+// LookupEntitiesByName finds every entity in scope with the given
+// (already normalised) name, across all kinds. Unlike LookupEntity this
+// takes no kind, because a bare edge endpoint name doesn't carry one —
+// the caller decides what to do when more than one entity matches: an
+// edge endpoint is ambiguous, not resolvable to either.
+func (s *Store) LookupEntitiesByName(ctx context.Context, scope anamnesia.Scope, name string) ([]*anamnesia.Entity, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id, user_id, project_id, kind, name, props, created_at
+		FROM entities
+		WHERE user_id = $1
+		  AND coalesce(project_id, '00000000-0000-0000-0000-000000000000'::uuid)
+		      = coalesce($2, '00000000-0000-0000-0000-000000000000'::uuid)
+		  AND name = $3`,
+		scope.UserID, scope.ProjectID, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*anamnesia.Entity
+	for rows.Next() {
+		ent, err := scanEntity(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ent)
+	}
+	return out, rows.Err()
+}
+
 // ListEntities returns recent entities in scope.
 func (s *Store) ListEntities(ctx context.Context, scope anamnesia.Scope, kind string, limit int) ([]*anamnesia.Entity, error) {
 	if limit <= 0 {

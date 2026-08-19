@@ -173,7 +173,6 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 	// Upsert every ADD_ENTITY op, normalised, collecting ids by name.
 	known := make(map[string]uuid.UUID)
 	upserted := make([]*anamnesia.Entity, 0, len(ops))
-	kindsSeen := make(map[string]bool)
 	failures := make([]string, 0)
 	for _, op := range ops {
 		if strings.ToUpper(strings.TrimSpace(op.Op)) != "ADD_ENTITY" {
@@ -194,35 +193,49 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 		}
 		known[name] = ent.ID
 		upserted = append(upserted, ent)
-		kindsSeen[op.Kind] = true
 	}
 
 	// Resolve edge endpoints not created this pass against entities from
-	// an earlier checkpoint. LookupEntity needs a kind, which a bare
-	// edge endpoint name does not carry, so the kinds this pass itself
-	// declared via ADD_ENTITY are the candidate vocabulary tried.
+	// an earlier checkpoint, by name alone — a bare edge endpoint carries
+	// no kind, so LookupEntity (which needs one) cannot be used here.
+	// Resolve only when the name is unambiguous: two entities sharing a
+	// name under different kinds means the edge is dropped, not guessed.
+	// A wrong edge would be believed; a missing one is merely invisible.
+	var ambiguous []string
+	queried := make(map[string]bool)
 	for _, op := range ops {
 		if strings.ToUpper(strings.TrimSpace(op.Op)) != "ADD_EDGE" {
 			continue
 		}
 		for _, raw := range []string{op.From, op.To} {
 			name := normaliseEntityName(raw)
-			if name == "" {
+			if name == "" || queried[name] {
 				continue
 			}
 			if _, ok := known[name]; ok {
 				continue
 			}
-			for kind := range kindsSeen {
-				if ent, err := e.Store.LookupEntity(ctx, src.Scope, kind, name); err == nil {
-					known[name] = ent.ID
-					break
+			queried[name] = true
+			matches, err := e.Store.LookupEntitiesByName(ctx, src.Scope, name)
+			if err != nil {
+				if e.Log != nil {
+					e.Log.Warn("extractor: lookup entity by name failed", "err", err)
 				}
+				continue
+			}
+			switch len(matches) {
+			case 0:
+				// Left unresolved: resolveEdges reports it below.
+			case 1:
+				known[name] = matches[0].ID
+			default:
+				ambiguous = append(ambiguous, fmt.Sprintf("entity %q is ambiguous: %d entities share that name across kinds", name, len(matches)))
 			}
 		}
 	}
 
 	resolved, dropped := resolveEdges(ops, known)
+	dropped = append(dropped, ambiguous...)
 
 	edgesCreated, edgesSuperseded := 0, 0
 	for _, edge := range resolved {

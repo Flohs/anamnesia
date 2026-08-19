@@ -15,9 +15,13 @@ import (
 	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
-// fakeLLM returns whatever the test pre-loads into Ops.
+// fakeLLM returns whatever the test pre-loads into Ops. RawOps, when
+// set, is used verbatim instead of marshaling Ops — Operation has no
+// name/from/to/props fields, so a test that needs a graph op shape
+// (ADD_ENTITY/ADD_EDGE) builds its own JSON and sets this instead.
 type fakeLLM struct {
 	Ops    []Operation
+	RawOps []json.RawMessage
 	Calls  int
 	Prompt string
 	System string
@@ -40,13 +44,16 @@ func (f *fakeLLM) Extract(_ context.Context, in llm.DistillInput, out any) error
 	f.Prompt = in.User
 	f.System = in.System
 	f.Schema = in.Schema
-	rawOps := make([]json.RawMessage, len(f.Ops))
-	for i, op := range f.Ops {
-		b, err := json.Marshal(op)
-		if err != nil {
-			return err
+	rawOps := f.RawOps
+	if rawOps == nil {
+		rawOps = make([]json.RawMessage, len(f.Ops))
+		for i, op := range f.Ops {
+			b, err := json.Marshal(op)
+			if err != nil {
+				return err
+			}
+			rawOps[i] = b
 		}
-		rawOps[i] = b
 	}
 	raw, _ := json.Marshal(opsResponse{Operations: rawOps})
 	return json.Unmarshal(raw, out)

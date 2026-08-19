@@ -95,6 +95,53 @@ func TestSourcesForEntitiesRoundTrips(t *testing.T) {
 	}
 }
 
+func TestLookupEntitiesByName(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	uid, err := st.EnsureUser(ctx, "graph-lookup-by-name-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), "graph-lookup-by-name-test") })
+	scope := anamnesia.Scope{UserID: uid}
+
+	site := &anamnesia.Entity{Scope: scope, Kind: "site", Name: "rotterdam"}
+	if err := st.UpsertEntity(ctx, site); err != nil {
+		t.Fatal(err)
+	}
+
+	// One match: the name resolves unambiguously.
+	matches, err := st.LookupEntitiesByName(ctx, scope, "rotterdam")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 || matches[0].ID != site.ID {
+		t.Errorf("LookupEntitiesByName = %v, want exactly the one site entity", matches)
+	}
+
+	// A second entity with the same name under a different kind makes
+	// the name ambiguous: both are reported, neither is picked for you.
+	person := &anamnesia.Entity{Scope: scope, Kind: "person", Name: "rotterdam"}
+	if err := st.UpsertEntity(ctx, person); err != nil {
+		t.Fatal(err)
+	}
+	matches, err = st.LookupEntitiesByName(ctx, scope, "rotterdam")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 2 {
+		t.Errorf("LookupEntitiesByName returned %d matches for an ambiguous name, want 2", len(matches))
+	}
+}
+
 func TestMentionsVanishWithTheirEntity(t *testing.T) {
 	// ON DELETE CASCADE, so a purged entity cannot leave dangling rows.
 	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
