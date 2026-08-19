@@ -66,6 +66,24 @@ const (
 )
 
 // inspectContainer reports whether the container exists and is running.
+// containerOwner reports the ANAMNESIA_HOME recorded on a container when it
+// was created. Empty means the container predates ownership labels.
+func containerOwner(ctx context.Context, name string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, dockerBin, "inspect", "--format",
+		"{{index .Config.Labels \""+containerOwnerLabel+"\"}}", name).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("docker inspect %s: %s", name, strings.TrimSpace(string(out)))
+	}
+	owner := strings.TrimSpace(string(out))
+	// A missing label prints as "<no value>" with this format.
+	if owner == "<no value>" {
+		return "", nil
+	}
+	return owner, nil
+}
+
 func inspectContainer(ctx context.Context, name string) (containerState, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -100,6 +118,24 @@ func ensurePostgres(ctx context.Context, hc *hostConfig, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	ourHome, err := anamnesiaHome()
+	if err != nil {
+		return err
+	}
+	// An existing container may belong to another install. Decide before
+	// touching it: the password reconcile below repairs a drifted config by
+	// rewriting the role password, which against someone else's database
+	// locks them out of their own memory.
+	decision := containerDecision{mayUse: true, mayResetPassword: true}
+	if state != stateMissing {
+		owner, err := containerOwner(ctx, name)
+		if err != nil {
+			return err
+		}
+		if decision, err = decideContainer(owner, ourHome, adoptContainer); err != nil {
+			return err
+		}
+	}
 	switch state {
 	case stateRunning:
 		// Still wait for readiness: "running" only means the process
@@ -117,7 +153,7 @@ func ensurePostgres(ctx context.Context, hc *hostConfig, out io.Writer) error {
 	if err := waitPostgresReady(ctx, hc, out); err != nil {
 		return err
 	}
-	return reconcilePostgresPassword(ctx, hc, out)
+	return reconcilePostgresPassword(ctx, hc, out, decision)
 }
 
 // reconcilePostgresPassword makes the running database accept the password in
@@ -133,13 +169,17 @@ func ensurePostgres(ctx context.Context, hc *hostConfig, out io.Writer) error {
 //
 // initdb trusts connections over the local unix socket, so the password can be
 // set from inside the container without knowing the old one.
-func reconcilePostgresPassword(ctx context.Context, hc *hostConfig, out io.Writer) error {
+func reconcilePostgresPassword(ctx context.Context, hc *hostConfig, out io.Writer, decision containerDecision) error {
 	// Give a just-started server a moment before concluding anything. An
 	// authenticated connection can still be refused for a beat after the port
 	// opens, and treating that as a wrong password would rewrite the password
 	// on every first run and say so, which is both needless and misleading.
 	if waitPasswordWorks(ctx, hc, 15*time.Second) {
 		return nil
+	}
+	if !decision.mayResetPassword {
+		home, _ := anamnesiaHome()
+		return passwordResetRefused(hc.Get("postgres.container"), home)
 	}
 	fmt.Fprintln(out, "  the stored database password differs from your config; updating it")
 	if err := setPostgresPassword(ctx, hc); err != nil {
@@ -259,6 +299,10 @@ func createPostgres(ctx context.Context, hc *hostConfig, out io.Writer) error {
 		fmt.Fprintf(out, "  could not pull %s, trying the local copy\n", image)
 	}
 
+	ownerHome, err := anamnesiaHome()
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(out, "  creating container %s on 127.0.0.1:%d\n", name, port)
 	args := []string{
 		"run", "--detach",
@@ -270,6 +314,10 @@ func createPostgres(ctx context.Context, hc *hostConfig, out io.Writer) error {
 		"--env", "POSTGRES_PASSWORD=" + hc.Get("postgres.password"),
 		"--env", "POSTGRES_DB=" + hc.Get("postgres.database"),
 		"--label", "anamnesia=postgres",
+		// Records which install owns this container, so a second
+		// ANAMNESIA_HOME that resolves to the same name is refused rather
+		// than silently sharing the database and rewriting its password.
+		"--label", containerOwnerLabel + "=" + ownerHome,
 		image,
 	}
 	if o, err := exec.CommandContext(ctx, dockerBin, args...).CombinedOutput(); err != nil {

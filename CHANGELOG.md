@@ -7,6 +7,24 @@ were rebuilt around being verifiable.
 
 ### Fixed
 
+- **One install could take over another's database and lock it out.** The
+  Postgres container's name, volume and port all live inside a config file, and
+  which config file is used depends on `ANAMNESIA_HOME`. So a second install
+  left on the defaults resolved to the same container as the first and simply
+  adopted it. Adopting was survivable; the next step was not. The password
+  reconcile exists to repair a config whose password has drifted from its own
+  container, and it repairs it by rewriting the role password — against another
+  install's database, that silently locks the owner out of their own memory.
+
+  Containers now record the install that created them, in an `anamnesia.home`
+  label. A container labelled for a different home is refused outright, naming
+  both homes so the reader can tell which config is wrong. A container with no
+  label — every container created before this — stays usable, because refusing
+  those would break working installs, but its password will not be rewritten
+  without `--adopt`. `--adopt` covers exactly that case and cannot override a
+  label naming someone else, because a flag that seizes a container in active
+  use is the same failure wearing a different hat.
+
 - **A fresh install could not store a single memory.** The migration chain
   ended at `vector(2048)` while the default embedding width was 1536, so
   every embedding write failed with `expected 2048 dimensions, not 1536`.

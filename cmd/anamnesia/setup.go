@@ -42,6 +42,8 @@ func init() {
 	setupCmd.Flags().BoolVar(&setupNoStart, "no-start", false, "skip starting the stack")
 	setupCmd.Flags().StringVar(&setupScope, "scope", "user", "hook scope: user (~/.claude) or project ($PWD/.claude)")
 	setupCmd.Flags().StringVar(&setupConfigDir, "config-dir", "", "override the config directory (testing escape hatch)")
+	setupCmd.Flags().BoolVar(&adoptContainer, "adopt", false,
+		"claim a postgres container created before installs recorded ownership")
 }
 
 func runSetup(cmd *cobra.Command, _ []string) error {
