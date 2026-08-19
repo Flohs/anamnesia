@@ -290,3 +290,69 @@ func (s *Store) Neighbors(ctx context.Context, src uuid.UUID, kinds []string, di
 	}
 	return ents, edges, rows.Err()
 }
+
+// ─── entity_mentions ─────────────────────────────────────────────────
+
+// RecordMention notes that a source mentioned an entity. Idempotent: a
+// re-extraction of the same source must not error.
+func (s *Store) RecordMention(ctx context.Context, entityID, sourceID uuid.UUID) error {
+	_, err := s.Pool.Exec(ctx, `
+		INSERT INTO entity_mentions (entity_id, source_id)
+		VALUES ($1, $2)
+		ON CONFLICT (entity_id, source_id) DO NOTHING`, entityID, sourceID)
+	if err != nil {
+		return fmt.Errorf("record mention: %w", err)
+	}
+	return nil
+}
+
+// EntitiesForSources returns the entities those sources mentioned. This is
+// the outward half of the bridge: a search hit knows its source, and this
+// turns that into somewhere to start walking.
+func (s *Store) EntitiesForSources(ctx context.Context, sourceIDs []uuid.UUID) ([]*anamnesia.Entity, error) {
+	if len(sourceIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT DISTINCT e.id, e.user_id, e.project_id, e.kind, e.name, e.props, e.created_at
+		  FROM entities e
+		  JOIN entity_mentions m ON m.entity_id = e.id
+		 WHERE m.source_id = ANY($1)`, sourceIDs)
+	if err != nil {
+		return nil, fmt.Errorf("entities for sources: %w", err)
+	}
+	defer rows.Close()
+	var out []*anamnesia.Entity
+	for rows.Next() {
+		ent, err := scanEntity(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ent)
+	}
+	return out, rows.Err()
+}
+
+// SourcesForEntities returns the sources that mentioned those entities. The
+// inward half: having walked to a neighbour, this is how its memory rows are
+// reached, since facts and experiences carry source_id.
+func (s *Store) SourcesForEntities(ctx context.Context, entityIDs []uuid.UUID) ([]uuid.UUID, error) {
+	if len(entityIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT DISTINCT source_id FROM entity_mentions WHERE entity_id = ANY($1)`, entityIDs)
+	if err != nil {
+		return nil, fmt.Errorf("sources for entities: %w", err)
+	}
+	defer rows.Close()
+	var out []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
