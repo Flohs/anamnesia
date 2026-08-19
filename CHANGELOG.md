@@ -134,14 +134,23 @@ were rebuilt around being verifiable.
   injected into an agent's context, and dividing by k scores "returned three
   hits, all relevant" the same as "returned ten, three relevant".
 
-  **`--baseline` is not yet trustworthy, and should not be used as a gate.**
-  Two runs over the identical corpus and the same code returned recall@5 of
-  0.700 and 0.880, against a regression tolerance of 0.02. Extraction is a model
-  call per source, so each run builds a different corpus from the same input;
-  that variance has not yet been isolated from the reranker or from the fact
-  that a different corpus produces a different ANN index. The recorded rc7
-  baseline is a record of one run, not a threshold. Comparing two runs by hand
-  works; automating a pass/fail on it does not.
+  The report says what the corpus actually became, not just that the queue
+  drained. Sources that the surprise gate skips or that fail extraction leave
+  the pending queue exactly as extracted ones do, so a run could be scored
+  against a smaller corpus than it ingested with nothing on screen saying so.
+  The source-state breakdown and row totals are now printed, with a warning
+  when any source produced nothing.
+
+  **`--baseline`'s tolerance is measured rather than guessed.** Six
+  back-to-back runs over the identical corpus gave recall@5 of 0.860 to 0.920 —
+  a standard deviation of 0.021 — because extraction is a model call per source
+  and every run builds a slightly different corpus from the same input. The
+  tolerance is 0.05, a little over two standard deviations, and a test fails if
+  the constant and the measurement ever drift apart. A regression smaller than
+  that cannot be established from a single run against a single baseline; it
+  needs several runs on each side. A baseline that decodes without any metrics —
+  one written by an older version — is refused rather than compared as though
+  every metric were a genuine zero.
 
 - **The server can now say what it is doing, and why.** It kept no record of
   its own reasoning: which loop ran last, what the extractor decided about a
