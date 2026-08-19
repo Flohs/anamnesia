@@ -74,6 +74,12 @@ type Config struct {
 	// ExtractCommitments lets the extractor emit ADD_COMMITMENT ops.
 	ExtractCommitments bool // ANAMNESIA_EXTRACT_COMMITMENTS (default false)
 
+	// ExtractGraph lets the extractor run the graph pass (ADD_ENTITY /
+	// ADD_EDGE) on a claude-session-graph source. GraphMaxOps caps how
+	// many entities and edges one checkpoint may produce.
+	ExtractGraph bool // ANAMNESIA_GRAPH_EXTRACT (default false)
+	GraphMaxOps  int  // ANAMNESIA_GRAPH_MAX_OPS (default 12)
+
 	// Decay half-lives per experience kind. Relevance falls by half over
 	// this long since a memory was last used, per kind, which is what
 	// makes an episode fade while an approach does not.
@@ -191,6 +197,9 @@ func Load() (*Config, error) {
 		EmbedBackfill:    dur("ANAMNESIA_EMBED_BACKFILL", time.Minute),
 
 		ExtractCommitments: boolean("ANAMNESIA_EXTRACT_COMMITMENTS", false),
+
+		ExtractGraph: boolean("ANAMNESIA_GRAPH_EXTRACT", false),
+		GraphMaxOps:  num("ANAMNESIA_GRAPH_MAX_OPS", 12),
 
 		DecayHalfLifeCase:     dur("ANAMNESIA_DECAY_HALF_LIFE_CASE", 336*time.Hour),
 		DecayHalfLifeStrategy: dur("ANAMNESIA_DECAY_HALF_LIFE_STRATEGY", 8760*time.Hour),

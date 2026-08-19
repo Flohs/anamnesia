@@ -60,6 +60,14 @@ type Config struct {
 	// for the existing ops are byte-identical when the feature is
 	// disabled — benchmark runs are not perturbed.
 	ExtractCommitments bool
+	// ExtractGraph, when true, runs the graph pass (ADD_ENTITY /
+	// ADD_EDGE) on a claude-session-graph source instead of the
+	// fact/experience pass. Off by default: it costs one extra model
+	// call per checkpoint.
+	ExtractGraph bool
+	// GraphMaxOps caps how many entities and edges one graph pass may
+	// produce. Default 12.
+	GraphMaxOps int
 }
 
 // Extractor runs the pipeline against an open-source memory store.
@@ -88,6 +96,9 @@ func (c Config) applyDefaults() Config {
 	}
 	if c.MinContentLen == 0 {
 		c.MinContentLen = 16
+	}
+	if c.GraphMaxOps == 0 {
+		c.GraphMaxOps = 12
 	}
 	return c
 }
@@ -185,6 +196,18 @@ func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (int, error)
 	if len(content) < cfg.MinContentLen {
 		tr.End("skipped", fmt.Sprintf("Nothing to extract from %d characters", len(content)))
 		return 0, nil
+	}
+
+	// A graph source carries the whole checkpoint's text, posted once
+	// per checkpoint rather than once per segment (see graph.go). It is
+	// a different job on the same queue: no surprise gate, no candidate
+	// fetch, no fact/experience pass.
+	if src.Kind == graphSourceKind {
+		if !cfg.ExtractGraph {
+			tr.End("skipped", "Graph extraction is off")
+			return 0, nil
+		}
+		return e.runGraph(ctx, src, tr)
 	}
 
 	// Step 1: surprise gate. The gate is intentionally cheap — one

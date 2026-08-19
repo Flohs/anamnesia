@@ -184,6 +184,12 @@ var settings = []setting{
 		Doc: "Record what the server is doing, in memory, and serve it on /v1/activity. Off makes those routes 404 and every recording call a no-op."},
 	{Key: "activity.traces", Kind: kInt, Def: "200", Env: "ANAMNESIA_ACTIVITY_TRACES",
 		Doc: "How many recent traces to keep. They live in memory only, so a restart clears them. Use activity.enabled to switch recording off; this is a size, and sizes are positive."},
+
+	// ─── graph ───────────────────────────────────────────────────────
+	{Key: "graph.extract", Kind: kBool, Def: "false", Env: "ANAMNESIA_GRAPH_EXTRACT",
+		Doc: "Extract entities and relationships from a session, in one extra model call per checkpoint. Off by default: it costs a call, and an install that never reads the graph should not pay for it."},
+	{Key: "graph.max_ops", Kind: kInt, Def: "12", Env: "ANAMNESIA_GRAPH_MAX_OPS",
+		Doc: "Caps how many entities and edges one checkpoint may produce."},
 }
 
 // settingByKey indexes settings for lookup.
