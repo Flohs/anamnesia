@@ -13,422 +13,422 @@
     "experiences": 33
   },
   "aggregate": {
-    "Queries": 25,
-    "RecallAt": {
+    "queries": 25,
+    "recall_at": {
       "1": 0.72,
       "10": 0.88,
       "5": 0.88
     },
-    "PrecisionAt": {
+    "precision_at": {
       "1": 0.84,
       "10": 0.11955555555555558,
       "5": 0.21600000000000008
     },
-    "MRR": 0.8733333333333334,
-    "ZeroHit": 2,
-    "P50MS": 1256,
-    "P95MS": 1491
+    "mrr": 0.8733333333333334,
+    "zero_hit": 2,
+    "p50_ms": 1256,
+    "p95_ms": 1491
   },
   "per_query": [
     {
-      "ID": "q-001",
-      "RecallAt": {
+      "id": "q-001",
+      "recall_at": {
         "1": 0.5,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.2222222222222222,
         "5": 0.4
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1256
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1256
     },
     {
-      "ID": "q-002",
-      "RecallAt": {
+      "id": "q-002",
+      "recall_at": {
         "1": 0.5,
         "10": 0.5,
         "5": 0.5
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1153
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1153
     },
     {
-      "ID": "q-003",
-      "RecallAt": {
+      "id": "q-003",
+      "recall_at": {
         "1": 0,
         "10": 0,
         "5": 0
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 0,
         "10": 0,
         "5": 0
       },
-      "MRR": 0,
-      "Found": false,
-      "LatencyMS": 1203
+      "mrr": 0,
+      "found": false,
+      "latency_ms": 1203
     },
     {
-      "ID": "q-004",
-      "RecallAt": {
+      "id": "q-004",
+      "recall_at": {
         "1": 0.5,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.2,
         "5": 0.4
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1218
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1218
     },
     {
-      "ID": "q-005",
-      "RecallAt": {
+      "id": "q-005",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1177
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1177
     },
     {
-      "ID": "q-006",
-      "RecallAt": {
+      "id": "q-006",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1191
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1191
     },
     {
-      "ID": "q-007",
-      "RecallAt": {
+      "id": "q-007",
+      "recall_at": {
         "1": 0.5,
         "10": 0.5,
         "5": 0.5
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1277
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1277
     },
     {
-      "ID": "q-008",
-      "RecallAt": {
+      "id": "q-008",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1306
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1306
     },
     {
-      "ID": "q-009",
-      "RecallAt": {
+      "id": "q-009",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1227
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1227
     },
     {
-      "ID": "q-010",
-      "RecallAt": {
+      "id": "q-010",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1298
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1298
     },
     {
-      "ID": "q-011",
-      "RecallAt": {
+      "id": "q-011",
+      "recall_at": {
         "1": 0,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 0,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 0.3333333333333333,
-      "Found": true,
-      "LatencyMS": 1491
+      "mrr": 0.3333333333333333,
+      "found": true,
+      "latency_ms": 1491
     },
     {
-      "ID": "q-012",
-      "RecallAt": {
+      "id": "q-012",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1251
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1251
     },
     {
-      "ID": "q-013",
-      "RecallAt": {
+      "id": "q-013",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1256
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1256
     },
     {
-      "ID": "q-014",
-      "RecallAt": {
+      "id": "q-014",
+      "recall_at": {
         "1": 0.5,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.2222222222222222,
         "5": 0.4
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1215
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1215
     },
     {
-      "ID": "q-015",
-      "RecallAt": {
+      "id": "q-015",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1990
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1990
     },
     {
-      "ID": "q-016",
-      "RecallAt": {
+      "id": "q-016",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1302
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1302
     },
     {
-      "ID": "q-017",
-      "RecallAt": {
+      "id": "q-017",
+      "recall_at": {
         "1": 0.5,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.2222222222222222,
         "5": 0.4
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1285
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1285
     },
     {
-      "ID": "q-018",
-      "RecallAt": {
+      "id": "q-018",
+      "recall_at": {
         "1": 0,
         "10": 0,
         "5": 0
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 0,
         "10": 0,
         "5": 0
       },
-      "MRR": 0,
-      "Found": false,
-      "LatencyMS": 2486
+      "mrr": 0,
+      "found": false,
+      "latency_ms": 2486
     },
     {
-      "ID": "q-019",
-      "RecallAt": {
+      "id": "q-019",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1309
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1309
     },
     {
-      "ID": "q-020",
-      "RecallAt": {
+      "id": "q-020",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.16666666666666666,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1252
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1252
     },
     {
-      "ID": "q-021",
-      "RecallAt": {
+      "id": "q-021",
+      "recall_at": {
         "1": 0,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 0,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 0.5,
-      "Found": true,
-      "LatencyMS": 1281
+      "mrr": 0.5,
+      "found": true,
+      "latency_ms": 1281
     },
     {
-      "ID": "q-022",
-      "RecallAt": {
+      "id": "q-022",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1230
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1230
     },
     {
-      "ID": "q-023",
-      "RecallAt": {
+      "id": "q-023",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1190
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1190
     },
     {
-      "ID": "q-024",
-      "RecallAt": {
+      "id": "q-024",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1111111111111111,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1255
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1255
     },
     {
-      "ID": "q-025",
-      "RecallAt": {
+      "id": "q-025",
+      "recall_at": {
         "1": 1,
         "10": 1,
         "5": 1
       },
-      "PrecisionAt": {
+      "precision_at": {
         "1": 1,
         "10": 0.1,
         "5": 0.2
       },
-      "MRR": 1,
-      "Found": true,
-      "LatencyMS": 1334
+      "mrr": 1,
+      "found": true,
+      "latency_ms": 1334
     }
   ]
 }

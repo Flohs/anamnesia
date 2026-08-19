@@ -531,6 +531,15 @@ func compareToBaseline(base, now evalReport) (bool, []string, error) {
 		return false, nil, fmt.Errorf("baseline covered %d queries, this run covered %d: cannot compare", base.Queries, now.Queries)
 	}
 
+	// A baseline that decoded but carries no metrics is a shape mismatch, not
+	// a run that scored zero: a file written before the metric fields had json
+	// tags matches on K and Queries and then compares as if every metric were
+	// a genuine 0.0, so the current run reads as a clean improvement over
+	// nothing.
+	if len(base.Aggregate.RecallAt) == 0 && len(base.Aggregate.PrecisionAt) == 0 && base.Aggregate.MRR == 0 {
+		return false, nil, errors.New("baseline carries no metrics: it was probably written by an older version and cannot be compared")
+	}
+
 	var lines []string
 	regressed := false
 	type metric struct {

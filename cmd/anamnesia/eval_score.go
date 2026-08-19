@@ -8,22 +8,22 @@ package main
 import "sort"
 
 type queryScore struct {
-	ID          string
-	RecallAt    map[int]float64
-	PrecisionAt map[int]float64
-	MRR         float64
-	Found       bool
-	LatencyMS   int64
+	ID          string          `json:"id"`
+	RecallAt    map[int]float64 `json:"recall_at"`
+	PrecisionAt map[int]float64 `json:"precision_at"`
+	MRR         float64         `json:"mrr"`
+	Found       bool            `json:"found"`
+	LatencyMS   int64           `json:"latency_ms"`
 }
 
 type aggregateScore struct {
-	Queries     int
-	RecallAt    map[int]float64
-	PrecisionAt map[int]float64
-	MRR         float64
-	ZeroHit     int
-	P50MS       int64
-	P95MS       int64
+	Queries     int             `json:"queries"`
+	RecallAt    map[int]float64 `json:"recall_at"`
+	PrecisionAt map[int]float64 `json:"precision_at"`
+	MRR         float64         `json:"mrr"`
+	ZeroHit     int             `json:"zero_hit"`
+	P50MS       int64           `json:"p50_ms"`
+	P95MS       int64           `json:"p95_ms"`
 }
 
 // score measures one query. ranked is source ids in rank order and may

@@ -155,9 +155,9 @@ func TestRunEvalPassReportsK(t *testing.T) {
 	if !ok {
 		t.Fatal("report json has no aggregate object")
 	}
-	recallAt, ok := aggregateJSON["RecallAt"].(map[string]any)
+	recallAt, ok := aggregateJSON["recall_at"].(map[string]any)
 	if !ok {
-		t.Fatal("aggregate json has no RecallAt object")
+		t.Fatalf("aggregate json has no recall_at object: %v", aggregateJSON)
 	}
 	if _, present := recallAt["10"]; present {
 		t.Errorf("a --k 5 run reported a recall@10 key: %v", recallAt)
@@ -283,5 +283,33 @@ func TestRegressionToleranceExceedsMeasuredRunToRunNoise(t *testing.T) {
 	// And not so loose it stops catching anything worth catching.
 	if regressionTolerance > 0.10 {
 		t.Errorf("tolerance %.3f is loose enough to miss a real regression", regressionTolerance)
+	}
+}
+
+func TestBaselineFromAnOlderShapeIsRefusedNotSilentlyCompared(t *testing.T) {
+	// A baseline written before the metric fields carried json tags decodes
+	// with every metric at zero. K and Queries still match, so the shape check
+	// passes, and every delta then comes out positive — the run reads as a
+	// clean improvement over nothing. Refuse it instead.
+	stale := evalReport{K: 10, Queries: 25} // decoded, but no metrics survived
+	now := evalReport{K: 10, Queries: 25, Aggregate: aggregateScore{
+		Queries: 25, MRR: 0.84,
+		RecallAt: map[int]float64{5: 0.88}, PrecisionAt: map[int]float64{5: 0.21},
+	}}
+	_, _, err := compareToBaseline(stale, now)
+	if err == nil {
+		t.Fatal("a baseline with no metrics at all was accepted and compared")
+	}
+	if !strings.Contains(err.Error(), "no metrics") {
+		t.Errorf("error %q does not explain that the baseline carried no metrics", err)
+	}
+}
+
+func TestBaselineWithRealMetricsStillCompares(t *testing.T) {
+	base := evalReport{K: 10, Queries: 25, Aggregate: aggregateScore{
+		Queries: 25, MRR: 0.84, RecallAt: map[int]float64{5: 0.88}, PrecisionAt: map[int]float64{5: 0.21}}}
+	now := base
+	if _, _, err := compareToBaseline(base, now); err != nil {
+		t.Errorf("a well-formed baseline was refused: %v", err)
 	}
 }
