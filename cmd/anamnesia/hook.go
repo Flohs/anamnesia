@@ -345,6 +345,26 @@ func doRetrieve(ctx context.Context, w io.Writer, hc *hostConfig, ev hookEvent) 
 	return note, nil
 }
 
+// segment is one piece of a checkpoint: contiguous turns that look like one
+// subject, and when the first of them happened.
+type segment struct {
+	Content string
+	At      time.Time
+	// EndOffset is the absolute byte offset in the transcript just past
+	// this segment's last line. It lets a partial post advance the offset
+	// to the last segment that actually landed, instead of losing progress
+	// on every failure.
+	EndOffset int64
+}
+
+// minSegmentBytes is the shortest tail worth posting on its own. Below it a
+// segment merges backwards: a one-word coda ("ok", "thanks") is not its own
+// idea, and posting it costs a gate evaluation to learn that. Kept well
+// below the length of even a short but genuine exchange, so a real topic
+// change that happens to be terse is never folded back into the one before
+// it.
+const minSegmentBytes = 40
+
 // ─── checkpoints (session-end + pre-compact) ─────────────────────────
 
 // doCheckpoint sends the part of the transcript that has not been sent
@@ -358,41 +378,70 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 		return "no transcript path", nil
 	}
 	offset := readOffset(input.SessionID, input.TranscriptPath)
-	content, next, err := readTranscriptFrom(input.TranscriptPath, offset)
+	segs, next, err := readTranscriptFrom(input.TranscriptPath, offset,
+		hc.Dur("ingest.segment_gap"), hc.Int("ingest.segment_max_bytes"))
 	if err != nil {
 		return "", err
 	}
-	if strings.TrimSpace(content) == "" {
+	if len(segs) == 0 {
 		// Still record the offset: a checkpoint over tool-only turns has
 		// nothing to say but has definitely consumed those bytes.
 		_ = writeOffset(input.SessionID, input.TranscriptPath, next)
 		return "nothing new since last checkpoint", nil
 	}
+
 	title := input.SessionID
 	if title == "" {
 		title = kind
 	}
-	err = httpPost(ctx, hc, "/v1/ingest", ingestPayload{
-		Kind:    kind,
-		Title:   title,
-		Content: content,
-		User:    hc.User(),
-		Project: hc.Project(),
-		Metadata: map[string]any{
-			"session_id":  input.SessionID,
-			"cwd":         input.CWD,
-			"stop_reason": input.StopReason,
-			"trigger":     input.Trigger,
-			"byte_range":  fmt.Sprintf("%d-%d", offset, next),
-		},
-	}, nil)
-	if err != nil {
-		return "", err
+	sent := 0
+	var lastEnd int64
+	segStart := offset
+	for i, seg := range segs {
+		at := seg.At
+		payload := ingestPayload{
+			Kind:        kind,
+			Title:       title,
+			ExternalRef: fmt.Sprintf("%s#%d", input.SessionID, segStart),
+			Content:     seg.Content,
+			User:        hc.User(),
+			Project:     hc.Project(),
+			Metadata: map[string]any{
+				"session_id":  input.SessionID,
+				"cwd":         input.CWD,
+				"stop_reason": input.StopReason,
+				"trigger":     input.Trigger,
+				"byte_range":  fmt.Sprintf("%d-%d", segStart, seg.EndOffset),
+				"segment":     i,
+				"segments":    len(segs),
+			},
+		}
+		if !at.IsZero() {
+			payload.OccurredAt = &at
+		}
+		if err := httpPost(ctx, hc, "/v1/ingest", payload, nil); err != nil {
+			// Advance the offset to the last segment that actually landed,
+			// so a retry re-sends only what failed rather than everything
+			// again on top of a growing transcript: without this, a
+			// checkpoint that runs out of time can never catch up, because
+			// each retry re-reads a larger range than the one before it.
+			// Re-sending is safe (the gate deduplicates); losing a segment
+			// that already landed is not.
+			if sent > 0 {
+				if werr := writeOffset(input.SessionID, input.TranscriptPath, lastEnd); werr != nil {
+					return fmt.Sprintf("ingested %d of %d segments, offset not saved", sent, len(segs)), werr
+				}
+			}
+			return fmt.Sprintf("ingested %d of %d segments", sent, len(segs)), err
+		}
+		sent++
+		lastEnd = seg.EndOffset
+		segStart = seg.EndOffset
 	}
 	if err := writeOffset(input.SessionID, input.TranscriptPath, next); err != nil {
-		return fmt.Sprintf("ingested %d bytes, offset not saved", len(content)), err
+		return fmt.Sprintf("ingested %d segments, offset not saved", sent), err
 	}
-	return fmt.Sprintf("ingested %d new bytes", len(content)), nil
+	return fmt.Sprintf("ingested %d segments", sent), nil
 }
 
 // readTranscriptFrom renders the chat turns in path starting at offset,
@@ -400,16 +449,16 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 //
 // Tool calls and tool results are skipped: the assistant's own prose
 // already says what the tools produced, at a fraction of the tokens.
-func readTranscriptFrom(path string, offset int64) (string, int64, error) {
+func readTranscriptFrom(path string, offset int64, gap time.Duration, maxBytes int) ([]segment, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", offset, err
+		return nil, offset, err
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return "", offset, err
+		return nil, offset, err
 	}
 	// A transcript that shrank was replaced, so the old offset is
 	// meaningless and we start over.
@@ -417,14 +466,14 @@ func readTranscriptFrom(path string, offset int64) (string, int64, error) {
 		offset = 0
 	}
 	if info.Size() == offset {
-		return "", offset, nil
+		return nil, offset, nil
 	}
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return "", offset, err
+		return nil, offset, err
 	}
 	raw, err := io.ReadAll(f)
 	if err != nil {
-		return "", offset, err
+		return nil, offset, err
 	}
 
 	// Only whole lines are consumed, so a checkpoint landing mid-write
@@ -433,12 +482,40 @@ func readTranscriptFrom(path string, offset int64) (string, int64, error) {
 	if i := bytes.LastIndexByte(raw, '\n'); i >= 0 {
 		consumed = i + 1
 	} else {
-		return "", offset, nil // no complete line yet
+		return nil, offset, nil // no complete line yet
 	}
 
-	var sb strings.Builder
-	for _, line := range strings.Split(string(raw[:consumed]), "\n") {
-		line = strings.TrimSpace(line)
+	// raw[:consumed] always ends in '\n' (only whole lines are consumed
+	// above), so Split always leaves one trailing empty element. Drop it
+	// before using line lengths for byte accounting, or every read would
+	// be off by one.
+	rawLines := strings.Split(string(raw[:consumed]), "\n")
+	rawLines = rawLines[:len(rawLines)-1]
+
+	var (
+		segs    []segment
+		sb      strings.Builder
+		segAt   time.Time
+		prevAt  time.Time
+		haveSeg bool
+		pos     = offset
+	)
+	// flush closes out the current segment, ending it at end: the exact
+	// byte position up to which its lines have been consumed. A failed
+	// post can then resume from there rather than from the start of the
+	// whole batch.
+	flush := func(end int64) {
+		if body := strings.TrimSpace(sb.String()); body != "" {
+			segs = append(segs, segment{Content: body, At: segAt, EndOffset: end})
+		}
+		sb.Reset()
+		haveSeg = false
+	}
+
+	for _, rawLine := range rawLines {
+		lineStart := pos
+		pos += int64(len(rawLine)) + 1
+		line := strings.TrimSpace(rawLine)
 		if line == "" {
 			continue
 		}
@@ -454,23 +531,67 @@ func readTranscriptFrom(path string, offset int64) (string, int64, error) {
 		if role == "" {
 			continue
 		}
+		// A record with no timestamp of its own inherits the previous
+		// one, so meta records cannot look like a jump to the zero time.
+		at, ok := rec.at()
+		if !ok {
+			at = prevAt
+		}
+
+		if haveSeg {
+			gapCut := gap > 0 && !prevAt.IsZero() && !at.IsZero() && at.Sub(prevAt) > gap
+			sizeCut := maxBytes > 0 && sb.Len() > maxBytes
+			if gapCut || sizeCut {
+				flush(lineStart)
+			}
+		}
+		if !haveSeg {
+			segAt = at
+			haveSeg = true
+		}
 		sb.WriteString(role)
 		sb.WriteString(": ")
 		sb.WriteString(text)
 		sb.WriteString("\n")
+		prevAt = at
 	}
-	return strings.TrimSpace(sb.String()), offset + int64(consumed), nil
+	flush(pos)
+
+	// A short tail is not its own idea. Merge it backwards rather than
+	// spending a gate evaluation to discover that. The merged segment
+	// keeps the tail's EndOffset: it now carries the tail's bytes too, and
+	// the predecessor's old EndOffset would leave them looking unconsumed.
+	if len(segs) > 1 && len(segs[len(segs)-1].Content) < minSegmentBytes {
+		last := segs[len(segs)-1]
+		segs = segs[:len(segs)-1]
+		segs[len(segs)-1].Content += "\n" + last.Content
+		segs[len(segs)-1].EndOffset = last.EndOffset
+	}
+	return segs, offset + int64(consumed), nil
 }
 
 // transcriptRecord matches the loose schema Claude Code writes to the
 // transcript JSONL. Each line is either a wrapped message block (role plus
 // content) or a top-level type indicator.
 type transcriptRecord struct {
-	Type    string `json:"type,omitempty"`
-	Message *struct {
+	Type      string `json:"type,omitempty"`
+	Timestamp string `json:"timestamp,omitempty"`
+	Message   *struct {
 		Role    string          `json:"role,omitempty"`
 		Content json.RawMessage `json:"content,omitempty"`
 	} `json:"message,omitempty"`
+}
+
+// at parses the record's timestamp. Summaries and meta records carry none.
+func (r transcriptRecord) at() (time.Time, bool) {
+	if r.Timestamp == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, r.Timestamp)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 func (r transcriptRecord) role() string {
@@ -516,11 +637,13 @@ func (r transcriptRecord) text() string {
 type ingestPayload struct {
 	Kind         string         `json:"kind"`
 	Title        string         `json:"title,omitempty"`
+	ExternalRef  string         `json:"external_ref,omitempty"`
 	Content      string         `json:"content"`
 	Participants []string       `json:"participants,omitempty"`
 	Metadata     map[string]any `json:"metadata,omitempty"`
 	User         string         `json:"user,omitempty"`
 	Project      string         `json:"project,omitempty"`
+	OccurredAt   *time.Time     `json:"occurred_at,omitempty"`
 }
 
 // ─── transcript offsets ──────────────────────────────────────────────

@@ -27,15 +27,50 @@ Two mechanisms cause this, and both are correct in intent and wrong in scale.
 
 **The surprise gate decides per source.** `Extractor.Run` calls
 `surpriseGate(ctx, src.Scope, content, threshold)` once, over the whole body,
-and a skip verdict ends the run: `tr.End("skipped", …); return 0, nil`. A
-329 KB session is not one claim. It is a day containing dozens, and one cosine
-comparison against one top-1 neighbour decided the fate of all of them. The
+and a skip verdict ends the run: `tr.End("skipped", …); return 0, nil`. The
 gate was designed for a chat turn — "is this message a duplicate?" — and is
 being asked "is this *day* a duplicate?", a question it cannot answer.
 
-**`MaxOps` is 8.** The 44 KB source returned exactly 8, which is a ceiling
-being hit rather than a need being met. A day of work can contribute at most
-eight memories no matter what happened in it.
+> **Corrected 2026-08-19, after measurement.** An earlier draft of this section
+> asserted that the 329 KB source above was killed by a gate skip. That was
+> inferred from `extraction_state='skipped'`, and that field cannot support the
+> inference: it is set both when the gate skips and when the LLM returns no
+> operations, with no way to tell them apart outside the trace. Measurement
+> found the gate returning `keep` on every one of 50+ real ingests, with scores
+> of 0.41 for a paraphrase, 0.45 for a near-verbatim restatement and 0.60 for a
+> byte-identical copy of already-stored text — none near the 0.93 threshold. A
+> single temporal marker anywhere in the content also bypasses the gate
+> entirely (`hasTemporalMarker`, extract.go:197), which a long session will
+> almost always contain. So the gate is real but close to inert on this
+> content, and it is not what lost the 329 KB session.
+
+**One call with a fixed output budget, and this is the mechanism that actually
+bites.** Each source gets one LLM call with `maxTok = 1024` on the completion
+and `MaxOps = 8` on the result. The 44 KB source returned exactly 8, a ceiling
+being hit rather than a need being met.
+
+> **Corrected 2026-08-19.** A first pass at this section blamed the operation
+> cap alone. The measurement below contradicts that: the unsegmented run
+> produced **7** operations against a cap of 8, so the cap was never reached.
+> What binds is the 1024-token completion budget together with the model's own
+> prioritisation inside a single call — asked to cover 25 subjects at once, it
+> spends the budget on what the transcript says most often. Naming the cap was a
+> second unsupported inference in a document already carrying one correction,
+> which is worth recording as its own lesson.
+
+> **Measured 2026-08-19.** A 32.5 KB transcript of 25 subjects, 20 of them
+> restating already-known facts and 5 genuinely novel, ingested both ways
+> against the same primed store:
+>
+> ```
+> unsegmented   1 source,  7 operations — all 7 re-derive the known topics
+>                                          0 of 5 novel subjects survived
+> segmented    25 sources, 55 operations — 5 of 5 novel subjects survived
+> ```
+>
+> Reproduced twice on fresh scopes. The loss is the op budget being consumed by
+> dominant repeated content before the extractor reaches anything new, not a
+> gate verdict.
 
 The write path is also rare: 112 `retrieve` hook runs against 6 `session-end`,
 and `pre-compact` has never fired. Memory is read constantly and written a

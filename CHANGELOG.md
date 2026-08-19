@@ -117,6 +117,58 @@ were rebuilt around being verifiable.
 
 ### Added
 
+- **A session checkpoint is cut into segments instead of sent as one blob.** The
+  extractor gets one LLM call per source with a fixed output budget — 1024
+  completion tokens, capped at eight operations — so a long session had one
+  call in which to cover everything it contained, and the model spent it on
+  whatever the session had said most often. Novel material at the end was never
+  reached. (The operation cap is not what bound it: the unsegmented run below
+  produced seven operations against a cap of eight. The completion budget and
+  the model's own prioritisation within a single call are what bound it.) Measured on a 32.5 KB transcript of 25
+  subjects — 20 restating already-known facts, 5 genuinely novel — ingested both
+  ways against the same primed store:
+
+  ```
+  whole      1 source,  7 operations — all 7 re-derive the known topics
+                                       0 of 5 novel subjects survived
+  segmented 25 sources, 55 operations — 5 of 5 novel subjects survived
+  ```
+
+  The hook now cuts a checkpoint where the user paused for longer than
+  `ingest.segment_gap` (default 20m) or where a segment grows past
+  `ingest.segment_max_bytes` (default 32768), never inside a turn, and posts
+  each piece as its own source. Each one gets its own gate verdict and its own
+  operation budget. Set either setting to `0` to send checkpoints whole again,
+  which is exactly what earlier versions did.
+
+  Each segment also carries the timestamp of its first turn rather than the
+  moment the session closed. That matters beyond bookkeeping: decay reads
+  `occurred_at`, so a morning's work used to start ageing from the moment you
+  shut your laptop.
+
+  A checkpoint that fails partway now advances its offset to the last segment
+  that landed, rather than leaving it untouched. Leaving it meant the next
+  checkpoint re-read the same range plus whatever had accrued since, so the
+  range grew, the deadline arrived sooner, and memory silently stopped for that
+  session. Re-sending a segment is cheap; skipping one is not. On `SessionEnd`
+  there is no next checkpoint, so this turns "lose the whole session" into
+  "lose the tail after the failure" — an improvement, not a guarantee.
+
+  **The cost, stated plainly.** Two of them. Twenty-five sources means
+  twenty-five extraction calls, twenty-five embeddings and twenty-five gate
+  lookups where there was one — the work drains over worker ticks rather than
+  arriving as a burst, but the total is N times larger and it reaches your model
+  bill. And judging each piece independently lets near-duplicates through where
+  one blob was judged once: in the measurement above, 19 of 20 restatement
+  segments produced their own rows, 33 facts and 10 experiences for what is
+  substantively 8 pieces of information.
+
+  Neither is free, and the trade is still worth it — consolidation and decay
+  exist to compress duplicates, and nothing recovers content that was never
+  extracted. But "segmentation recovers novel content" is the earned claim;
+  "segmentation is free" is not. A fact count that climbs faster than before is
+  expected, not a bug.
+
 - **`anamnesia eval` measures retrieval instead of arguing about it.** Every
   retrieval decision in the tree — RRF over score normalisation, the fusion
   constant, the candidate widths, reranking the top 4×K — rested on reasoning
