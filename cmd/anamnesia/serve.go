@@ -230,7 +230,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		recorder = activity.New(cfg.ActivityTraces)
 	}
 
-	retr := &retrieval.Engine{Store: st, Embedder: emb, Reranker: reranker}
+	retr := &retrieval.Engine{Store: st, Embedder: emb, Reranker: reranker, Log: log}
 	briefer := &jobs.Briefer{LLM: llmc}
 
 	mcpHandler := mcp.NewHandler(mcp.Deps{

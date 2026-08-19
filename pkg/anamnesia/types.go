@@ -231,6 +231,7 @@ type SearchHit struct {
 	Score        float64 `json:"score"`
 	VectorRank   int     `json:"vector_rank,omitempty"`
 	LexicalRank  int     `json:"lexical_rank,omitempty"`
+	GraphRank    int     `json:"graph_rank,omitempty"`
 	RerankerRank int     `json:"reranker_rank,omitempty"`
 }
 

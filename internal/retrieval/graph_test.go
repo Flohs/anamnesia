@@ -108,12 +108,12 @@ func TestAnEmptyGraphChangesNothing(t *testing.T) {
 		t.Fatalf("hits = %v, want exactly the two facts, higher-frequency match first, nothing the graph invented", hitIDs(base))
 	}
 
-	// Direct, white-box check that the empty-graph guard inside
-	// graphExpand is what fires. Production change that would make this
-	// fail: EntitiesForSources being skipped/short-circuited before it
-	// actually queries (masking a real bug elsewhere), or the "found no
-	// entities" case falling through into the walk instead of returning
-	// immediately.
+	// Direct, white-box check that walking an empty graph genuinely finds
+	// nothing: EntitiesForSources really runs (real sourced facts, real
+	// entity_mentions table, nothing in it for these two sources) and the
+	// walk it feeds produces zero candidates. Production change that
+	// would make this fail: graphExpand returning phantom hits, or
+	// erroring, when nothing in entities/entity_mentions/edges matches.
 	direct, err := eng.graphExpand(ctx, Query{
 		Scope:      scope,
 		Domains:    []anamnesia.Domain{anamnesia.DomainFact, anamnesia.DomainExperience},
@@ -260,5 +260,285 @@ func TestTheGraphSurfacesARowNeitherSearchFinds(t *testing.T) {
 	}
 	if !foundExp2 {
 		t.Errorf("hits = %v, want the zebra experience surfaced through the aardvark-project -> zebra-project edge; the graph channel isn't doing anything", hitIDs(hits))
+	}
+
+	// A negative GraphSeedN must genuinely turn the channel off, using
+	// this same fixture where "on" is known to surface exp2: this is the
+	// real kill switch (Search only replaces GraphSeedN == 0, so -1
+	// survives into graphExpand's own seedN<=0 guard), not the impossible
+	// "0 disables" this task's brief originally asked for.
+	off, err := eng.Search(ctx, Query{Scope: scope, Text: "aardvark", GraphSeedN: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range off {
+		if h.Experience != nil && h.Experience.ID == exp2.ID {
+			t.Errorf("hits = %v with GraphSeedN -1, want the graph channel off and the zebra experience absent", hitIDs(off))
+		}
+	}
+}
+
+// TestGraphWalkStaysInsideItsTenant: anamnesia_graph_edge takes raw
+// entity UUIDs with no scope check, so nothing today stops a cross-user
+// edge from being created, and Store.Neighbors/SourcesForEntities (Task
+// 1-3, no scope parameter of their own) will traverse it just as readily
+// as an in-tenant one. This fixture mirrors
+// TestTheGraphSurfacesARowNeitherSearchFinds exactly, except the two
+// experiences belong to two different users and the edge crosses between
+// them.
+//
+// graphExpand has two independent scope predicates (entitiesInScope/
+// inScope filtering the walk itself, and the user_id filter already in
+// hitsForSources' SQL), but for THIS fixture they turn out to be fully
+// redundant with each other: entB is filtered out as a neighbour by the
+// walk-level predicate before hitsForSources is ever asked about it, so
+// removing either predicate alone (checked by deliberately neutering
+// each, one at a time, and rerunning — not committed) still leaves the
+// other one blocking the leak, and this test stays green either way. That
+// is not a wasted test — it is real defense in depth, and it is still the
+// scenario the review named — but it means this specific test cannot be
+// the thing that proves hitsForSources' filter matters. See
+// TestGraphWalkKeepsABadMentionInsideItsTenant below for a fixture where
+// it's the only thing that does, and TestInScope for a direct,
+// DB-free check of the walk-level predicate's own logic.
+func TestGraphWalkStaysInsideItsTenant(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	handleA := "retrieval-tenant-a-" + uuid.NewString()[:8]
+	uidA, err := st.EnsureUser(ctx, handleA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), handleA) })
+	handleB := "retrieval-tenant-b-" + uuid.NewString()[:8]
+	uidB, err := st.EnsureUser(ctx, handleB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), handleB) })
+	scopeA := anamnesia.Scope{UserID: uidA}
+	scopeB := anamnesia.Scope{UserID: uidB}
+
+	srcA := &anamnesia.Source{Scope: scopeA, Kind: "claude-session-graph", RawContent: "x"}
+	if err := st.InsertSource(ctx, srcA); err != nil {
+		t.Fatal(err)
+	}
+	srcB := &anamnesia.Source{Scope: scopeB, Kind: "claude-session-graph", RawContent: "x"}
+	if err := st.InsertSource(ctx, srcB); err != nil {
+		t.Fatal(err)
+	}
+
+	expA := &anamnesia.Experience{
+		Scope: scopeA, Kind: anamnesia.ExperienceCase, SourceID: &srcA.ID,
+		Title: "sunfish migration", Body: "Notes on the sunfish migration rollout.",
+	}
+	if err := st.RecordExperience(ctx, expA); err != nil {
+		t.Fatal(err)
+	}
+	expB := &anamnesia.Experience{
+		Scope: scopeB, Kind: anamnesia.ExperienceCase, SourceID: &srcB.ID,
+		Title: "otter patrol", Body: "Notes on the otter crossing patrol logs.",
+	}
+	if err := st.RecordExperience(ctx, expB); err != nil {
+		t.Fatal(err)
+	}
+
+	entA := &anamnesia.Entity{Scope: scopeA, Kind: "topic", Name: "sunfish-project"}
+	if err := st.UpsertEntity(ctx, entA); err != nil {
+		t.Fatal(err)
+	}
+	entB := &anamnesia.Entity{Scope: scopeB, Kind: "topic", Name: "otter-project"}
+	if err := st.UpsertEntity(ctx, entB); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordMention(ctx, entA.ID, srcA.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordMention(ctx, entB.ID, srcB.ID); err != nil {
+		t.Fatal(err)
+	}
+	// The cross-tenant edge CreateEdge doesn't stop: entA (user A) to
+	// entB (user B).
+	if err := st.CreateEdge(ctx, &anamnesia.Edge{From: entA.ID, To: entB.ID, Kind: "related_to", Trust: 0.9}); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := &Engine{Store: st}
+	hits, err := eng.Search(ctx, Query{Scope: scopeA, Text: "sunfish"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foundExpA, leakedExpB bool
+	for _, h := range hits {
+		if h.Experience == nil {
+			continue
+		}
+		switch h.Experience.ID {
+		case expA.ID:
+			foundExpA = true
+		case expB.ID:
+			leakedExpB = true
+		}
+	}
+	if !foundExpA {
+		t.Fatalf("hits = %v, want user A's own sunfish experience", hitIDs(hits))
+	}
+	if leakedExpB {
+		t.Errorf("hits = %v, want user B's experience absent: it leaked across the cross-tenant edge", hitIDs(hits))
+	}
+}
+
+// TestGraphWalkKeepsABadMentionInsideItsTenant isolates hitsForSources'
+// own user_id filter as the thing that matters, by using a fixture the
+// walk-level scope predicate cannot help with at all: entC below is a
+// genuinely user-A-scoped entity (no edge crosses a tenant boundary, so
+// entitiesInScope/inScope has nothing to object to), but it carries a
+// mention linking it to a source owned by user B — RecordMention (Task
+// 1-3) takes raw UUIDs with no scope check either, so nothing stops that
+// mention existing (a bad extraction, a bug, anything). Only
+// hitsForSources' own user_id filter, applied to the row it fetches, can
+// catch this. Verified by mutation: neutering that filter (replacing
+// "user_id = $2" with an always-true predicate that still binds $2, so
+// the query stays valid SQL) makes this test fail; not committed.
+func TestGraphWalkKeepsABadMentionInsideItsTenant(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	handleA := "retrieval-tenant-bad-mention-a-" + uuid.NewString()[:8]
+	uidA, err := st.EnsureUser(ctx, handleA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), handleA) })
+	handleB := "retrieval-tenant-bad-mention-b-" + uuid.NewString()[:8]
+	uidB, err := st.EnsureUser(ctx, handleB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), handleB) })
+	scopeA := anamnesia.Scope{UserID: uidA}
+	scopeB := anamnesia.Scope{UserID: uidB}
+
+	srcA := &anamnesia.Source{Scope: scopeA, Kind: "claude-session-graph", RawContent: "x"}
+	if err := st.InsertSource(ctx, srcA); err != nil {
+		t.Fatal(err)
+	}
+	srcB := &anamnesia.Source{Scope: scopeB, Kind: "claude-session-graph", RawContent: "x"}
+	if err := st.InsertSource(ctx, srcB); err != nil {
+		t.Fatal(err)
+	}
+
+	expA := &anamnesia.Experience{
+		Scope: scopeA, Kind: anamnesia.ExperienceCase, SourceID: &srcA.ID,
+		Title: "puffin migration", Body: "Notes on the puffin migration rollout.",
+	}
+	if err := st.RecordExperience(ctx, expA); err != nil {
+		t.Fatal(err)
+	}
+	expB := &anamnesia.Experience{
+		Scope: scopeB, Kind: anamnesia.ExperienceCase, SourceID: &srcB.ID,
+		Title: "otter patrol", Body: "Notes on the otter crossing patrol logs.",
+	}
+	if err := st.RecordExperience(ctx, expB); err != nil {
+		t.Fatal(err)
+	}
+
+	// entA (seed) -> entC (neighbour), both genuinely owned by user A.
+	entA := &anamnesia.Entity{Scope: scopeA, Kind: "topic", Name: "puffin-project"}
+	if err := st.UpsertEntity(ctx, entA); err != nil {
+		t.Fatal(err)
+	}
+	entC := &anamnesia.Entity{Scope: scopeA, Kind: "topic", Name: "puffin-related"}
+	if err := st.UpsertEntity(ctx, entC); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordMention(ctx, entA.ID, srcA.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateEdge(ctx, &anamnesia.Edge{From: entA.ID, To: entC.ID, Kind: "related_to", Trust: 0.9}); err != nil {
+		t.Fatal(err)
+	}
+	// The bad mention: entC (user A's own entity) mentioning a source
+	// that belongs to user B.
+	if err := st.RecordMention(ctx, entC.ID, srcB.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := &Engine{Store: st}
+	hits, err := eng.Search(ctx, Query{Scope: scopeA, Text: "puffin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foundExpA, leakedExpB bool
+	for _, h := range hits {
+		if h.Experience == nil {
+			continue
+		}
+		switch h.Experience.ID {
+		case expA.ID:
+			foundExpA = true
+		case expB.ID:
+			leakedExpB = true
+		}
+	}
+	if !foundExpA {
+		t.Fatalf("hits = %v, want user A's own puffin experience", hitIDs(hits))
+	}
+	if leakedExpB {
+		t.Errorf("hits = %v, want user B's experience absent: it leaked through a same-tenant entity's mention of a foreign source", hitIDs(hits))
+	}
+}
+
+// TestInScope is a direct, DB-free check of the walk-level scope
+// predicate's own logic (graph.go). It has no content-observable failure
+// mode of its own in either DB-backed test above — both find that
+// hitsForSources' user_id filter alone is enough to keep the specific
+// fixtures they construct safe — so this is the test that actually
+// constrains entitiesInScope/inScope: it is what would catch that logic
+// being wrong or deleted, even though no single Search() call in this
+// file can.
+func TestInScope(t *testing.T) {
+	userA, userB := uuid.New(), uuid.New()
+	projX, projY := uuid.New(), uuid.New()
+
+	cases := []struct {
+		name      string
+		candidate anamnesia.Scope
+		want      anamnesia.Scope
+		in        bool
+	}{
+		{"same user, neither scoped to a project", anamnesia.Scope{UserID: userA}, anamnesia.Scope{UserID: userA}, true},
+		{"different user", anamnesia.Scope{UserID: userB}, anamnesia.Scope{UserID: userA}, false},
+		{"user-level query sees a project-scoped candidate too", anamnesia.Scope{UserID: userA, ProjectID: &projX}, anamnesia.Scope{UserID: userA}, true},
+		{"project-scoped query sees a user-level candidate", anamnesia.Scope{UserID: userA}, anamnesia.Scope{UserID: userA, ProjectID: &projX}, true},
+		{"same user, same project", anamnesia.Scope{UserID: userA, ProjectID: &projX}, anamnesia.Scope{UserID: userA, ProjectID: &projX}, true},
+		{"same user, different project", anamnesia.Scope{UserID: userA, ProjectID: &projX}, anamnesia.Scope{UserID: userA, ProjectID: &projY}, false},
+		{"matching project id, different user", anamnesia.Scope{UserID: userB, ProjectID: &projX}, anamnesia.Scope{UserID: userA, ProjectID: &projX}, false},
+	}
+	for _, c := range cases {
+		if got := inScope(c.candidate, c.want); got != c.in {
+			t.Errorf("%s: inScope(%+v, %+v) = %v, want %v", c.name, c.candidate, c.want, got, c.in)
+		}
 	}
 }

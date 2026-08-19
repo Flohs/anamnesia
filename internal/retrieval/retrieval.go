@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -20,11 +21,15 @@ import (
 
 // Engine wires a Store + Embedder for query-time retrieval. Reranker is
 // optional; when non-nil it re-orders the fused candidate list as the
-// final step.
+// final step. Log is optional too: when set, a failed graph expansion is
+// logged through it rather than silently swallowed (see Search) — nil is
+// fine, since callers that don't care about that still get vector and
+// lexical results either way.
 type Engine struct {
 	Store    *store.Store
 	Embedder embed.Embedder
 	Reranker Reranker
+	Log      *slog.Logger
 }
 
 // Query controls the search.
@@ -42,15 +47,14 @@ type Query struct {
 	// reachable sources contribute up to GraphK extra candidates, folded
 	// back into the RRF score alongside vector/lexical rank. See graph.go.
 	//
-	// Defaults (5/10/20) are applied the same way VectorK/LexicalK/
-	// RRFConst are: any non-positive value is replaced. That means, unlike
-	// the doc this field started from, GraphSeedN's zero value cannot
-	// actually disable the channel here — it converges on the same
-	// default 5 an unset field gets, which is what lets the channel ship
-	// enabled for every existing caller without editing them. graphExpand
-	// itself still treats GraphSeedN<=0 as "do nothing", so a future
-	// caller-side opt-out is one guard away if this default ever moves
-	// out of Search.
+	// GraphSeedN's zero value (an unset field) defaults to 5, so the
+	// channel ships enabled for every existing caller without editing
+	// them. A negative value disables it: graphExpand treats any
+	// GraphSeedN<=0 as "do nothing", and Search only replaces exactly
+	// zero, so a caller that wants the channel off can set GraphSeedN to
+	// -1 and have that survive. GraphFanout/GraphK have no such caller
+	// meaning for non-positive values, so they default the same way
+	// VectorK/LexicalK do: anything <=0 is replaced.
 	GraphSeedN  int
 	GraphFanout int
 	GraphK      int
@@ -95,7 +99,7 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 	if q.RRFConst <= 0 {
 		q.RRFConst = 60
 	}
-	if q.GraphSeedN <= 0 {
+	if q.GraphSeedN == 0 {
 		q.GraphSeedN = 5
 	}
 	if q.GraphFanout <= 0 {
@@ -254,11 +258,6 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
 
-	if q.Trace != nil {
-		q.Trace.Step("fuse", fmt.Sprintf("RRF fused %d candidates", len(out)),
-			map[string]any{"ranked": rankedDetails(out)})
-	}
-
 	// Graph channel: walk out from the top-ranked fused hits' mentioned
 	// entities and fold in whatever their neighbours' sources contribute,
 	// as extra candidates (see graph.go). This runs after fusion, not
@@ -266,21 +265,29 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 	// graph adds reachable-and-related rows on top of that ranking rather
 	// than feeding into it.
 	//
+	// A failed walk must not fail the search: vector and lexical results
+	// are already computed by this point, and the retrieve hook's whole
+	// budget is 2.5s (cmd/anamnesia/hook.go) — a slow or broken graph
+	// mid-walk must degrade retrieval, not turn a working one into no
+	// memory injected at all. Log it (if a logger is wired) and keep
+	// going with the fused-only `out`.
+	graphHits, err := e.graphExpand(ctx, q, out)
+	if err != nil {
+		if e.Log != nil {
+			e.Log.Warn("graph expand failed, continuing without it", "error", err)
+		}
+		graphHits = nil
+	}
 	// When the walk finds nothing — every install ships with an empty
 	// graph — `out` is left completely untouched: no recompute, no
 	// re-sort. TestAnEmptyGraphChangesNothing checks this directly: it
 	// calls graphExpand itself and asserts it returns nothing once
-	// EntitiesForSources finds no rows, which is the guard that must fire
-	// before any further graph query runs. (A re-sort of tied scores
-	// could in principle reorder rows too, since sort.Slice isn't stable
-	// and Go's map iteration order isn't fixed across calls — but that
-	// instability already exists in the fused-only sort above, with or
-	// without this channel, so it isn't this guard's job to fix and the
-	// test doesn't rely on it.)
-	graphHits, err := e.graphExpand(ctx, q, out)
-	if err != nil {
-		return nil, fmt.Errorf("graph expand: %w", err)
-	}
+	// EntitiesForSources finds no rows. (That specific guard is a
+	// readability short-circuit, not a load-bearing one: ranging over
+	// zero entities already makes zero further Neighbors calls on its
+	// own, so removing the guard doesn't change behaviour — the test
+	// documents that this path is a genuine no-op, not that this one
+	// line is what makes it so.)
 	if len(graphHits) > 0 {
 		for i, h := range graphHits {
 			key := string(h.Domain) + ":" + h.ID().String()
@@ -298,9 +305,20 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 			r.hit.Score = score(r)
 			r.hit.VectorRank = r.vRk
 			r.hit.LexicalRank = r.lRk
+			r.hit.GraphRank = r.gRk
 			out = append(out, r.hit)
 		}
 		sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
+	}
+
+	// Traced after graph expansion, not before: this must be the ranking
+	// actually handed to the reranker below, not an intermediate one the
+	// graph is about to change. rankedDetails renders GraphRank too, so a
+	// graph-sourced hit (vector_rank 0, lexical_rank 0) is identifiable
+	// as "the graph found this", not indistinguishable from a bug.
+	if q.Trace != nil {
+		q.Trace.Step("fuse", fmt.Sprintf("RRF fused %d candidates", len(out)),
+			map[string]any{"ranked": rankedDetails(out)})
 	}
 
 	// Take a candidate set 4× the requested K into the reranker so the
@@ -564,6 +582,7 @@ func rankedDetails(hits []anamnesia.SearchHit) []map[string]any {
 			"rrf_score":    h.Score,
 			"vector_rank":  h.VectorRank,
 			"lexical_rank": h.LexicalRank,
+			"graph_rank":   h.GraphRank,
 		})
 	}
 	if capped {
