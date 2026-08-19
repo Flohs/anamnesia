@@ -29,14 +29,32 @@ type Engine struct {
 
 // Query controls the search.
 type Query struct {
-	Scope     anamnesia.Scope
-	Text      string
-	Domains   []anamnesia.Domain // empty = all
-	K         int                // top-K to return (default 10)
-	VectorK   int                // vector candidates per domain (default 40)
-	LexicalK  int                // lexical candidates per domain (default 40)
-	RRFConst  float64            // default 60
-	ProjectIn []uuid.UUID        // include hits from these projects; empty + ProjectID set = restrict to that project
+	Scope    anamnesia.Scope
+	Text     string
+	Domains  []anamnesia.Domain // empty = all
+	K        int                // top-K to return (default 10)
+	VectorK  int                // vector candidates per domain (default 40)
+	LexicalK int                // lexical candidates per domain (default 40)
+	RRFConst float64            // default 60
+	// GraphSeedN, GraphFanout and GraphK control the graph channel: after
+	// vector+lexical fusion, the top GraphSeedN fused hits seed a walk
+	// (Store.Neighbors, capped to GraphFanout per seed entity) whose
+	// reachable sources contribute up to GraphK extra candidates, folded
+	// back into the RRF score alongside vector/lexical rank. See graph.go.
+	//
+	// Defaults (5/10/20) are applied the same way VectorK/LexicalK/
+	// RRFConst are: any non-positive value is replaced. That means, unlike
+	// the doc this field started from, GraphSeedN's zero value cannot
+	// actually disable the channel here — it converges on the same
+	// default 5 an unset field gets, which is what lets the channel ship
+	// enabled for every existing caller without editing them. graphExpand
+	// itself still treats GraphSeedN<=0 as "do nothing", so a future
+	// caller-side opt-out is one guard away if this default ever moves
+	// out of Search.
+	GraphSeedN  int
+	GraphFanout int
+	GraphK      int
+	ProjectIn   []uuid.UUID // include hits from these projects; empty + ProjectID set = restrict to that project
 	// OnlyRaw, when true, restricts experience retrieval to abstraction=0
 	// rows — verbatim sources only, no consolidator-generated summaries.
 	// Set this for evidence-grounded answering (benchmarks, citation
@@ -77,6 +95,15 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 	if q.RRFConst <= 0 {
 		q.RRFConst = 60
 	}
+	if q.GraphSeedN <= 0 {
+		q.GraphSeedN = 5
+	}
+	if q.GraphFanout <= 0 {
+		q.GraphFanout = 10
+	}
+	if q.GraphK <= 0 {
+		q.GraphK = 20
+	}
 	if len(q.Domains) == 0 {
 		q.Domains = []anamnesia.Domain{anamnesia.DomainFact, anamnesia.DomainExperience, anamnesia.DomainSkill}
 	}
@@ -107,6 +134,7 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 		hit anamnesia.SearchHit
 		vRk int
 		lRk int
+		gRk int // graph-channel rank; set after fusion, see below
 	}
 	byID := map[string]*ranked{}
 	var vectorHits, lexicalHits []anamnesia.SearchHit
@@ -190,14 +218,18 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 			map[string]any{"hits": HitDetails(lexicalHits)})
 	}
 
-	out := make([]anamnesia.SearchHit, 0, len(byID))
-	for _, r := range byID {
-		score := 0.0
+	// score computes a ranked entry's RRF total: one term per channel it
+	// appeared in (vector, lexical, graph), plus the decay-aware boost.
+	score := func(r *ranked) float64 {
+		s := 0.0
 		if r.vRk > 0 {
-			score += 1.0 / (q.RRFConst + float64(r.vRk))
+			s += 1.0 / (q.RRFConst + float64(r.vRk))
 		}
 		if r.lRk > 0 {
-			score += 1.0 / (q.RRFConst + float64(r.lRk))
+			s += 1.0 / (q.RRFConst + float64(r.lRk))
+		}
+		if r.gRk > 0 {
+			s += 1.0 / (q.RRFConst + float64(r.gRk))
 		}
 		// Decay-aware boost: experiences carry a precomputed relevance
 		// (recency + frequency × importance). Multiply rather than add
@@ -208,9 +240,14 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 			if rel <= 0 {
 				rel = 0.1
 			}
-			score *= rel
+			s *= rel
 		}
-		r.hit.Score = score
+		return s
+	}
+
+	out := make([]anamnesia.SearchHit, 0, len(byID))
+	for _, r := range byID {
+		r.hit.Score = score(r)
 		r.hit.VectorRank = r.vRk
 		r.hit.LexicalRank = r.lRk
 		out = append(out, r.hit)
@@ -220,6 +257,50 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 	if q.Trace != nil {
 		q.Trace.Step("fuse", fmt.Sprintf("RRF fused %d candidates", len(out)),
 			map[string]any{"ranked": rankedDetails(out)})
+	}
+
+	// Graph channel: walk out from the top-ranked fused hits' mentioned
+	// entities and fold in whatever their neighbours' sources contribute,
+	// as extra candidates (see graph.go). This runs after fusion, not
+	// before: seeds are hits vector/lexical search already trusts, so the
+	// graph adds reachable-and-related rows on top of that ranking rather
+	// than feeding into it.
+	//
+	// When the walk finds nothing — every install ships with an empty
+	// graph — `out` is left completely untouched: no recompute, no
+	// re-sort. TestAnEmptyGraphChangesNothing checks this directly: it
+	// calls graphExpand itself and asserts it returns nothing once
+	// EntitiesForSources finds no rows, which is the guard that must fire
+	// before any further graph query runs. (A re-sort of tied scores
+	// could in principle reorder rows too, since sort.Slice isn't stable
+	// and Go's map iteration order isn't fixed across calls — but that
+	// instability already exists in the fused-only sort above, with or
+	// without this channel, so it isn't this guard's job to fix and the
+	// test doesn't rely on it.)
+	graphHits, err := e.graphExpand(ctx, q, out)
+	if err != nil {
+		return nil, fmt.Errorf("graph expand: %w", err)
+	}
+	if len(graphHits) > 0 {
+		for i, h := range graphHits {
+			key := string(h.Domain) + ":" + h.ID().String()
+			r, ok := byID[key]
+			if !ok {
+				r = &ranked{hit: h}
+				byID[key] = r
+			}
+			if r.gRk == 0 {
+				r.gRk = i + 1
+			}
+		}
+		out = out[:0]
+		for _, r := range byID {
+			r.hit.Score = score(r)
+			r.hit.VectorRank = r.vRk
+			r.hit.LexicalRank = r.lRk
+			out = append(out, r.hit)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
 	}
 
 	// Take a candidate set 4× the requested K into the reranker so the
