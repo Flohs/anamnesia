@@ -39,18 +39,22 @@ func sameOrder(a, b []anamnesia.SearchHit) bool {
 // today has an empty graph. Results must be unaffected.
 //
 // This does NOT compare GraphSeedN:0 against GraphSeedN-unset the way the
-// original sketch for this test proposed. Search defaults any
-// non-positive GraphSeedN to 5, so those two values collapse to the exact
-// same Query and the comparison would be tautological — it would pass
-// even if graphExpand always fired. Instead this: (a) calls graphExpand
-// directly to prove its own empty-graph guard is what fires — sourced
-// facts with entity_mentions rows for neither source, so
-// EntitiesForSources genuinely runs and genuinely returns nothing, per
-// the brief's "step 2 returning no entities should end it before any
-// further query" — and (b) compares two different *positive* seed counts
-// (1 and the default 5) through the public Search API, which exercises a
-// genuinely different fused[:seedN] slice inside graphExpand while still
-// proving the channel is a no-op end to end.
+// original sketch for this test proposed. Search's zero value and unset
+// are the same Go value, and Search defaults exactly that to 5 (a
+// negative value is what actually disables the channel now — see the
+// Query.GraphSeedN doc), so GraphSeedN:0 and GraphSeedN-unset collapse to
+// the identical Query and the comparison would be tautological — it
+// would pass even if graphExpand always fired. Instead this: (a) calls
+// graphExpand directly with real sourced facts and an empty
+// entities/entity_mentions table, to show the walk genuinely finds
+// nothing rather than assuming it — real EntitiesForSources call, real
+// zero rows back, not the guard itself being load-bearing (ranging over
+// zero entities already makes zero further Neighbors calls on its own;
+// see the comment where that guard lives in graph.go) — and (b) compares
+// two different *positive* seed counts (1 and the default 5) through the
+// public Search API, which exercises a genuinely different
+// fused[:seedN] slice inside graphExpand while still proving the channel
+// is a no-op end to end.
 func TestAnEmptyGraphChangesNothing(t *testing.T) {
 	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
 	if dsn == "" {
