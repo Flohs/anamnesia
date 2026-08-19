@@ -63,27 +63,71 @@ the facts and experiences extracted from those sources.
 
 ## Part 1 — extraction
 
-A **second LLM pass**, behind a config flag, following the exact shape
-`ExtractCommitments` already established.
+> **Revised 2026-08-19, after segmented ingest landed.** This section
+> originally specified a second LLM pass per source, and said it "doubles
+> per-source model cost". That sentence was written when a long session was one
+> source. Segmentation makes it about twenty-five, so the same design would now
+> cost twenty-five extra calls per session rather than one.
+>
+> Worse than the cost: segments are cut **at topic boundaries**, and a graph
+> exists to connect topics. A pass over segment 5 sees only segment 5, so it can
+> only emit an edge between two entities that both appear there. The executor
+> can resolve an endpoint that already exists in the store, but the model has to
+> name it first, and it cannot name a subject it never saw. Per-segment
+> extraction would produce decent nodes and systematically impoverished edges —
+> which is the half that matters.
+>
+> The graph pass therefore runs **once per checkpoint, over the whole text**,
+> alongside the per-segment fact and experience passes.
+
+A **separate LLM pass**, behind a config flag, following the shape
+`ExtractCommitments` already established — but at a different granularity from
+the fact pass.
 
 ```
-source → gate → candidates ─┬─ pass 1  ADD_FACT / ADD_EXPERIENCE   (unchanged)
-                            └─ pass 2  ADD_ENTITY / ADD_EDGE       (graph.extract)
+checkpoint ─┬─ N segments  → N × pass 1  ADD_FACT / ADD_EXPERIENCE  (unchanged)
+            └─ whole text  → 1 × pass 2  ADD_ENTITY / ADD_EDGE      (graph.extract)
 ```
 
-A second call rather than four ops in one, because pass 1's prompt already
-carries a default-to-NOOP prior, an 8-operation cap and list-decomposition
-rules. Adding a second extraction task to it would have relationships compete
-with facts for the same budget, and a malformed graph response would take the
-facts down with it. Separate calls fail separately.
+A separate call rather than more ops in one, because pass 1's prompt already
+carries a default-to-NOOP prior, an operation cap and list-decomposition rules.
+Adding a second extraction task would have relationships compete with facts for
+the same budget, and a malformed graph response would take the facts down with
+it. Separate calls fail separately.
+
+### How a per-checkpoint pass reaches a per-source extractor
+
+The extractor works per source, so the whole-checkpoint text needs to arrive as
+a source of its own. **Source kind already drives extraction behaviour** —
+`bypassGate` and the liberal-prompt switch both branch on it (`extract.go:202`,
+`:261`) — so the graph pass uses the same lever rather than inventing one.
+
+The hook posts its N segments as it does today, and then posts the whole
+checkpoint once more with `kind = "claude-session-graph"`. The extractor sees
+that kind and runs **only** the graph pass for it, skipping fact and experience
+extraction entirely. Everything else is reused unchanged: the queue, the trace,
+the retry, the 7-day raw-content TTL, the `queues` event.
+
+The cost of that choice, stated: one extra source row per checkpoint, holding a
+duplicate of the checkpoint's text until the TTL purges it. Worth it against a
+new endpoint doing synchronous work inside the hook's 20s budget, which is the
+timeout problem segmented ingest just had to fix.
 
 New settings, declared in `settings.go` like everything else:
 
-- `graph.extract` (bool, default **false**) — run the second pass
-- `graph.max_ops` (int, default 12) — cap per source
+- `graph.extract` (bool, default **false**) — run the graph pass at all
+- `graph.max_ops` (int, default 12) — cap per checkpoint
 
-Default off. It doubles per-source model cost, and an install that never looks
-at the graph should not pay for it.
+Default off. It adds one model call per checkpoint, and an install that never
+looks at the graph should not pay for it.
+
+**The risk this inherits, named up front:** the whole-checkpoint pass has the
+same fixed output budget that lost novel facts before segmentation — one call,
+1024 completion tokens, asked to cover everything. For a long session it will
+capture the relationships it considers most salient and miss the rest. That is
+acceptable for a graph in a way it was not for facts, because a graph is a
+navigational aid rather than the record itself, but it must be measured rather
+than assumed.
 
 ### The operations
 
@@ -205,7 +249,12 @@ Then the eval, before and after, quoted in the commit.
 ## Open questions for review
 
 - Should `graph.extract` run on the liberal/benchmark prompt path too, or only
-  the default one?
-- Should entities be embedded on write (the column exists) even though this
-  design never searches them directly? It costs an embed call per new entity
-  and would enable entity-anchored search later.
+  the default one? **Provisional answer: only the default path.** Benchmark
+  streams (`bypassGateKinds`) are evaluation workloads measured on fact recall,
+  and a graph pass would add cost to a measurement it does not affect.
+- Should entities be embedded on write? **Yes.** `entities_embedding` (HNSW)
+  already exists and every dims migration rebuilds it, so the schema and index
+  cost is already being paid for a column that is permanently NULL. It also
+  improves this design rather than merely enabling something later: Part 2 seeds
+  the walk indirectly, via a hit's source and that source's entities, which is a
+  weak link. Embedding lets the walk seed directly from the query.
