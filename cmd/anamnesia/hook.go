@@ -441,7 +441,35 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 	if err := writeOffset(input.SessionID, input.TranscriptPath, next); err != nil {
 		return fmt.Sprintf("ingested %d segments, offset not saved", sent), err
 	}
-	return fmt.Sprintf("ingested %d segments", sent), nil
+
+	note := fmt.Sprintf("ingested %d segments", sent)
+	if hc.Bool("graph.extract") {
+		// One extra post over the whole checkpoint, after every segment has
+		// landed: a per-segment graph pass could only ever connect entities
+		// within the same segment, and the segments are already cut at
+		// topic boundaries. A failure here must not fail the checkpoint or
+		// hold back the offset already written above: the segments are the
+		// memory, this is an extra.
+		contents := make([]string, len(segs))
+		for i, seg := range segs {
+			contents[i] = seg.Content
+		}
+		payload := ingestPayload{
+			Kind:        "claude-session-graph",
+			Title:       title,
+			ExternalRef: fmt.Sprintf("%s#%d-graph", input.SessionID, offset),
+			Content:     strings.Join(contents, "\n"),
+			User:        hc.User(),
+			Project:     hc.Project(),
+		}
+		if at := segs[0].At; !at.IsZero() {
+			payload.OccurredAt = &at
+		}
+		if err := httpPost(ctx, hc, "/v1/ingest", payload, nil); err != nil {
+			note += "; graph source failed: " + err.Error()
+		}
+	}
+	return note, nil
 }
 
 // readTranscriptFrom renders the chat turns in path starting at offset,

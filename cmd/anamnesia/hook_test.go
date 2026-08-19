@@ -880,3 +880,73 @@ func TestCheckpointByteRangeStartsAtResumeOffsetNotZero(t *testing.T) {
 		t.Errorf("byte_range = %q, want it to start at the resume offset %d", gotRange, resumeOffset)
 	}
 }
+
+func TestGraphSourceIsPostedAfterTheSegments(t *testing.T) {
+	hc, got := captureIngests(t)
+	hc.values["graph.extract"] = "true"
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "g1"}, "claude-session"); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if len(*got) != 3 {
+		t.Fatalf("posted %d sources, want 2 segments plus 1 graph source", len(*got))
+	}
+	last := (*got)[2]
+	if last["kind"] != "claude-session-graph" {
+		t.Errorf("last source kind = %v, want the graph kind", last["kind"])
+	}
+	content, _ := last["content"].(string)
+	if !strings.Contains(content, "first subject") || !strings.Contains(content, "separate subject") {
+		t.Errorf("graph source does not carry the whole checkpoint:\n%s", content)
+	}
+}
+
+func TestNoGraphSourceWhenTheFlagIsOff(t *testing.T) {
+	hc, got := captureIngests(t)
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "g2"}, "claude-session"); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if len(*got) != 2 {
+		t.Errorf("posted %d sources with graph.extract off, want just the 2 segments", len(*got))
+	}
+}
+
+func TestAFailedGraphSourceDoesNotFailTheCheckpoint(t *testing.T) {
+	// The segments are the memory. The graph source is an extra, and losing
+	// it must not hold back the offset and re-send everything next time.
+	var posts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts++
+		if posts == 3 { // the graph source, after two segments
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"source_id":"6f1c1f7a-0a1a-4a7a-9a7a-1a7a1a7a1a7a","queued":true}`))
+	}))
+	t.Cleanup(srv.Close)
+	hc := testHostConfig(t)
+	hc.values["server.url"] = srv.URL
+	hc.values["graph.extract"] = "true"
+
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "g3"}, "claude-session"); err != nil {
+		t.Errorf("a failed graph source failed the whole checkpoint: %v", err)
+	}
+	if off := readOffset("g3", path); off == 0 {
+		t.Error("the offset was held back by a failed graph source; the segments all landed")
+	}
+}
