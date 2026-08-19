@@ -183,3 +183,102 @@ func TestRunGraphAgainstRealStore(t *testing.T) {
 		t.Errorf("an ambiguous endpoint produced an edge anyway: %v", edges)
 	}
 }
+
+// TestGraphBridgeConnectsSegmentSourcesToEntities proves the property that
+// was false before the fix in
+// docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md: given a
+// checkpoint whose segments produced facts, after runGraph executes,
+// EntitiesForSources on those SEGMENT source ids — not the graph source's
+// own id — returns the entities the graph pass found. That is exactly the
+// join graphExpand relies on to seed a walk from a real search hit, which
+// always carries a segment source id, never the graph source's.
+//
+// The graph source's metadata is round-tripped through the store via
+// GetSource before runGraph sees it, the way the extractor's worker loop
+// actually loads a pending source — so segment_source_ids arrives as
+// []any of strings, not the []string a test could set up and forget to
+// convert.
+func TestGraphBridgeConnectsSegmentSourcesToEntities(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	user := "graph-bridge-test-" + uuid.NewString()[:8]
+	uid, err := st.EnsureUser(ctx, user)
+	if err != nil {
+		t.Fatalf("ensure user: %v", err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), user) })
+	scope := anamnesia.Scope{UserID: uid}
+
+	// Two segments, the way a real checkpoint posts one source per topic.
+	// Each produces a fact — standing in for the memory a real search hit
+	// returns, carrying that segment's source_id.
+	newSegment := func(content string) *anamnesia.Source {
+		seg := &anamnesia.Source{Scope: scope, Kind: "claude-session", OccurredAt: time.Now().UTC(), RawContent: content}
+		if err := st.InsertSource(ctx, seg); err != nil {
+			t.Fatalf("insert segment: %v", err)
+		}
+		return seg
+	}
+	seg1 := newSegment("I just switched the stock-reconciliation service to read from the Rotterdam warehouse nightly.")
+	seg2 := newSegment("I just confirmed reconciliation now reports its results to the Rotterdam warehouse team.")
+
+	factExtractor := &Extractor{Store: st, LLM: &fakeLLM{Ops: []Operation{
+		{Op: "ADD_FACT", Key: "reconciliation.source", Value: json.RawMessage(`"rotterdam warehouse"`)},
+	}}}
+	for _, seg := range []*anamnesia.Source{seg1, seg2} {
+		n, err := factExtractor.Run(ctx, seg)
+		if err != nil {
+			t.Fatalf("run segment %s: %v", seg.ID, err)
+		}
+		if n == 0 {
+			t.Fatalf("segment %s produced no facts; test setup is invalid", seg.ID)
+		}
+	}
+
+	// The graph source, carrying the segment ids the hook fix collects —
+	// mirroring what doCheckpoint posts once per checkpoint, after every
+	// segment has landed.
+	graphSrc := &anamnesia.Source{
+		Scope: scope, Kind: graphSourceKind, OccurredAt: time.Now().UTC(),
+		RawContent: seg1.RawContent + "\n" + seg2.RawContent,
+		Metadata: map[string]any{
+			"segment_source_ids": []string{seg1.ID.String(), seg2.ID.String()},
+		},
+	}
+	if err := st.InsertSource(ctx, graphSrc); err != nil {
+		t.Fatalf("insert graph source: %v", err)
+	}
+	loaded, err := st.GetSource(ctx, graphSrc.ID)
+	if err != nil {
+		t.Fatalf("reload graph source: %v", err)
+	}
+
+	graphExtractor := &Extractor{Cfg: Config{ExtractGraph: true}, Store: st, LLM: &fakeLLM{RawOps: marshalGraphOps(t, []graphOperation{
+		{Op: "ADD_ENTITY", Kind: "service", Name: "stock-reconciliation"},
+		{Op: "ADD_ENTITY", Kind: "site", Name: "Rotterdam warehouse"},
+		{Op: "ADD_EDGE", From: "stock-reconciliation", To: "Rotterdam warehouse", Kind: "reads_from", Trust: 0.8},
+	})}}
+	if _, err := graphExtractor.Run(ctx, loaded); err != nil {
+		t.Fatalf("run graph pass: %v", err)
+	}
+
+	mentioned, err := st.EntitiesForSources(ctx, []uuid.UUID{seg1.ID, seg2.ID})
+	if err != nil {
+		t.Fatalf("entities for sources: %v", err)
+	}
+	if len(mentioned) != 2 {
+		t.Fatalf("EntitiesForSources(segment ids) = %d entities, want 2 — this is the exact join graphExpand relies on to seed a walk from a search hit", len(mentioned))
+	}
+}

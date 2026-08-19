@@ -92,6 +92,53 @@ func TestEdgeWithAnUnresolvableEndpointIsDropped(t *testing.T) {
 	}
 }
 
+// TestMalformedSegmentSourceIDsDoNotBreakTheGraphPass: a graph source's
+// metadata may be absent (an older checkpoint) or shaped unexpectedly (a
+// source posted by something other than doCheckpoint). Either way runGraph
+// must finish without error, not panic or fail the pass. Every case here
+// keeps the LLM response to NOOP, so runGraph never reaches the store —
+// the property under test is purely that reading the metadata is safe.
+func TestMalformedSegmentSourceIDsDoNotBreakTheGraphPass(t *testing.T) {
+	cases := map[string]map[string]any{
+		"no metadata at all":       nil,
+		"metadata without the key": {"other": "value"},
+		"not a list":               {"segment_source_ids": "6f1c1f7a-0a1a-4a7a-9a7a-1a7a1a7a1a7a"},
+		"list of non-strings":      {"segment_source_ids": []any{42, true}},
+		"list of non-uuid strings": {"segment_source_ids": []any{"not-a-uuid"}},
+	}
+	for name, meta := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			fake := &fakeLLM{Ops: []Operation{{Op: "NOOP"}}}
+			ex := &Extractor{Cfg: Config{ExtractGraph: true}, LLM: fake}
+			src := &anamnesia.Source{
+				Scope: anamnesia.Scope{UserID: uuid.New()}, Kind: graphSourceKind,
+				OccurredAt: time.Now().UTC(),
+				RawContent: "Some content long enough to clear the min-content gate.",
+				Metadata:   meta,
+			}
+			if _, err := ex.Run(ctx, src); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+		})
+	}
+}
+
+// TestSegmentSourceIDsFromMetadataParsesValidIDs is the companion to the
+// tolerance test above: given well-formed metadata (the shape doCheckpoint
+// actually sends, JSON round-tripped through the store so string entries
+// arrive as []any), every id parses.
+func TestSegmentSourceIDsFromMetadataParsesValidIDs(t *testing.T) {
+	id1, id2 := uuid.New(), uuid.New()
+	ex := &Extractor{}
+	got := ex.segmentSourceIDsFromMetadata(map[string]any{
+		"segment_source_ids": []any{id1.String(), id2.String()},
+	})
+	if len(got) != 2 || got[0] != id1 || got[1] != id2 {
+		t.Errorf("segmentSourceIDsFromMetadata = %v, want [%s %s]", got, id1, id2)
+	}
+}
+
 func TestEntityNamesAreNormalisedBeforeUpsert(t *testing.T) {
 	// entities_identity is unique on (scope, kind, name) but dedupes on the
 	// LITERAL name, so normalisation has to happen before the store call or

@@ -257,9 +257,18 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 		edgesCreated++
 	}
 
+	// Mentions must be recorded against the checkpoint's segment sources,
+	// not only the graph source itself: those are the sources a search
+	// hit actually carries, and EntitiesForSources joins on source_id
+	// exactly (store/graph.go). The graph source keeps a mention too, for
+	// provenance, but it must not be the only one — see
+	// docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md.
+	mentionSources := append([]uuid.UUID{src.ID}, e.segmentSourceIDsFromMetadata(src.Metadata)...)
 	for _, id := range known {
-		if err := e.Store.RecordMention(ctx, id, src.ID); err != nil && e.Log != nil {
-			e.Log.Warn("extractor: record mention failed", "err", err)
+		for _, sourceID := range mentionSources {
+			if err := e.Store.RecordMention(ctx, id, sourceID); err != nil && e.Log != nil {
+				e.Log.Warn("extractor: record mention failed", "err", err)
+			}
 		}
 	}
 
@@ -281,6 +290,45 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 			len(upserted), edgesCreated, humanBytes(len(content)), src.Kind))
 	}
 	return executed, nil
+}
+
+// segmentSourceIDsFromMetadata reads the checkpoint's segment source ids
+// off the graph source's metadata (set by doCheckpoint in cmd/anamnesia/
+// hook.go). Tolerant by design: an older checkpoint carries no such key,
+// and a graph source posted by something else may not shape it the way
+// this expects — either way runGraph must finish with whatever it can
+// resolve, not fail the pass over it.
+func (e *Extractor) segmentSourceIDsFromMetadata(meta map[string]any) []uuid.UUID {
+	raw, ok := meta["segment_source_ids"]
+	if !ok {
+		return nil
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		if e.Log != nil {
+			e.Log.Warn("extractor: segment_source_ids metadata has an unexpected shape", "type", fmt.Sprintf("%T", raw))
+		}
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(list))
+	for _, v := range list {
+		s, ok := v.(string)
+		if !ok {
+			if e.Log != nil {
+				e.Log.Warn("extractor: segment_source_ids entry is not a string", "type", fmt.Sprintf("%T", v))
+			}
+			continue
+		}
+		id, err := uuid.Parse(s)
+		if err != nil {
+			if e.Log != nil {
+				e.Log.Warn("extractor: segment_source_ids entry is not a uuid", "value", s, "err", err)
+			}
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // findValidEdge looks for a currently-valid edge with the same

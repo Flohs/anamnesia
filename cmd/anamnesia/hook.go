@@ -397,6 +397,12 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 	sent := 0
 	var lastEnd int64
 	segStart := offset
+	// segmentSourceIDs collects each segment's source id as it lands, so
+	// the graph source posted below can carry them: it is the only thing
+	// that lets a later hit on a segment seed a walk into the entities
+	// that segment's checkpoint mentioned. See
+	// docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md.
+	segmentSourceIDs := make([]string, 0, len(segs))
 	for i, seg := range segs {
 		at := seg.At
 		payload := ingestPayload{
@@ -419,7 +425,8 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 		if !at.IsZero() {
 			payload.OccurredAt = &at
 		}
-		if err := httpPost(ctx, hc, "/v1/ingest", payload, nil); err != nil {
+		var resp ingestResponse
+		if err := httpPost(ctx, hc, "/v1/ingest", payload, &resp); err != nil {
 			// Advance the offset to the last segment that actually landed,
 			// so a retry re-sends only what failed rather than everything
 			// again on top of a growing transcript: without this, a
@@ -433,6 +440,9 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 				}
 			}
 			return fmt.Sprintf("ingested %d of %d segments", sent, len(segs)), err
+		}
+		if resp.SourceID != "" {
+			segmentSourceIDs = append(segmentSourceIDs, resp.SourceID)
 		}
 		sent++
 		lastEnd = seg.EndOffset
@@ -461,6 +471,9 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 			Content:     strings.Join(contents, "\n"),
 			User:        hc.User(),
 			Project:     hc.Project(),
+			Metadata: map[string]any{
+				"segment_source_ids": segmentSourceIDs,
+			},
 		}
 		if at := segs[0].At; !at.IsZero() {
 			payload.OccurredAt = &at
@@ -672,6 +685,13 @@ type ingestPayload struct {
 	User         string         `json:"user,omitempty"`
 	Project      string         `json:"project,omitempty"`
 	OccurredAt   *time.Time     `json:"occurred_at,omitempty"`
+}
+
+// ingestResponse mirrors the part of httpapi.IngestResponse this file
+// needs: the source id, so a checkpoint can tell the graph source which
+// segment sources it belongs to.
+type ingestResponse struct {
+	SourceID string `json:"source_id"`
 }
 
 // ─── transcript offsets ──────────────────────────────────────────────
