@@ -35,10 +35,38 @@ const (
 	drainTimeout = 10 * time.Minute
 )
 
+// corpusStats is what the scope actually became after extraction, decoded
+// from the subset of /v1/stats this needs. It exists because a drained queue
+// does not mean a whole corpus: MarkSkipped and MarkFailed both move a source
+// out of 'pending', so a run where sources were gated out or errored drains
+// cleanly and is then scored against a corpus smaller than the one ingested.
+type corpusStats struct {
+	SourcesByState map[string]int `json:"sources_by_state"`
+	Facts          int            `json:"facts"`
+	Experiences    int            `json:"experiences"`
+}
+
+// ingested is how many sources reached the store, whatever became of them.
+func (c corpusStats) ingested() int {
+	n := 0
+	for _, v := range c.SourcesByState {
+		n += v
+	}
+	return n
+}
+
+// barren is how many sources produced no rows: gated out by the surprise
+// gate, or failed outright. Both are terminal, and neither is visible in a
+// queue depth of zero.
+func (c corpusStats) barren() int {
+	return c.SourcesByState["skipped"] + c.SourcesByState["failed"]
+}
+
 type evalReport struct {
 	At        string         `json:"at"`
 	K         int            `json:"k"`
 	Queries   int            `json:"queries"`
+	Corpus    corpusStats    `json:"corpus"`
 	Aggregate aggregateScore `json:"aggregate"`
 	PerQuery  []queryScore   `json:"per_query"`
 }
@@ -87,6 +115,14 @@ func runEvalPass(ctx context.Context, hc *hostConfig, sources []evalSource, quer
 	if err := c.waitForDrain(ctx, drainTimeout); err != nil {
 		return evalReport{}, err
 	}
+	// Read what the corpus actually became before querying it. A drained
+	// queue only says nothing is pending, not that every source produced
+	// rows, and that difference is what makes two runs of one corpus score
+	// differently.
+	corpus, err := c.corpusStats(ctx)
+	if err != nil {
+		return evalReport{}, fmt.Errorf("read corpus stats: %w", err)
+	}
 
 	ks := evalMetricKs(k)
 	scores := make([]queryScore, 0, len(queries))
@@ -116,6 +152,7 @@ func runEvalPass(ctx context.Context, hc *hostConfig, sources []evalSource, quer
 
 	return evalReport{
 		K:         k,
+		Corpus:    corpus,
 		Queries:   len(queries),
 		Aggregate: aggregate(scores, ks),
 		PerQuery:  scores,
@@ -139,6 +176,48 @@ type evalClient struct {
 	base  string
 	token string
 	hc    *http.Client
+}
+
+// get reads a JSON body from the server.
+func (c *evalClient) get(ctx context.Context, path string, into any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+path, nil)
+	if err != nil {
+		return err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
+		return fmt.Errorf("%s: %s: %s", path, resp.Status, bytes.TrimSpace(msg))
+	}
+	return json.NewDecoder(resp.Body).Decode(into)
+}
+
+// corpusStats reads /v1/stats for the eval scope. Only a subset of that
+// response is decoded: the eval is an HTTP client like any other and has no
+// business depending on the server's full stats shape.
+func (c *evalClient) corpusStats(ctx context.Context) (corpusStats, error) {
+	var body struct {
+		Totals struct {
+			Facts       int `json:"facts"`
+			Experiences int `json:"experiences"`
+		} `json:"totals"`
+		SourcesByState map[string]int `json:"sources_by_state"`
+	}
+	if err := c.get(ctx, "/v1/stats?user="+evalUser+"&project="+evalProject, &body); err != nil {
+		return corpusStats{}, err
+	}
+	return corpusStats{
+		SourcesByState: body.SourcesByState,
+		Facts:          body.Totals.Facts,
+		Experiences:    body.Totals.Experiences,
+	}, nil
 }
 
 func (c *evalClient) post(ctx context.Context, path string, body, into any) error {
@@ -394,6 +473,20 @@ func renderReport(w io.Writer, r evalReport) {
 	fmt.Fprintf(w, "\n  MRR        %.3f\n", a.MRR)
 	fmt.Fprintf(w, "  latency    p50 %d ms, p95 %d ms\n", a.P50MS, a.P95MS)
 	fmt.Fprintf(w, "  found nothing: %d of %d\n", a.ZeroHit, a.Queries)
+
+	if n := r.Corpus.ingested(); n > 0 {
+		st := r.Corpus.SourcesByState
+		fmt.Fprintf(w, "\n  corpus     %d of %d sources extracted, skipped %d, failed %d\n",
+			st["done"], n, st["skipped"], st["failed"])
+		fmt.Fprintf(w, "             %d facts, %d experiences\n",
+			r.Corpus.Facts, r.Corpus.Experiences)
+		// Two runs of the same corpus can score differently because they
+		// extracted differently. Without this, that is invisible and the
+		// difference looks like a retrieval change.
+		if b := r.Corpus.barren(); b > 0 {
+			fmt.Fprintf(w, "  ! %d of %d sources produced nothing, so this run scored a smaller corpus than it ingested\n", b, n)
+		}
+	}
 	if a.ZeroHit > 0 {
 		fmt.Fprintln(w, "\n  queries that returned nothing relevant:")
 		for _, q := range r.PerQuery {

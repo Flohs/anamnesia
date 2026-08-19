@@ -196,3 +196,74 @@ func TestJSONRunSendsOnlyTheReportToStdout(t *testing.T) {
 		t.Error("the baseline comparison did not reach stderr")
 	}
 }
+
+// A run is scored against whatever extraction actually produced, which is not
+// necessarily what was ingested: MarkSkipped and MarkFailed both move a source
+// out of 'pending', so the drain completes and the shortfall is invisible.
+func TestReportShowsWhatTheCorpusActuallyBecame(t *testing.T) {
+	r := evalReport{
+		Queries: 25,
+		Corpus: corpusStats{
+			SourcesByState: map[string]int{"done": 34, "skipped": 4, "failed": 2},
+			Facts:          16,
+			Experiences:    30,
+		},
+		Aggregate: aggregateScore{Queries: 25, RecallAt: map[int]float64{5: 0.7}, PrecisionAt: map[int]float64{5: 0.2}},
+	}
+	var sb strings.Builder
+	renderReport(&sb, r)
+	out := sb.String()
+	for _, want := range []string{"34", "skipped 4", "failed 2", "16 facts", "30 experiences"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report does not show %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestReportWarnsWhenSourcesProducedNothing(t *testing.T) {
+	// Six of forty sources produced no rows. The scored corpus is smaller than
+	// the ingested one, and a reader comparing two runs has to be told.
+	r := evalReport{
+		Queries: 25,
+		Corpus: corpusStats{
+			SourcesByState: map[string]int{"done": 34, "skipped": 4, "failed": 2},
+			Facts:          16, Experiences: 30,
+		},
+		Aggregate: aggregateScore{Queries: 25},
+	}
+	var sb strings.Builder
+	renderReport(&sb, r)
+	if !strings.Contains(sb.String(), "6 of 40") {
+		t.Errorf("report does not warn that 6 of 40 sources produced nothing:\n%s", sb.String())
+	}
+}
+
+func TestReportIsQuietWhenEverySourceExtracted(t *testing.T) {
+	r := evalReport{
+		Queries: 25,
+		Corpus: corpusStats{
+			SourcesByState: map[string]int{"done": 40},
+			Facts:          22, Experiences: 41,
+		},
+		Aggregate: aggregateScore{Queries: 25},
+	}
+	var sb strings.Builder
+	renderReport(&sb, r)
+	if strings.Contains(sb.String(), "produced nothing") {
+		t.Errorf("report warns when nothing was lost:\n%s", sb.String())
+	}
+}
+
+func TestCorpusShortfallCounts(t *testing.T) {
+	c := corpusStats{SourcesByState: map[string]int{"done": 34, "skipped": 4, "failed": 2}}
+	if got, want := c.ingested(), 40; got != want {
+		t.Errorf("ingested = %d, want %d", got, want)
+	}
+	if got, want := c.barren(), 6; got != want {
+		t.Errorf("barren = %d, want %d (skipped + failed)", got, want)
+	}
+	empty := corpusStats{}
+	if empty.ingested() != 0 || empty.barren() != 0 {
+		t.Error("an empty corpusStats must report zeroes, not panic")
+	}
+}
