@@ -118,9 +118,13 @@ were rebuilt around being verifiable.
 ### Added
 
 - **A session checkpoint is cut into segments instead of sent as one blob.** The
-  extractor gets one LLM call per source with a fixed budget of eight
-  operations, so a long session spent that budget on whatever it had said most
-  often and never reached anything else. Measured on a 32.5 KB transcript of 25
+  extractor gets one LLM call per source with a fixed output budget — 1024
+  completion tokens, capped at eight operations — so a long session had one
+  call in which to cover everything it contained, and the model spent it on
+  whatever the session had said most often. Novel material at the end was never
+  reached. (The operation cap is not what bound it: the unsegmented run below
+  produced seven operations against a cap of eight. The completion budget and
+  the model's own prioritisation within a single call are what bound it.) Measured on a 32.5 KB transcript of 25
   subjects — 20 restating already-known facts, 5 genuinely novel — ingested both
   ways against the same primed store:
 
@@ -146,15 +150,24 @@ were rebuilt around being verifiable.
   that landed, rather than leaving it untouched. Leaving it meant the next
   checkpoint re-read the same range plus whatever had accrued since, so the
   range grew, the deadline arrived sooner, and memory silently stopped for that
-  session. Re-sending a segment is cheap; skipping one is not.
+  session. Re-sending a segment is cheap; skipping one is not. On `SessionEnd`
+  there is no next checkpoint, so this turns "lose the whole session" into
+  "lose the tail after the failure" — an improvement, not a guarantee.
 
-  **The cost, stated plainly:** segmenting means each piece is judged
-  independently, so near-duplicates get through where one blob was judged once.
-  In the measurement above, 19 of 20 restatement segments produced their own
-  near-duplicate rows — 33 facts and 10 experiences for what is substantively 8
-  pieces of information. Consolidation and decay exist to compress that, and
-  nothing recovers content that was never extracted, so the trade is worth it —
-  but a fact count that climbs faster than before is expected, not a bug.
+  **The cost, stated plainly.** Two of them. Twenty-five sources means
+  twenty-five extraction calls, twenty-five embeddings and twenty-five gate
+  lookups where there was one — the work drains over worker ticks rather than
+  arriving as a burst, but the total is N times larger and it reaches your model
+  bill. And judging each piece independently lets near-duplicates through where
+  one blob was judged once: in the measurement above, 19 of 20 restatement
+  segments produced their own rows, 33 facts and 10 experiences for what is
+  substantively 8 pieces of information.
+
+  Neither is free, and the trade is still worth it — consolidation and decay
+  exist to compress duplicates, and nothing recovers content that was never
+  extracted. But "segmentation recovers novel content" is the earned claim;
+  "segmentation is free" is not. A fact count that climbs faster than before is
+  expected, not a bug.
 
 - **`anamnesia eval` measures retrieval instead of arguing about it.** Every
   retrieval decision in the tree — RRF over score normalisation, the fusion

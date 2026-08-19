@@ -44,11 +44,19 @@ being asked "is this *day* a duplicate?", a question it cannot answer.
 > almost always contain. So the gate is real but close to inert on this
 > content, and it is not what lost the 329 KB session.
 
-**`MaxOps` is 8, and this is the mechanism that actually bites.** The 44 KB
-source returned exactly 8, which is a ceiling being hit rather than a need being
-met. A day of work can contribute at most eight memories no matter what happened
-in it — and measurement showed the budget is spent on whatever is most
-repeated, so novel content at the end of a long session is never reached at all.
+**One call with a fixed output budget, and this is the mechanism that actually
+bites.** Each source gets one LLM call with `maxTok = 1024` on the completion
+and `MaxOps = 8` on the result. The 44 KB source returned exactly 8, a ceiling
+being hit rather than a need being met.
+
+> **Corrected 2026-08-19.** A first pass at this section blamed the operation
+> cap alone. The measurement below contradicts that: the unsegmented run
+> produced **7** operations against a cap of 8, so the cap was never reached.
+> What binds is the 1024-token completion budget together with the model's own
+> prioritisation inside a single call — asked to cover 25 subjects at once, it
+> spends the budget on what the transcript says most often. Naming the cap was a
+> second unsupported inference in a document already carrying one correction,
+> which is worth recording as its own lesson.
 
 > **Measured 2026-08-19.** A 32.5 KB transcript of 25 subjects, 20 of them
 > restating already-known facts and 5 genuinely novel, ingested both ways
