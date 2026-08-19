@@ -117,6 +117,32 @@ were rebuilt around being verifiable.
 
 ### Added
 
+- **`anamnesia eval` measures retrieval instead of arguing about it.** Every
+  retrieval decision in the tree — RRF over score normalisation, the fusion
+  constant, the candidate widths, reranking the top 4×K — rested on reasoning
+  rather than a number, and a change could not be shown to have helped. The
+  command ingests a committed 40-source fixture corpus through the real ingest
+  path under a throwaway scope, waits for extraction and embedding to drain,
+  runs 25 labelled queries, and reports recall@k, precision@k, MRR, latency and
+  — the number that matters most for an agent — how many queries found nothing
+  at all. The scope is deleted afterwards, and the command refuses to run if it
+  already exists rather than deleting a user it did not create.
+
+  Relevance is labelled per source rather than per row, so changing the
+  extraction prompt does not invalidate the gold set. Precision divides by what
+  was actually returned rather than by k, because it exists to measure noise
+  injected into an agent's context, and dividing by k scores "returned three
+  hits, all relevant" the same as "returned ten, three relevant".
+
+  **`--baseline` is not yet trustworthy, and should not be used as a gate.**
+  Two runs over the identical corpus and the same code returned recall@5 of
+  0.700 and 0.880, against a regression tolerance of 0.02. Extraction is a model
+  call per source, so each run builds a different corpus from the same input;
+  that variance has not yet been isolated from the reranker or from the fact
+  that a different corpus produces a different ANN index. The recorded rc7
+  baseline is a record of one run, not a threshold. Comparing two runs by hand
+  works; automating a pass/fail on it does not.
+
 - **The server can now say what it is doing, and why.** It kept no record of
   its own reasoning: which loop ran last, what the extractor decided about a
   checkpoint, why a retrieval returned what it did. An install that was
