@@ -88,6 +88,12 @@ var stopCmd = &cobra.Command{
 	},
 }
 
+// adoptContainer lets an operator claim an unlabelled Postgres container —
+// one created before containers recorded which install owns them. It permits
+// the password reconcile for that case and nothing else; a container whose
+// label names a different install is refused regardless.
+var adoptContainer bool
+
 var restartCmd = &cobra.Command{
 	Use:   "restart",
 	Short: "Restart the server",
@@ -124,6 +130,10 @@ func init() {
 	logsCmd.Flags().BoolVarP(&logsFollowFlag, "follow", "f", false, "keep printing new lines")
 	logsCmd.Flags().IntVarP(&logsLinesFlag, "lines", "n", 50, "how many trailing lines to print")
 	statusCmd.Flags().BoolVar(&statusJSONFlag, "json", false, "print machine-readable status")
+	for _, c := range []*cobra.Command{startCmd, restartCmd} {
+		c.Flags().BoolVar(&adoptContainer, "adopt", false,
+			"claim a postgres container created before installs recorded ownership")
+	}
 }
 
 // requireConfigured fails early when setup has never run, rather than
