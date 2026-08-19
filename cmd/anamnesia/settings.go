@@ -51,6 +51,10 @@ type setting struct {
 	// writes. That file is committed with the repository, which is why a
 	// kSecret setting can never be one of these.
 	Project bool
+	// Zeroable lets a numeric setting be set to 0, where 0 means "off"
+	// rather than "unset". Most numeric settings are sizes or intervals
+	// that cannot be zero, so this is opt-in per setting.
+	Zeroable bool
 }
 
 func (s setting) section() string { return strings.SplitN(s.Key, ".", 2)[0] }
@@ -162,9 +166,9 @@ var settings = []setting{
 		Doc: "Also record open obligations (\"I'll send X by Friday\") in the commitments ledger."},
 
 	// ─── ingest ──────────────────────────────────────────────────────
-	{Key: "ingest.segment_gap", Kind: kDuration, Def: "20m", Env: "",
+	{Key: "ingest.segment_gap", Kind: kDuration, Def: "20m", Env: "", Zeroable: true,
 		Doc: "A pause longer than this starts a new segment when a checkpoint is cut up, so the surprise gate judges one subject at a time rather than a whole session. Set to 0 to send each checkpoint as a single source, which is what earlier versions did."},
-	{Key: "ingest.segment_max_bytes", Kind: kInt, Def: "32768", Env: "",
+	{Key: "ingest.segment_max_bytes", Kind: kInt, Def: "32768", Env: "", Zeroable: true,
 		Doc: "A segment is cut when it grows past this, because a long unbroken session is still not one idea. Set to 0 to disable the size cut."},
 
 	// ─── decay ───────────────────────────────────────────────────────
@@ -230,7 +234,7 @@ func (s setting) validate(raw string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("%s must be a number, got %q", s.Key, raw)
 		}
-		if n <= 0 {
+		if n < 0 || (n == 0 && !s.Zeroable) {
 			return "", fmt.Errorf("%s must be positive, got %d", s.Key, n)
 		}
 		return strconv.Itoa(n), nil
@@ -251,7 +255,7 @@ func (s setting) validate(raw string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("%s must be a duration like 15s, 1m or 24h, got %q", s.Key, raw)
 		}
-		if d <= 0 {
+		if d < 0 || (d == 0 && !s.Zeroable) {
 			return "", fmt.Errorf("%s must be positive, got %q", s.Key, raw)
 		}
 		return v, nil

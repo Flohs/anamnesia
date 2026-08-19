@@ -604,3 +604,49 @@ func TestStopWaitsLongerThanTheServerMayTake(t *testing.T) {
 		}
 	}
 }
+
+// TestZeroableSettingsAcceptZero closes the loop the reversibility
+// guarantee depends on: the ingest settings' docs promise "set to 0 to
+// disable", which only holds if `config set` followed by a reload actually
+// accepts 0, not only a direct call to readTranscriptFrom.
+func TestZeroableSettingsAcceptZero(t *testing.T) {
+	home := isolatedHome(t)
+	path := filepath.Join(home, "config.toml")
+
+	if err := setConfigValue(path, "ingest.segment_gap", "0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := setConfigValue(path, "ingest.segment_max_bytes", "0"); err != nil {
+		t.Fatal(err)
+	}
+	hc, err := loadHostConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hc.Dur("ingest.segment_gap"); got != 0 {
+		t.Errorf("ingest.segment_gap = %v, want 0", got)
+	}
+	if got := hc.Int("ingest.segment_max_bytes"); got != 0 {
+		t.Errorf("ingest.segment_max_bytes = %d, want 0", got)
+	}
+}
+
+// TestNonZeroableSettingStillRejectsZero guards against Zeroable quietly
+// loosening validation for every numeric setting instead of just the two
+// it's meant for.
+func TestNonZeroableSettingStillRejectsZero(t *testing.T) {
+	if _, err := settingByKey["worker.extract_every"].validate("0s"); err == nil {
+		t.Error("worker.extract_every accepted 0, but is not Zeroable")
+	}
+}
+
+// TestZeroableSettingsStillRejectNegative: 0 means off; a negative value is
+// never valid, Zeroable or not.
+func TestZeroableSettingsStillRejectNegative(t *testing.T) {
+	if _, err := settingByKey["ingest.segment_gap"].validate("-5m"); err == nil {
+		t.Error("ingest.segment_gap accepted a negative duration")
+	}
+	if _, err := settingByKey["ingest.segment_max_bytes"].validate("-100"); err == nil {
+		t.Error("ingest.segment_max_bytes accepted a negative number")
+	}
+}
