@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -532,5 +535,103 @@ func TestAShortTrailingSegmentMergesBackwards(t *testing.T) {
 	}
 	if !strings.Contains(segs[0].Content, "ok") {
 		t.Errorf("the short tail was dropped instead of merged:\n%s", segs[0].Content)
+	}
+}
+
+// captureIngests stands up a server that records every ingest body, and
+// points a host config at it.
+func captureIngests(t *testing.T) (*hostConfig, *[]map[string]any) {
+	t.Helper()
+	var got []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		got = append(got, body)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"source_id":"6f1c1f7a-0a1a-4a7a-9a7a-1a7a1a7a1a7a","queued":true}`))
+	}))
+	t.Cleanup(srv.Close)
+	hc := testHostConfig(t)
+	hc.values["server.url"] = srv.URL
+	return hc, &got
+}
+
+func TestCheckpointPostsOneSourcePerSegment(t *testing.T) {
+	hc, got := captureIngests(t)
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "s1"}, "claude-session"); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if len(*got) != 2 {
+		t.Fatalf("posted %d sources, want one per segment", len(*got))
+	}
+	if (*got)[0]["occurred_at"] == nil {
+		t.Error("segment posted without an occurred_at; decay reads it")
+	}
+	first, _ := (*got)[0]["external_ref"].(string)
+	second, _ := (*got)[1]["external_ref"].(string)
+	if first == second || !strings.HasPrefix(first, "s1") {
+		t.Errorf("external_refs = %q, %q; want the session id with distinct suffixes", first, second)
+	}
+}
+
+func TestCheckpointAdvancesTheOffsetOnlyWhenEverySegmentLands(t *testing.T) {
+	// Losing a segment is worse than sending one twice: the gate deduplicates
+	// a repeat, and nothing recovers a segment that was skipped.
+	var posts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts++
+		if posts == 2 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"source_id":"6f1c1f7a-0a1a-4a7a-9a7a-1a7a1a7a1a7a","queued":true}`))
+	}))
+	t.Cleanup(srv.Close)
+	hc := testHostConfig(t)
+	hc.values["server.url"] = srv.URL
+
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "s2"}, "claude-session"); err == nil {
+		t.Fatal("checkpoint reported success despite a failed segment")
+	}
+	if off := readOffset("s2", path); off != 0 {
+		t.Errorf("offset advanced to %d after a failed segment; the range must be re-sent", off)
+	}
+}
+
+// TestSegmentWithNoTimestampOmitsOccurredAt: a segment whose first record
+// carries no parsable timestamp has a zero time.Time as its At. Posting
+// that as occurred_at would record the memory as having happened in year
+// 1, and decay reads occurred_at, so it would be treated as infinitely
+// stale. It must be left out of the payload entirely rather than sent as
+// a zero time.
+func TestSegmentWithNoTimestampOmitsOccurredAt(t *testing.T) {
+	hc, got := captureIngests(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	body := `{"type":"user","message":{"role":"user","content":"a question with no timestamp on its record at all"}}
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "s3"}, "claude-session"); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if len(*got) != 1 {
+		t.Fatalf("posted %d sources, want 1", len(*got))
+	}
+	if _, present := (*got)[0]["occurred_at"]; present {
+		t.Errorf("occurred_at present with no source timestamp: %v", (*got)[0]["occurred_at"])
 	}
 }

@@ -373,46 +373,57 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 		return "no transcript path", nil
 	}
 	offset := readOffset(input.SessionID, input.TranscriptPath)
-	segs, next, err := readTranscriptFrom(input.TranscriptPath, offset, hc.Dur("ingest.segment_gap"), hc.Int("ingest.segment_max_bytes"))
+	segs, next, err := readTranscriptFrom(input.TranscriptPath, offset,
+		hc.Dur("ingest.segment_gap"), hc.Int("ingest.segment_max_bytes"))
 	if err != nil {
 		return "", err
 	}
-	parts := make([]string, len(segs))
-	for i, s := range segs {
-		parts[i] = s.Content
-	}
-	content := strings.Join(parts, "\n")
-	if strings.TrimSpace(content) == "" {
+	if len(segs) == 0 {
 		// Still record the offset: a checkpoint over tool-only turns has
 		// nothing to say but has definitely consumed those bytes.
 		_ = writeOffset(input.SessionID, input.TranscriptPath, next)
 		return "nothing new since last checkpoint", nil
 	}
+
 	title := input.SessionID
 	if title == "" {
 		title = kind
 	}
-	err = httpPost(ctx, hc, "/v1/ingest", ingestPayload{
-		Kind:    kind,
-		Title:   title,
-		Content: content,
-		User:    hc.User(),
-		Project: hc.Project(),
-		Metadata: map[string]any{
-			"session_id":  input.SessionID,
-			"cwd":         input.CWD,
-			"stop_reason": input.StopReason,
-			"trigger":     input.Trigger,
-			"byte_range":  fmt.Sprintf("%d-%d", offset, next),
-		},
-	}, nil)
-	if err != nil {
-		return "", err
+	sent := 0
+	for i, seg := range segs {
+		at := seg.At
+		payload := ingestPayload{
+			Kind:        kind,
+			Title:       title,
+			ExternalRef: fmt.Sprintf("%s#%d", input.SessionID, i),
+			Content:     seg.Content,
+			User:        hc.User(),
+			Project:     hc.Project(),
+			Metadata: map[string]any{
+				"session_id":  input.SessionID,
+				"cwd":         input.CWD,
+				"stop_reason": input.StopReason,
+				"trigger":     input.Trigger,
+				"byte_range":  fmt.Sprintf("%d-%d", offset, next),
+				"segment":     i,
+				"segments":    len(segs),
+			},
+		}
+		if !at.IsZero() {
+			payload.OccurredAt = &at
+		}
+		if err := httpPost(ctx, hc, "/v1/ingest", payload, nil); err != nil {
+			// The offset stays where it was, so the next checkpoint
+			// re-sends this range. The gate deduplicates a repeat; nothing
+			// recovers a segment that was skipped.
+			return fmt.Sprintf("ingested %d of %d segments", sent, len(segs)), err
+		}
+		sent++
 	}
 	if err := writeOffset(input.SessionID, input.TranscriptPath, next); err != nil {
-		return fmt.Sprintf("ingested %d bytes, offset not saved", len(content)), err
+		return fmt.Sprintf("ingested %d segments, offset not saved", sent), err
 	}
-	return fmt.Sprintf("ingested %d new bytes", len(content)), nil
+	return fmt.Sprintf("ingested %d segments", sent), nil
 }
 
 // readTranscriptFrom renders the chat turns in path starting at offset,
@@ -591,11 +602,13 @@ func (r transcriptRecord) text() string {
 type ingestPayload struct {
 	Kind         string         `json:"kind"`
 	Title        string         `json:"title,omitempty"`
+	ExternalRef  string         `json:"external_ref,omitempty"`
 	Content      string         `json:"content"`
 	Participants []string       `json:"participants,omitempty"`
 	Metadata     map[string]any `json:"metadata,omitempty"`
 	User         string         `json:"user,omitempty"`
 	Project      string         `json:"project,omitempty"`
+	OccurredAt   *time.Time     `json:"occurred_at,omitempty"`
 }
 
 // ─── transcript offsets ──────────────────────────────────────────────
