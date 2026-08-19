@@ -350,6 +350,11 @@ func doRetrieve(ctx context.Context, w io.Writer, hc *hostConfig, ev hookEvent) 
 type segment struct {
 	Content string
 	At      time.Time
+	// EndOffset is the absolute byte offset in the transcript just past
+	// this segment's last line. It lets a partial post advance the offset
+	// to the last segment that actually landed, instead of losing progress
+	// on every failure.
+	EndOffset int64
 }
 
 // minSegmentBytes is the shortest tail worth posting on its own. Below it a
@@ -390,6 +395,7 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 		title = kind
 	}
 	sent := 0
+	var lastEnd int64
 	for i, seg := range segs {
 		at := seg.At
 		payload := ingestPayload{
@@ -413,12 +419,22 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 			payload.OccurredAt = &at
 		}
 		if err := httpPost(ctx, hc, "/v1/ingest", payload, nil); err != nil {
-			// The offset stays where it was, so the next checkpoint
-			// re-sends this range. The gate deduplicates a repeat; nothing
-			// recovers a segment that was skipped.
+			// Advance the offset to the last segment that actually landed,
+			// so a retry re-sends only what failed rather than everything
+			// again on top of a growing transcript: without this, a
+			// checkpoint that runs out of time can never catch up, because
+			// each retry re-reads a larger range than the one before it.
+			// Re-sending is safe (the gate deduplicates); losing a segment
+			// that already landed is not.
+			if sent > 0 {
+				if werr := writeOffset(input.SessionID, input.TranscriptPath, lastEnd); werr != nil {
+					return fmt.Sprintf("ingested %d of %d segments, offset not saved", sent, len(segs)), werr
+				}
+			}
 			return fmt.Sprintf("ingested %d of %d segments", sent, len(segs)), err
 		}
 		sent++
+		lastEnd = seg.EndOffset
 	}
 	if err := writeOffset(input.SessionID, input.TranscriptPath, next); err != nil {
 		return fmt.Sprintf("ingested %d segments, offset not saved", sent), err
@@ -467,23 +483,37 @@ func readTranscriptFrom(path string, offset int64, gap time.Duration, maxBytes i
 		return nil, offset, nil // no complete line yet
 	}
 
+	// raw[:consumed] always ends in '\n' (only whole lines are consumed
+	// above), so Split always leaves one trailing empty element. Drop it
+	// before using line lengths for byte accounting, or every read would
+	// be off by one.
+	rawLines := strings.Split(string(raw[:consumed]), "\n")
+	rawLines = rawLines[:len(rawLines)-1]
+
 	var (
 		segs    []segment
 		sb      strings.Builder
 		segAt   time.Time
 		prevAt  time.Time
 		haveSeg bool
+		pos     = offset
 	)
-	flush := func() {
+	// flush closes out the current segment, ending it at end: the exact
+	// byte position up to which its lines have been consumed. A failed
+	// post can then resume from there rather than from the start of the
+	// whole batch.
+	flush := func(end int64) {
 		if body := strings.TrimSpace(sb.String()); body != "" {
-			segs = append(segs, segment{Content: body, At: segAt})
+			segs = append(segs, segment{Content: body, At: segAt, EndOffset: end})
 		}
 		sb.Reset()
 		haveSeg = false
 	}
 
-	for _, line := range strings.Split(string(raw[:consumed]), "\n") {
-		line = strings.TrimSpace(line)
+	for _, rawLine := range rawLines {
+		lineStart := pos
+		pos += int64(len(rawLine)) + 1
+		line := strings.TrimSpace(rawLine)
 		if line == "" {
 			continue
 		}
@@ -510,7 +540,7 @@ func readTranscriptFrom(path string, offset int64, gap time.Duration, maxBytes i
 			gapCut := gap > 0 && !prevAt.IsZero() && !at.IsZero() && at.Sub(prevAt) > gap
 			sizeCut := maxBytes > 0 && sb.Len() > maxBytes
 			if gapCut || sizeCut {
-				flush()
+				flush(lineStart)
 			}
 		}
 		if !haveSeg {
@@ -523,14 +553,17 @@ func readTranscriptFrom(path string, offset int64, gap time.Duration, maxBytes i
 		sb.WriteString("\n")
 		prevAt = at
 	}
-	flush()
+	flush(pos)
 
 	// A short tail is not its own idea. Merge it backwards rather than
-	// spending a gate evaluation to discover that.
+	// spending a gate evaluation to discover that. The merged segment
+	// keeps the tail's EndOffset: it now carries the tail's bytes too, and
+	// the predecessor's old EndOffset would leave them looking unconsumed.
 	if len(segs) > 1 && len(segs[len(segs)-1].Content) < minSegmentBytes {
 		last := segs[len(segs)-1]
 		segs = segs[:len(segs)-1]
 		segs[len(segs)-1].Content += "\n" + last.Content
+		segs[len(segs)-1].EndOffset = last.EndOffset
 	}
 	return segs, offset + int64(consumed), nil
 }

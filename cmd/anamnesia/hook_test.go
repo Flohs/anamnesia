@@ -538,6 +538,52 @@ func TestAShortTrailingSegmentMergesBackwards(t *testing.T) {
 	}
 }
 
+// TestMergedTrailingSegmentKeepsTheTailsEndOffset: the merge folds the
+// tail's content into its predecessor, so its EndOffset must move too - if
+// it kept the predecessor's old EndOffset, the tail's bytes would look
+// unconsumed and be re-sent on the next checkpoint.
+func TestMergedTrailingSegmentKeepsTheTailsEndOffset(t *testing.T) {
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", strings.Repeat("a substantial first exchange. ", 20)},
+		[3]string{"2026-03-02T10:00:00Z", "user", "ok"},
+	)
+	segs, next, err := readTranscriptFrom(path, 0, 20*time.Minute, 32768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) != 1 {
+		t.Fatalf("segments = %d, want 1", len(segs))
+	}
+	if segs[0].EndOffset != next {
+		t.Errorf("merged segment EndOffset = %d, want it to reach the tail's end %d", segs[0].EndOffset, next)
+	}
+}
+
+// TestSegmentEndOffsetsAscendToNext: EndOffset is computed by walking the
+// same lines readTranscriptFrom already walks to produce next. If the two
+// ever disagree, one of the two accounting paths has a bug.
+func TestSegmentEndOffsetsAscendToNext(t *testing.T) {
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "why are the stock counts off"},
+		[3]string{"2026-03-02T09:01:00Z", "assistant", "the Rotterdam site writes local time"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "unrelated: the invoice PDF job runs out of memory"},
+		[3]string{"2026-03-02T09:42:00Z", "assistant", "stream it page by page"},
+	)
+	segs, next, err := readTranscriptFrom(path, 0, 20*time.Minute, 32768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) != 2 {
+		t.Fatalf("segments = %d, want 2", len(segs))
+	}
+	if segs[0].EndOffset <= 0 || segs[0].EndOffset >= segs[1].EndOffset {
+		t.Errorf("EndOffsets do not ascend: %d, %d", segs[0].EndOffset, segs[1].EndOffset)
+	}
+	if segs[len(segs)-1].EndOffset != next {
+		t.Errorf("last segment EndOffset = %d, want it to equal next = %d", segs[len(segs)-1].EndOffset, next)
+	}
+}
+
 // captureIngests stands up a server that records every ingest body, and
 // points a host config at it.
 func captureIngests(t *testing.T) (*hostConfig, *[]map[string]any) {
@@ -579,9 +625,15 @@ func TestCheckpointPostsOneSourcePerSegment(t *testing.T) {
 	}
 }
 
+// TestCheckpointAdvancesTheOffsetOnlyWhenEverySegmentLands: a checkpoint
+// that runs out of time must be able to catch up. If the offset stayed put
+// on any failure, the next checkpoint would re-read the same range plus
+// whatever the session added since, making the range - and the time it
+// takes to fail again - grow without bound. So the offset advances as far
+// as it safely can: past every segment that landed, short of the one that
+// didn't. Losing a segment is worse than sending one twice: the gate
+// deduplicates a repeat, and nothing recovers a segment that was skipped.
 func TestCheckpointAdvancesTheOffsetOnlyWhenEverySegmentLands(t *testing.T) {
-	// Losing a segment is worse than sending one twice: the gate deduplicates
-	// a repeat, and nothing recovers a segment that was skipped.
 	var posts int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		posts++
@@ -598,14 +650,61 @@ func TestCheckpointAdvancesTheOffsetOnlyWhenEverySegmentLands(t *testing.T) {
 
 	path := segLines(t,
 		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
-		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "a second subject, also discussed at length"},
+		[3]string{"2026-03-02T10:22:00Z", "user", "a third subject, discussed at length as well"},
 	)
+	wantSegs, next, err := readTranscriptFrom(path, 0, hc.Dur("ingest.segment_gap"), hc.Int("ingest.segment_max_bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wantSegs) != 3 {
+		t.Fatalf("test setup: got %d segments, want 3", len(wantSegs))
+	}
+
 	if _, err := doCheckpoint(context.Background(), hc,
 		claudeHookInput{TranscriptPath: path, SessionID: "s2"}, "claude-session"); err == nil {
 		t.Fatal("checkpoint reported success despite a failed segment")
 	}
-	if off := readOffset("s2", path); off != 0 {
-		t.Errorf("offset advanced to %d after a failed segment; the range must be re-sent", off)
+	off := readOffset("s2", path)
+	if off != wantSegs[0].EndOffset {
+		t.Errorf("offset = %d, want the first segment's EndOffset %d", off, wantSegs[0].EndOffset)
+	}
+	if off == 0 {
+		t.Error("offset stayed at 0 despite the first segment landing")
+	}
+	if off == next {
+		t.Error("offset advanced as far as full success, but the third segment was never sent")
+	}
+}
+
+// TestCheckpointOffsetStaysPutWhenTheFirstSegmentFails: with nothing
+// posted yet, there is no "last good" position to advance to, so the
+// offset must be left exactly where it started.
+func TestCheckpointOffsetStaysPutWhenTheFirstSegmentFails(t *testing.T) {
+	var posts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts++
+		if posts == 1 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"source_id":"6f1c1f7a-0a1a-4a7a-9a7a-1a7a1a7a1a7a","queued":true}`))
+	}))
+	t.Cleanup(srv.Close)
+	hc := testHostConfig(t)
+	hc.values["server.url"] = srv.URL
+
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "s5"}, "claude-session"); err == nil {
+		t.Fatal("checkpoint reported success despite a failed segment")
+	}
+	if off := readOffset("s5", path); off != 0 {
+		t.Errorf("offset = %d after the first segment failed, want 0", off)
 	}
 }
 
