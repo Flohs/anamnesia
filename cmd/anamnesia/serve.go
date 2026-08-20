@@ -249,6 +249,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	mcpHandler := mcp.NewHandler(mcp.Deps{
 		Store:          st,
 		Retrieval:      retr,
+		Embedder:       emb,
 		PII:            piiDet,
 		Briefer:        briefer,
 		DefaultUser:    cfg.DefaultUser,

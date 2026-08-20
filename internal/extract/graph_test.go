@@ -173,8 +173,8 @@ func TestEntityNamesAreNormalisedBeforeUpsert(t *testing.T) {
 	// LITERAL name, so normalisation has to happen before the store call or
 	// three spellings become three nodes the database is happy with.
 	for _, in := range []string{"The Rotterdam Warehouse", "Rotterdam warehouse", "rotterdam  warehouse"} {
-		if got := normaliseEntityName(in); got != "rotterdam-warehouse" {
-			t.Errorf("normaliseEntityName(%q) = %q, want %q", in, got, "rotterdam-warehouse")
+		if got := NormaliseEntityName(in); got != "rotterdam-warehouse" {
+			t.Errorf("NormaliseEntityName(%q) = %q, want %q", in, got, "rotterdam-warehouse")
 		}
 	}
 }

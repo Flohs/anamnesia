@@ -1,5 +1,5 @@
 // Package jobs is the background worker. It runs three lightweight loops:
-//   - embed:    backfill missing vectors on facts/experiences
+//   - embed:    backfill missing vectors on facts/experiences/entities
 //   - forget:   purge expired working memory
 //   - consolidate: distil clusters of experiences with the LLM
 //
@@ -163,11 +163,44 @@ func (w *Worker) tickEmbed(ctx context.Context) (string, error) {
 		}
 		w.Log.Info("embedded experiences", "n", len(exps))
 	}
-	if len(facts) == 0 && len(exps) == 0 {
+	// Backfill entities. The text is the entity NAME, matching what the
+	// graph extractor embeds when it creates one, because that vector's
+	// only job is merge-candidate recall — an entity without one can
+	// never be offered as a candidate, so entity resolution is silently
+	// inert for it forever. That state is not rare: any entity created
+	// while the embedder was down has it, and `migrate --dims N` (the
+	// documented repair for a width mismatch) does ALTER COLUMN ... USING
+	// NULL, which puts every entity in the database into it at once.
+	// QueuePending also counts these into embed_pending, so without this
+	// backfill anything waiting for the queue to drain waits forever.
+	ents, err := w.Store.EntitiesMissingEmbedding(ctx, w.Cfg.EmbedBatch)
+	if err != nil {
+		return "", fmt.Errorf("fetch entities: %w", err)
+	}
+	if len(ents) > 0 {
+		texts := make([]string, len(ents))
+		for i, e := range ents {
+			texts[i] = e.Name
+		}
+		vecs, err := w.Embedder.Embed(ctx, texts)
+		if err != nil {
+			return "", fmt.Errorf("embed entities: %w", err)
+		}
+		for i, e := range ents {
+			if i >= len(vecs) || vecs[i] == nil {
+				continue
+			}
+			if err := w.Store.SetEntityEmbedding(ctx, e.ID, vecs[i]); err != nil {
+				w.Log.Warn("set entity embedding", "id", e.ID, "err", err)
+			}
+		}
+		w.Log.Info("embedded entities", "n", len(ents))
+	}
+	if len(facts) == 0 && len(exps) == 0 && len(ents) == 0 {
 		return "nothing to embed", nil
 	}
 	w.publishQueues(ctx)
-	return fmt.Sprintf("embedded %d facts, %d experiences", len(facts), len(exps)), nil
+	return fmt.Sprintf("embedded %d facts, %d experiences, %d entities", len(facts), len(exps), len(ents)), nil
 }
 
 func (w *Worker) tickForget(ctx context.Context) (string, error) {

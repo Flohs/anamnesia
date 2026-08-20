@@ -1,15 +1,19 @@
 package extract
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/flohs/anamnesia/internal/activity"
 	"github.com/flohs/anamnesia/internal/embed"
 	"github.com/flohs/anamnesia/internal/store"
 	"github.com/flohs/anamnesia/pkg/anamnesia"
@@ -926,4 +930,162 @@ func TestAVerdictIsAppliedToTheEntityItNames(t *testing.T) {
 			t.Errorf("ListEntities = %d, want 4: the verdict names two entities at once, so it merges neither; got %v", len(all), names)
 		}
 	})
+}
+
+// TestEntityPropsSurviveARedeclarationWithoutProps guards the normal
+// case: a checkpoint re-declares an entity an earlier checkpoint already
+// described. Re-declaration carries whatever the model happened to say
+// this time, which is usually no props at all — and a wholesale replace
+// would silently drop the attribute the first checkpoint recorded, with
+// no trace entry and no way to notice.
+//
+// The documented rule this asserts: props merge per key, the newer value
+// wins, and an absent key leaves what was there alone.
+func TestEntityPropsSurviveARedeclarationWithoutProps(t *testing.T) {
+	st, scope := newGraphTestStore(t, "entity-props-test")
+	ctx := context.Background()
+
+	run := func(content string, ops []graphOperation) {
+		t.Helper()
+		src := &anamnesia.Source{Scope: scope, Kind: graphSourceKind, OccurredAt: time.Now().UTC(), RawContent: content}
+		if err := st.InsertSource(ctx, src); err != nil {
+			t.Fatalf("insert source: %v", err)
+		}
+		ex := &Extractor{Cfg: Config{ExtractGraph: true}, Store: st, LLM: &fakeLLM{RawOps: marshalGraphOps(t, ops)}}
+		if _, err := ex.Run(ctx, src); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	}
+	props := func() map[string]any {
+		t.Helper()
+		ent, err := st.LookupEntity(ctx, scope, "service", "stock-reconciliation")
+		if err != nil {
+			t.Fatalf("lookup entity: %v", err)
+		}
+		return ent.Props
+	}
+
+	run("the stock-reconciliation service runs as a nightly job against the warehouse.",
+		[]graphOperation{{Op: "ADD_ENTITY", Kind: "service", Name: "stock-reconciliation",
+			Props: map[string]any{"role": "nightly job", "owner": "ops"}}})
+	if got := props(); got["role"] != "nightly job" {
+		t.Fatalf("props after the first checkpoint = %v, want role recorded; test setup is invalid", got)
+	}
+
+	// Re-declared with no props at all — the common case.
+	run("stock-reconciliation came up again today, nothing new about it.",
+		[]graphOperation{{Op: "ADD_ENTITY", Kind: "service", Name: "stock-reconciliation"}})
+	if got := props(); got["role"] != "nightly job" || got["owner"] != "ops" {
+		t.Fatalf("props = %v after a re-declaration carrying none; want both keys intact", got)
+	}
+
+	// Re-declared with one new key and one changed key: the newer value
+	// wins per key, and the key nobody mentioned survives.
+	run("stock-reconciliation now runs hourly and is owned by the platform team.",
+		[]graphOperation{{Op: "ADD_ENTITY", Kind: "service", Name: "stock-reconciliation",
+			Props: map[string]any{"owner": "platform", "schedule": "hourly"}}})
+	got := props()
+	if got["owner"] != "platform" {
+		t.Errorf("props[owner] = %v, want the newer value to win", got["owner"])
+	}
+	if got["schedule"] != "hourly" {
+		t.Errorf("props[schedule] = %v, want the new key added", got["schedule"])
+	}
+	if got["role"] != "nightly job" {
+		t.Errorf("props[role] = %v, want the key nobody re-declared left alone", got["role"])
+	}
+}
+
+// TestGraphTraceCountsMentionsAndFlagsMissingSegmentSources: an empty
+// segment_source_ids list is the exact defect that already shipped on
+// this branch once (docs/superpowers/specs/2026-08-19-the-graph-bridge-
+// is-broken.md). Nothing observed it: the trace's graph step reported
+// entities and edges but never mentions, and the helper only warned on a
+// wrong SHAPE, never on an absent or empty list. The channel could go
+// inert again and every trace would still read "ok".
+func TestGraphTraceCountsMentionsAndFlagsMissingSegmentSources(t *testing.T) {
+	st, scope := newGraphTestStore(t, "graph-trace-mentions")
+	ctx := context.Background()
+
+	ops := []graphOperation{
+		{Op: "ADD_ENTITY", Kind: "service", Name: "stock-reconciliation"},
+		{Op: "ADD_ENTITY", Kind: "site", Name: "rotterdam-warehouse"},
+		{Op: "ADD_EDGE", From: "stock-reconciliation", To: "rotterdam-warehouse", Kind: "reads_from"},
+	}
+	run := func(meta map[string]any) (*activity.Trace, string) {
+		t.Helper()
+		src := &anamnesia.Source{
+			Scope: scope, Kind: graphSourceKind, OccurredAt: time.Now().UTC(),
+			RawContent: "the stock-reconciliation service reads from the rotterdam warehouse nightly.",
+			Metadata:   meta,
+		}
+		if err := st.InsertSource(ctx, src); err != nil {
+			t.Fatalf("insert source: %v", err)
+		}
+		loaded, err := st.GetSource(ctx, src.ID)
+		if err != nil {
+			t.Fatalf("reload source: %v", err)
+		}
+		var logs bytes.Buffer
+		rec := activity.New(4)
+		ex := &Extractor{
+			Cfg:   Config{ExtractGraph: true},
+			Store: st,
+			LLM:   &fakeLLM{RawOps: marshalGraphOps(t, ops)},
+			Log:   slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})),
+			// A recorder per run, so onlyTrace sees exactly this one.
+			Activity: rec,
+		}
+		if _, err := ex.Run(ctx, loaded); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		return onlyTrace(t, rec), logs.String()
+	}
+	graphStep := func(tr *activity.Trace) map[string]any {
+		t.Helper()
+		for _, s := range tr.Steps {
+			if s.Name == "graph" {
+				return s.Detail
+			}
+		}
+		t.Fatalf("no graph step in the trace: steps = %v", stepNames(tr.Steps))
+		return nil
+	}
+
+	// No segment_source_ids at all: mentions land only on the graph
+	// source, which no search hit ever carries. Nothing is broken enough
+	// to fail the pass, so the warning and the count are the only
+	// evidence there is.
+	tr, logs := run(nil)
+	detail := graphStep(tr)
+	if detail["mentions_recorded"] != 2 {
+		t.Errorf("mentions_recorded = %v, want 2 (two entities against the graph source alone)", detail["mentions_recorded"])
+	}
+	if detail["segment_sources"] != 0 {
+		t.Errorf("segment_sources = %v, want 0", detail["segment_sources"])
+	}
+	if !strings.Contains(logs, "segment_source_ids") {
+		t.Errorf("no warning about the missing segment_source_ids; logs = %q", logs)
+	}
+
+	// The healthy shape: two segments, so every entity is mentioned
+	// against both of them plus the graph source.
+	seg1 := &anamnesia.Source{Scope: scope, Kind: "claude-session", OccurredAt: time.Now().UTC(), RawContent: "segment one, long enough to be a source."}
+	seg2 := &anamnesia.Source{Scope: scope, Kind: "claude-session", OccurredAt: time.Now().UTC(), RawContent: "segment two, long enough to be a source."}
+	for _, seg := range []*anamnesia.Source{seg1, seg2} {
+		if err := st.InsertSource(ctx, seg); err != nil {
+			t.Fatalf("insert segment: %v", err)
+		}
+	}
+	tr, logs = run(map[string]any{"segment_source_ids": []string{seg1.ID.String(), seg2.ID.String()}})
+	detail = graphStep(tr)
+	if detail["mentions_recorded"] != 6 {
+		t.Errorf("mentions_recorded = %v, want 6 (two entities against the graph source and both segments)", detail["mentions_recorded"])
+	}
+	if detail["segment_sources"] != 2 {
+		t.Errorf("segment_sources = %v, want 2", detail["segment_sources"])
+	}
+	if strings.Contains(logs, "segment_source_ids") {
+		t.Errorf("a healthy checkpoint warned about its segment_source_ids anyway; logs = %q", logs)
+	}
 }

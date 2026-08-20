@@ -20,6 +20,8 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/flohs/anamnesia/internal/embed"
+	"github.com/flohs/anamnesia/internal/extract"
 	"github.com/flohs/anamnesia/internal/jobs"
 	"github.com/flohs/anamnesia/internal/pii"
 	"github.com/flohs/anamnesia/internal/retrieval"
@@ -29,8 +31,12 @@ import (
 
 // Deps wires the MCP server.
 type Deps struct {
-	Store          *store.Store
-	Retrieval      *retrieval.Engine
+	Store     *store.Store
+	Retrieval *retrieval.Engine
+	// Embedder is what anamnesia_graph_entity gives a new entity its
+	// name vector with. Nil-safe: the entity is still written, and the
+	// worker's embed tick backfills the vector.
+	Embedder       embed.Embedder
 	PII            pii.Detector
 	Briefer        *jobs.Briefer // nil-safe
 	DefaultUser    string
@@ -803,12 +809,27 @@ func (d Deps) audit(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTool
 
 // ─── graph handlers ──────────────────────────────────────────────────
 
+// graphEntity is the SECOND writer to `entities`, the graph extractor
+// being the first, and it has to agree with it on two things or the
+// entities it writes are invisible to everything the extractor built.
+// Both are handled below: the name and kind are normalised the same way,
+// and the name carries the same embedding.
 func (d Deps) graphEntity(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := argsFromRequest(req)
 	kind := argString(args, "kind")
 	name := argString(args, "name")
 	if kind == "" || name == "" {
 		return bad(errors.New("kind and name required"))
+	}
+	// Normalised exactly as the extractor normalises them: (scope, kind,
+	// name) is the unique key, and kind is also the whole of the
+	// same-kind candidate filter. A raw "Rotterdam Warehouse" written
+	// here would sit beside the extractor's "rotterdam-warehouse" as a
+	// second node that can never be offered as its candidate.
+	kind = extract.NormaliseEntityKind(kind)
+	name = extract.NormaliseEntityName(name)
+	if kind == "" || name == "" {
+		return bad(errors.New("kind and name must each contain at least one letter or digit"))
 	}
 	scope, err := d.resolveScope(ctx, args)
 	if err != nil {
@@ -820,9 +841,24 @@ func (d Deps) graphEntity(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 		Name:  name,
 		Props: argMap(args, "props"),
 	}
+	// The vector is the NAME, the same text the extractor embeds, since
+	// its only job is merge-candidate recall. Best-effort in both
+	// directions: no embedder, or an embedder that errors, must not fail
+	// the write, and a nil embedding is not permanent — the worker's
+	// embed tick backfills any entity row left with a NULL one.
+	if d.Embedder != nil {
+		if vecs, err := d.Embedder.Embed(ctx, []string{name}); err == nil && len(vecs) > 0 {
+			ent.Embedding = vecs[0]
+		}
+	}
 	if err := d.Store.UpsertEntity(ctx, ent); err != nil {
 		return bad(err)
 	}
+	// No RecordMention, deliberately: a mention joins an entity to the
+	// SOURCE that mentioned it, and a tool call has no source to attach
+	// to. The entity is reachable by name and by candidate recall, and
+	// picks up mentions the first time a checkpoint's graph pass names
+	// it.
 	return ok(ent)
 }
 

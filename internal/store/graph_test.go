@@ -325,3 +325,82 @@ func TestNearestEntitiesStaysInsideItsScope(t *testing.T) {
 		t.Errorf("got %d matches from another user's scope, want 0", len(got))
 	}
 }
+
+// TestNearestEntitiesDoesNotCrossProjects is the project half of the
+// scope guard TestNearestEntitiesStaysInsideItsScope only covers for
+// users. A candidate offered here is a candidate the model may affirm as
+// the same thing, and a wrong merge is irreversible — so a scope with no
+// project must not be shown entities that belong to some arbitrary
+// project of the same user.
+func TestNearestEntitiesDoesNotCrossProjects(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	uid, err := st.EnsureUser(ctx, "entity-project-scope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), "entity-project-scope") })
+	alpha, err := st.EnsureProject(ctx, uid, "entity-project-alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beta, err := st.EnsureProject(ctx, uid, "entity-project-beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v := make([]float32, 1536)
+	v[0] = 1
+	mustUpsert := func(scope anamnesia.Scope, name string) *anamnesia.Entity {
+		ent := &anamnesia.Entity{Scope: scope, Kind: "person", Name: name, Embedding: v}
+		if err := st.UpsertEntity(ctx, ent); err != nil {
+			t.Fatal(err)
+		}
+		return ent
+	}
+	inAlpha := mustUpsert(anamnesia.Scope{UserID: uid, ProjectID: &alpha}, "alpha-person")
+	userLevel := mustUpsert(anamnesia.Scope{UserID: uid}, "user-level-person")
+
+	ids := func(matches []EntityMatch) map[uuid.UUID]bool {
+		out := make(map[uuid.UUID]bool, len(matches))
+		for _, m := range matches {
+			out[m.Entity.ID] = true
+		}
+		return out
+	}
+
+	// A user-level scope sees user-level entities and nothing else.
+	got, err := st.NearestEntities(ctx, anamnesia.Scope{UserID: uid}, v, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := ids(got)
+	if seen[inAlpha.ID] {
+		t.Error("a scope with no project was offered a project's entity as a merge candidate")
+	}
+	if !seen[userLevel.ID] {
+		t.Error("a scope with no project was not offered its own user-level entity")
+	}
+
+	// A project scope still sees its own project plus user-level, and
+	// never a sibling project.
+	got, err = st.NearestEntities(ctx, anamnesia.Scope{UserID: uid, ProjectID: &beta}, v, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen = ids(got)
+	if seen[inAlpha.ID] {
+		t.Error("a project scope was offered a sibling project's entity as a merge candidate")
+	}
+	if !seen[userLevel.ID] {
+		t.Error("a project scope was not offered a user-level entity")
+	}
+}

@@ -18,20 +18,38 @@ import (
 // ─── entities ────────────────────────────────────────────────────────
 
 // UpsertEntity creates or updates an entity keyed by (scope, kind, name).
-// Properties are replaced wholesale on conflict; pass the merged map.
+//
+// Properties MERGE on conflict, one level deep: a key present in e.Props
+// overwrites the stored value for that key, a key absent from e.Props
+// keeps whatever was already there, and a key whose value is a nested
+// object is replaced whole rather than merged recursively. Keys carrying
+// a JSON null are dropped before the merge — a null says nothing, and
+// must not erase an attribute an earlier caller established.
+//
+// Replace-wholesale was the previous rule and it silently erased props:
+// re-declaring an entity is the normal case for the graph extractor, and
+// a re-declaration usually carries whatever the model happened to
+// mention this time, which is often nothing. Merging in SQL rather than
+// read-modify-write in Go also keeps two concurrent upserts from losing
+// each other's keys.
 func (s *Store) UpsertEntity(ctx context.Context, e *anamnesia.Entity) error {
 	if e.Kind == "" || e.Name == "" {
 		return errors.New("entity: kind and name required")
 	}
-	var propsJSON []byte
-	if e.Props != nil {
-		b, err := json.Marshal(e.Props)
+	propsJSON := []byte("{}")
+	if len(e.Props) > 0 {
+		props := make(map[string]any, len(e.Props))
+		for k, v := range e.Props {
+			if v == nil {
+				continue
+			}
+			props[k] = v
+		}
+		b, err := json.Marshal(props)
 		if err != nil {
 			return fmt.Errorf("marshal props: %w", err)
 		}
 		propsJSON = b
-	} else {
-		propsJSON = []byte("{}")
 	}
 	var emb *pgvector.Vector
 	if len(e.Embedding) > 0 {
@@ -43,7 +61,7 @@ func (s *Store) UpsertEntity(ctx context.Context, e *anamnesia.Entity) error {
 		VALUES ($1, $2, $3, $4, $5::jsonb, $6)
 		ON CONFLICT (user_id, coalesce(project_id, '00000000-0000-0000-0000-000000000000'::uuid), kind, name)
 		DO UPDATE SET
-			props     = EXCLUDED.props,
+			props     = entities.props || EXCLUDED.props,
 			embedding = COALESCE(EXCLUDED.embedding, entities.embedding)
 		RETURNING id, created_at`,
 		e.Scope.UserID, e.Scope.ProjectID, e.Kind, e.Name, string(propsJSON), emb,
@@ -172,12 +190,25 @@ type EntityMatch struct {
 // distance, nearest first. Entities without an embedding are skipped. The
 // caller decides what distance counts as close enough; no threshold is
 // applied here.
+//
+// Scope is the same rule vectorFacts applies — the scope's own project
+// plus the user level — with the nil-project case spelled out rather
+// than left open: a scope with no project sees user-level entities ONLY,
+// never some arbitrary project's. Its one caller is merge-candidate
+// recall, and a candidate offered here is a candidate the model may
+// affirm as the same thing; a wrong merge is irreversible and a fork is
+// not, so a user-level ingest must not be able to be merged into a
+// project it never named. Leaving the predicate off entirely (which is
+// what "no project" used to mean here) offered every project the user
+// owns, and CreateEdge would then write an edge across the boundary.
 func (s *Store) NearestEntities(ctx context.Context, scope anamnesia.Scope, vec []float32, limit int) ([]EntityMatch, error) {
 	args := []any{scope.UserID, pgvector.NewVector(vec)}
 	where := []string{"user_id = $1", "embedding IS NOT NULL"}
 	if scope.ProjectID != nil {
 		args = append(args, *scope.ProjectID)
 		where = append(where, fmt.Sprintf("(project_id = $%d OR project_id IS NULL)", len(args)))
+	} else {
+		where = append(where, "project_id IS NULL")
 	}
 	args = append(args, limit)
 	q := fmt.Sprintf(`

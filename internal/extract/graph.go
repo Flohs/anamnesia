@@ -169,21 +169,21 @@ type identityQuery struct {
 	Candidates []identityCandidateJSON `json:"candidates"`
 }
 
-// normaliseEntityName canonicalises a name so upsert dedupes on meaning
+// NormaliseEntityName canonicalises a name so upsert dedupes on meaning
 // rather than on the literal string ON CONFLICT sees: "The Rotterdam
 // Warehouse", "Rotterdam warehouse" and "rotterdam  warehouse" must all
 // become the same node. slugKey (extract.go:514) already lower-cases,
 // collapses runs of non-alphanumerics to one hyphen, and trims — this
 // only adds stripping a leading "the", which slugKey has no reason to
 // know about.
-func normaliseEntityName(name string) string {
+func NormaliseEntityName(name string) string {
 	s := strings.ToLower(strings.TrimSpace(name))
 	s = strings.TrimPrefix(s, "the ")
 	return slugKey(s)
 }
 
-// normaliseEntityKind canonicalises a kind for exactly the same reason
-// normaliseEntityName canonicalises a name, and it matters just as much:
+// NormaliseEntityKind canonicalises a kind for exactly the same reason
+// NormaliseEntityName canonicalises a name, and it matters just as much:
 // kind is half of the (scope, kind, name) unique key AND the whole of
 // the same-kind candidate filter, yet nothing constrains what ends up in
 // it — graphOperationSchema types it as a bare string with no enum, the
@@ -194,7 +194,7 @@ func normaliseEntityName(name string) string {
 // other's candidate: entity resolution silently inert for that pair,
 // forever, with no log line. Unlike a name, a kind has no leading "the"
 // to strip, so this is slugKey alone.
-func normaliseEntityKind(kind string) string {
+func NormaliseEntityKind(kind string) string {
 	return slugKey(kind)
 }
 
@@ -285,14 +285,14 @@ func entityCandidatesForNameWith(
 		return nil
 	}
 	out := make([]store.EntityMatch, 0, len(matches))
-	want := normaliseEntityKind(kind)
+	want := NormaliseEntityKind(kind)
 	for _, m := range matches {
 		// Both sides normalised: a stored kind can carry any casing (an
 		// entity written before normalisation existed, or one written
 		// through anamnesia_graph_entity, which upserts a raw kind), and
 		// a candidate must not be hidden by that. See
-		// normaliseEntityKind.
-		if m.Distance <= threshold && normaliseEntityKind(m.Entity.Kind) == want {
+		// NormaliseEntityKind.
+		if m.Distance <= threshold && NormaliseEntityKind(m.Entity.Kind) == want {
 			out = append(out, m)
 		}
 	}
@@ -329,8 +329,8 @@ func (e *Extractor) resolveIdentities(ctx context.Context, scope anamnesia.Scope
 		if strings.ToUpper(strings.TrimSpace(op.Op)) != "ADD_ENTITY" {
 			continue
 		}
-		name := normaliseEntityName(op.Name)
-		kind := normaliseEntityKind(op.Kind)
+		name := NormaliseEntityName(op.Name)
+		kind := NormaliseEntityKind(op.Kind)
 		if name == "" || kind == "" {
 			continue
 		}
@@ -386,8 +386,8 @@ func (e *Extractor) resolveIdentities(ctx context.Context, scope anamnesia.Scope
 		if v.SameAs == "" {
 			continue
 		}
-		name := normaliseEntityName(v.Entity)
-		key := entityKey(normaliseEntityKind(v.Kind), name)
+		name := NormaliseEntityName(v.Entity)
+		key := entityKey(NormaliseEntityKind(v.Kind), name)
 		set, ok := byKey[key]
 		if !ok {
 			// No exact (kind, name) match — the model omitted the kind,
@@ -471,8 +471,8 @@ func resolveEdges(ops []graphOperation, known map[string]uuid.UUID) (resolved []
 		if strings.ToUpper(strings.TrimSpace(op.Op)) != "ADD_EDGE" {
 			continue
 		}
-		fromID, fromOK := known[normaliseEntityName(op.From)]
-		toID, toOK := known[normaliseEntityName(op.To)]
+		fromID, fromOK := known[NormaliseEntityName(op.From)]
+		toID, toOK := known[NormaliseEntityName(op.To)]
 		switch {
 		case !fromOK && !toOK:
 			dropped = append(dropped, fmt.Sprintf("edge %q -> %q (%s): neither endpoint resolved to an entity", op.From, op.To, op.Kind))
@@ -575,8 +575,8 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 		if strings.ToUpper(strings.TrimSpace(op.Op)) != "ADD_ENTITY" {
 			continue
 		}
-		name := normaliseEntityName(op.Name)
-		kind := normaliseEntityKind(op.Kind)
+		name := NormaliseEntityName(op.Name)
+		kind := NormaliseEntityKind(op.Kind)
 		if name == "" || kind == "" {
 			failures = append(failures, fmt.Sprintf("ADD_ENTITY %q: kind and name required", op.Name))
 			continue
@@ -588,14 +588,18 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 			merged = append(merged, name)
 			continue
 		}
+		// op.Props goes in as-is: UpsertEntity merges per key rather than
+		// replacing, so a re-declaration carrying no props — the normal
+		// case — leaves what an earlier checkpoint recorded alone. Merging
+		// here instead would be a read-modify-write two passes could lose.
 		ent := &anamnesia.Entity{Scope: src.Scope, Kind: kind, Name: name, Props: op.Props}
 		// Attach the name's embedding (best-effort; nil on any failure —
 		// UpsertEntity already treats a nil Embedding as "no vector yet")
 		// so THIS entity becomes findable as a candidate the next time
-		// something nearby is checkpointed. Per Ruling 3
-		// (.superpowers/sdd/2026-08-20-entity-resolution/progress.md),
-		// only new entities get this — no backfill of entities created
-		// before candidate recall existed.
+		// something nearby is checkpointed. A nil here is not permanent:
+		// the worker's embed tick backfills any entity whose embedding is
+		// NULL, which is also how entities recover from `migrate --dims N`
+		// nulling the whole column (jobs.tickEmbed).
 		ent.Embedding = e.embedEntityName(ctx, name)
 		if err := e.Store.UpsertEntity(ctx, ent); err != nil {
 			if e.Log != nil {
@@ -634,7 +638,7 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 			continue
 		}
 		for _, raw := range []string{op.From, op.To} {
-			name := normaliseEntityName(raw)
+			name := NormaliseEntityName(raw)
 			if name == "" || queried[name] {
 				continue
 			}
@@ -695,7 +699,8 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 	// exactly (store/graph.go). The graph source keeps a mention too, for
 	// provenance, but it must not be the only one — see
 	// docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md.
-	mentionSources := append([]uuid.UUID{src.ID}, e.segmentSourceIDsFromMetadata(src.Metadata)...)
+	segmentSources := e.segmentSourceIDsFromMetadata(src.Metadata)
+	mentionSources := append([]uuid.UUID{src.ID}, segmentSources...)
 	// Every entity this checkpoint touched: the ones its ADD_ENTITY ops
 	// landed on (known, one per kind+name — two entities sharing a name
 	// each get their own mention), plus any resolved from an earlier
@@ -708,22 +713,40 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 	for _, id := range endpoints {
 		mentioned[id] = true
 	}
+	// Counted, and counted into the trace: a mention that is never
+	// written is the failure this whole bridge already shipped once, and
+	// it is invisible from every other number here — entities and edges
+	// are written exactly the same either way. A RecordMention error is a
+	// failure of the pass, not a log line nobody reads.
+	mentionsRecorded := 0
 	for id := range mentioned {
 		for _, sourceID := range mentionSources {
-			if err := e.Store.RecordMention(ctx, id, sourceID); err != nil && e.Log != nil {
-				e.Log.Warn("extractor: record mention failed", "err", err)
+			if err := e.Store.RecordMention(ctx, id, sourceID); err != nil {
+				if e.Log != nil {
+					e.Log.Warn("extractor: record mention failed", "entity", id, "source", sourceID, "err", err)
+				}
+				failures = append(failures, fmt.Sprintf("mention of entity %s on source %s: %s", id, sourceID, err.Error()))
+				continue
 			}
+			mentionsRecorded++
 		}
 	}
 
-	tr.Step("graph", fmt.Sprintf("Upserted %d entities, merged %d, created %d edges (%d superseded, %d dropped)",
-		len(upserted), len(merged), edgesCreated, edgesSuperseded, len(dropped)),
+	mentionSourceIDs := make([]string, 0, len(mentionSources))
+	for _, id := range mentionSources {
+		mentionSourceIDs = append(mentionSourceIDs, id.String())
+	}
+	tr.Step("graph", fmt.Sprintf("Upserted %d entities, merged %d, created %d edges (%d superseded, %d dropped), recorded %d mentions across %d sources",
+		len(upserted), len(merged), edgesCreated, edgesSuperseded, len(dropped), mentionsRecorded, len(mentionSources)),
 		map[string]any{
 			"entities_upserted": len(upserted),
 			"entities_merged":   merged,
 			"edges_created":     edgesCreated,
 			"edges_superseded":  edgesSuperseded,
 			"edges_dropped":     dropped,
+			"mentions_recorded": mentionsRecorded,
+			"mention_sources":   mentionSourceIDs,
+			"segment_sources":   len(segmentSources),
 			"failures":          failures,
 		})
 
@@ -743,9 +766,20 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 // and a graph source posted by something else may not shape it the way
 // this expects — either way runGraph must finish with whatever it can
 // resolve, not fail the pass over it.
+//
+// Every path that yields nothing warns, including an absent or empty
+// list. Coming back empty is not a shape error, so it used to pass in
+// silence — and it is exactly the state the bridge shipped in
+// (docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md):
+// mentions land only on the graph source, which no search hit ever
+// carries, so the graph is populated and unreachable and nothing says
+// so.
 func (e *Extractor) segmentSourceIDsFromMetadata(meta map[string]any) []uuid.UUID {
 	raw, ok := meta["segment_source_ids"]
 	if !ok {
+		if e.Log != nil {
+			e.Log.Warn("extractor: graph source carries no segment_source_ids; mentions will land only on the graph source, which no search hit carries")
+		}
 		return nil
 	}
 	list, ok := raw.([]any)
@@ -754,6 +788,9 @@ func (e *Extractor) segmentSourceIDsFromMetadata(meta map[string]any) []uuid.UUI
 			e.Log.Warn("extractor: segment_source_ids metadata has an unexpected shape", "type", fmt.Sprintf("%T", raw))
 		}
 		return nil
+	}
+	if len(list) == 0 && e.Log != nil {
+		e.Log.Warn("extractor: segment_source_ids is empty; mentions will land only on the graph source, which no search hit carries")
 	}
 	ids := make([]uuid.UUID, 0, len(list))
 	for _, v := range list {
