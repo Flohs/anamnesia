@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -283,24 +284,130 @@ func TestGraphBridgeConnectsSegmentSourcesToEntities(t *testing.T) {
 	}
 }
 
-// TestEntityResolutionMergesTwoSpellingsOfOneName is the regression this
-// whole plan exists for:
-// docs/superpowers/specs/2026-08-19-entity-identity-does-not-hold.md found
-// two real sessions discussing one person land as two disconnected
-// subgraphs — "priha-raman" in one session, "priya-raman" in the next —
-// because entity identity was exact string equality on a model-produced
-// name. Run runGraph twice, once per spelling, with a fakeEmbedder that
-// places the two spellings within graph.merge_distance of each other and
-// everything else far apart. Afterwards there must be exactly one person
-// entity, with both sessions' edges attached to it.
+// vec1536 pads a 3-component test vector out to the schema's real
+// embedding width (1536 for the dims this test database migrated to).
+// The extra zero components do not change any cosine distance.
+func vec1536(x, y, z float32) []float32 {
+	v := make([]float32, 1536)
+	v[0], v[1], v[2] = x, y, z
+	return v
+}
+
+// TestEntityCandidatesOfferExistingEntitiesFromEarlierSessions is the
+// regression this plan exists for, reframed after distance-threshold
+// merging was found to have no separating value (see the comment on
+// entityCandidatesWith in graph.go):
+// docs/superpowers/specs/2026-08-19-entity-identity-does-not-hold.md
+// found two real sessions discussing one person land as two
+// disconnected subgraphs, "priha-raman" in one session and
+// "priya-raman" in the next, because entity identity was exact string
+// equality on a model-produced name and nothing offered the model a
+// chance to notice the earlier spelling.
 //
-// Before the fix in this commit, this test fails: with no entity
-// resolution, "priha-raman" and "priya-raman" upsert as two distinct
-// rows (ON CONFLICT dedupes on the literal name, and the two spellings
-// are literally different strings), so ListEntities(kind="person")
-// returns 3, not 2, and the "covers" edge attaches to a node the first
-// session's "owns" edge never reaches.
-func TestEntityResolutionMergesTwoSpellingsOfOneName(t *testing.T) {
+// This test proves the recall half of the fix mechanically: run one
+// checkpoint that creates "priya-raman", then a second whose raw
+// content a fakeEmbedder places close to that name's embedding, and
+// assert the second checkpoint's prompt actually lists priya-raman —
+// by name AND kind, since the graph system prompt's guard against
+// merging across kinds only works if the kind is visible — as a
+// candidate. Whether a real model then chooses to reuse that name is
+// a judgment this test cannot exercise (fakeLLM is scripted, not
+// reasoning) — that is what Task 3's real end-to-end proof is for.
+// TestEntityResolutionLandsOnOneNodeWhenTheModelReusesACandidateName
+// below proves the other half: IF the model does reuse the offered
+// name, ordinary exact-name upsert correctly lands both sessions on
+// one node.
+func TestEntityCandidatesOfferExistingEntitiesFromEarlierSessions(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	user := "entity-candidates-test-" + uuid.NewString()[:8]
+	uid, err := st.EnsureUser(ctx, user)
+	if err != nil {
+		t.Fatalf("ensure user: %v", err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), user) })
+	scope := anamnesia.Scope{UserID: uid}
+
+	content1 := "Priya Raman owns the nightly stock reconciliation job."
+	content2 := "Dana Okafor covers priha raman while she is on leave."
+	// priya-raman's NAME embeds close to session 2's CONTENT (this is
+	// recall, not merge: a generous distance is fine, and is exactly
+	// what graph.candidate_distance defaults loose for) — and the job
+	// entity is orthogonal to it, so it must not show up as a candidate
+	// for a checkpoint that never mentions it.
+	emb := &fakeEmbedder{Vecs: map[string][]float32{
+		"priya-raman":                      vec1536(1, 0, 0),
+		"nightly-stock-reconciliation-job": vec1536(0, 1, 0),
+		content1:                           vec1536(0, 0, 1), // irrelevant to recall; session 1 has no candidates yet
+		content2:                           vec1536(0.99, 0.01, 0),
+	}}
+
+	newSource := func(content string) *anamnesia.Source {
+		src := &anamnesia.Source{Scope: scope, Kind: graphSourceKind, OccurredAt: time.Now().UTC(), RawContent: content}
+		if err := st.InsertSource(ctx, src); err != nil {
+			t.Fatalf("insert source: %v", err)
+		}
+		return src
+	}
+
+	src1 := newSource(content1)
+	ex1 := &Extractor{
+		Cfg:      Config{ExtractGraph: true, GraphCandidateDistance: 0.1},
+		Store:    st,
+		Embedder: emb,
+		LLM: &fakeLLM{RawOps: marshalGraphOps(t, []graphOperation{
+			{Op: "ADD_ENTITY", Kind: "person", Name: "priya-raman"},
+			{Op: "ADD_ENTITY", Kind: "project", Name: "nightly-stock-reconciliation-job"},
+			{Op: "ADD_EDGE", From: "priya-raman", To: "nightly-stock-reconciliation-job", Kind: "owns"},
+		})},
+	}
+	if _, err := ex1.Run(ctx, src1); err != nil {
+		t.Fatalf("run session 1: %v", err)
+	}
+
+	src2 := newSource(content2)
+	fakeLLM2 := &fakeLLM{RawOps: marshalGraphOps(t, []graphOperation{{Op: "NOOP"}})}
+	ex2 := &Extractor{
+		Cfg:      Config{ExtractGraph: true, GraphCandidateDistance: 0.1},
+		Store:    st,
+		Embedder: emb,
+		LLM:      fakeLLM2,
+	}
+	if _, err := ex2.Run(ctx, src2); err != nil {
+		t.Fatalf("run session 2: %v", err)
+	}
+
+	if !strings.Contains(fakeLLM2.Prompt, "priya-raman") {
+		t.Errorf("session 2's prompt does not offer priya-raman as a candidate:\n%s", fakeLLM2.Prompt)
+	}
+	if !strings.Contains(fakeLLM2.Prompt, `"kind":"person"`) {
+		t.Errorf("session 2's prompt offers a candidate without its kind — the model cannot apply the same-kind guard blind:\n%s", fakeLLM2.Prompt)
+	}
+	if strings.Contains(fakeLLM2.Prompt, "nightly-stock-reconciliation-job") {
+		t.Errorf("session 2's prompt offers the job entity as a candidate; it is orthogonal to the content and should not recall:\n%s", fakeLLM2.Prompt)
+	}
+}
+
+// TestEntityResolutionLandsOnOneNodeWhenTheModelReusesACandidateName
+// covers the other half: a model that reuses a candidate's exact name
+// (simulated here by scripting fakeLLM to do so — this test cannot
+// prove a real model WOULD, only that the plumbing is correct if it
+// does) must land both checkpoints on one entity, with both sessions'
+// edges attached to it, via nothing more than the ordinary
+// (scope, kind, name) upsert.
+func TestEntityResolutionLandsOnOneNodeWhenTheModelReusesACandidateName(t *testing.T) {
 	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
@@ -323,22 +430,9 @@ func TestEntityResolutionMergesTwoSpellingsOfOneName(t *testing.T) {
 	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), user) })
 	scope := anamnesia.Scope{UserID: uid}
 
-	// priya-raman and priha-raman embed almost identically (cosine
-	// distance ~0.00005, well under the 0.05 threshold this test uses);
-	// dana-okafor and the job entity are orthogonal to everything, so
-	// they never get close enough to merge with anyone. The extra zero
-	// components (padding out to the schema's real embedding width) do
-	// not change any cosine distance.
-	vec1536 := func(x, y, z float32) []float32 {
-		v := make([]float32, 1536)
-		v[0], v[1], v[2] = x, y, z
-		return v
-	}
 	emb := &fakeEmbedder{Vecs: map[string][]float32{
-		"priya-raman":                      vec1536(1, 0, 0),
-		"priha-raman":                      vec1536(0.99, 0.01, 0),
-		"dana-okafor":                      vec1536(0, 1, 0),
-		"nightly-stock-reconciliation-job": vec1536(0, 0, 1),
+		"priya-raman": vec1536(1, 0, 0),
+		"dana-okafor": vec1536(0, 1, 0),
 	}}
 
 	newSource := func(content string) *anamnesia.Source {
@@ -350,7 +444,7 @@ func TestEntityResolutionMergesTwoSpellingsOfOneName(t *testing.T) {
 	}
 	run := func(src *anamnesia.Source, ops []graphOperation) {
 		ex := &Extractor{
-			Cfg:      Config{ExtractGraph: true, GraphMergeDistance: 0.05},
+			Cfg:      Config{ExtractGraph: true, GraphCandidateDistance: 0.1},
 			Store:    st,
 			Embedder: emb,
 			LLM:      &fakeLLM{RawOps: marshalGraphOps(t, ops)},
@@ -367,11 +461,14 @@ func TestEntityResolutionMergesTwoSpellingsOfOneName(t *testing.T) {
 		{Op: "ADD_EDGE", From: "priya-raman", To: "nightly-stock-reconciliation-job", Kind: "owns"},
 	})
 
+	// Second session: the model — as if it had read priya-raman off the
+	// candidate list proven to be offered by the test above — uses that
+	// exact name instead of the misspelling the raw text actually used.
 	src2 := newSource("Dana Okafor covers priha raman while she is on leave.")
 	run(src2, []graphOperation{
 		{Op: "ADD_ENTITY", Kind: "person", Name: "dana-okafor"},
-		{Op: "ADD_ENTITY", Kind: "person", Name: "priha-raman"},
-		{Op: "ADD_EDGE", From: "dana-okafor", To: "priha-raman", Kind: "covers"},
+		{Op: "ADD_ENTITY", Kind: "person", Name: "priya-raman"},
+		{Op: "ADD_EDGE", From: "dana-okafor", To: "priya-raman", Kind: "covers"},
 	})
 
 	people, err := st.ListEntities(ctx, scope, "person", 50)
@@ -383,17 +480,17 @@ func TestEntityResolutionMergesTwoSpellingsOfOneName(t *testing.T) {
 		for i, p := range people {
 			names[i] = p.Name
 		}
-		t.Fatalf("ListEntities(person) = %d, want 2 (one merged priya/priha-raman, one dana-okafor); got %v", len(people), names)
+		t.Fatalf("ListEntities(person) = %d, want 2 (priya-raman, dana-okafor); got %v", len(people), names)
 	}
 
 	var raman *anamnesia.Entity
 	for _, p := range people {
-		if p.Name == "priya-raman" || p.Name == "priha-raman" {
+		if p.Name == "priya-raman" {
 			raman = p
 		}
 	}
 	if raman == nil {
-		t.Fatalf("neither spelling of raman survived: %v", people)
+		t.Fatalf("priya-raman did not survive: %v", people)
 	}
 
 	_, ownsEdges, err := st.Neighbors(ctx, raman.ID, []string{"owns"}, "out", 10)
@@ -401,7 +498,7 @@ func TestEntityResolutionMergesTwoSpellingsOfOneName(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(ownsEdges) != 1 {
-		t.Errorf("owns edges from the merged entity = %d, want 1 (from the first session)", len(ownsEdges))
+		t.Errorf("owns edges from priya-raman = %d, want 1 (from the first session)", len(ownsEdges))
 	}
 
 	_, coversEdges, err := st.Neighbors(ctx, raman.ID, []string{"covers"}, "in", 10)
@@ -409,6 +506,6 @@ func TestEntityResolutionMergesTwoSpellingsOfOneName(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(coversEdges) != 1 {
-		t.Errorf("covers edges into the merged entity = %d, want 1 (from the second session)", len(coversEdges))
+		t.Errorf("covers edges into priya-raman = %d, want 1 (from the second session)", len(coversEdges))
 	}
 }

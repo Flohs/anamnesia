@@ -68,12 +68,13 @@ type Config struct {
 	// GraphMaxOps caps how many entities and edges one graph pass may
 	// produce. Default 12.
 	GraphMaxOps int
-	// GraphMergeDistance is the cosine distance below which a new
-	// entity's name is treated as the same thing as an existing one in
-	// scope, and reused rather than creating a fork. 0 is a legitimate
-	// value ("merge only identical names"), so applyDefaults leaves it
+	// GraphCandidateDistance is the cosine distance within which an
+	// existing entity is offered to the graph model as a possible match
+	// for something a checkpoint mentions — a recall net for the
+	// prompt, not a merge decision; the model judges identity. 0 is a
+	// legitimate value ("offer nothing"), so applyDefaults leaves it
 	// alone rather than treating zero as unset.
-	GraphMergeDistance float64
+	GraphCandidateDistance float64
 }
 
 // Extractor runs the pipeline against an open-source memory store.

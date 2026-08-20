@@ -80,12 +80,14 @@ type Config struct {
 	ExtractGraph bool // ANAMNESIA_GRAPH_EXTRACT (default false)
 	GraphMaxOps  int  // ANAMNESIA_GRAPH_MAX_OPS (default 12)
 
-	// GraphMergeDistance is the cosine distance below which a new
-	// entity's name is treated as the same thing as an existing one.
-	// Smaller is stricter; 0 is a legitimate value ("merge only identical
-	// names"), so unlike the other numeric settings it is not defaulted
-	// when zero — it always comes from ANAMNESIA_GRAPH_MERGE_DISTANCE.
-	GraphMergeDistance float64 // ANAMNESIA_GRAPH_MERGE_DISTANCE (default 0.28)
+	// GraphCandidateDistance is the cosine distance within which an
+	// existing entity is offered to the graph model as a possible match
+	// for something the checkpoint mentions. It does not merge anything
+	// by itself — the model decides identity — so it is deliberately
+	// loose. 0 is a legitimate value ("offer nothing"), so unlike the
+	// other numeric settings it is not defaulted when zero — it always
+	// comes from ANAMNESIA_GRAPH_CANDIDATE_DISTANCE.
+	GraphCandidateDistance float64 // ANAMNESIA_GRAPH_CANDIDATE_DISTANCE (default 0.45)
 
 	// Decay half-lives per experience kind. Relevance falls by half over
 	// this long since a memory was last used, per kind, which is what
@@ -224,7 +226,7 @@ func Load() (*Config, error) {
 		ExtractGraph: boolean("ANAMNESIA_GRAPH_EXTRACT", false),
 		GraphMaxOps:  num("ANAMNESIA_GRAPH_MAX_OPS", 12),
 
-		GraphMergeDistance: fraction("ANAMNESIA_GRAPH_MERGE_DISTANCE", 0.28),
+		GraphCandidateDistance: fraction("ANAMNESIA_GRAPH_CANDIDATE_DISTANCE", 0.45),
 
 		DecayHalfLifeCase:     dur("ANAMNESIA_DECAY_HALF_LIFE_CASE", 336*time.Hour),
 		DecayHalfLifeStrategy: dur("ANAMNESIA_DECAY_HALF_LIFE_STRATEGY", 8760*time.Hour),

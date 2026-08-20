@@ -190,8 +190,8 @@ var settings = []setting{
 		Doc: "Extract entities and relationships from a session, in one extra model call per checkpoint. Off by default: it costs a call, and an install that never reads the graph should not pay for it."},
 	{Key: "graph.max_ops", Kind: kInt, Def: "12", Env: "ANAMNESIA_GRAPH_MAX_OPS",
 		Doc: "Caps how many entities and edges one checkpoint may produce."},
-	{Key: "graph.merge_distance", Kind: kString, Def: "0.28", Env: "ANAMNESIA_GRAPH_MERGE_DISTANCE",
-		Doc: "How close two entity names must be before they are treated as the same thing. Cosine distance, so smaller is stricter; 0 merges only identical names. Raise it if one person keeps appearing as several nodes, lower it if distinct things are being merged."},
+	{Key: "graph.candidate_distance", Kind: kString, Def: "0.45", Env: "ANAMNESIA_GRAPH_CANDIDATE_DISTANCE",
+		Doc: "How close an existing entity's name must embed to a checkpoint's content before it is offered to the model as a possible match for something the checkpoint mentions. Cosine distance, so smaller is stricter. This does not merge anything by itself — the model decides identity, using the kind and name of each candidate it is shown — so it is deliberately loose; raise it only if relevant entities are consistently missing from what the model is offered."},
 }
 
 // settingByKey indexes settings for lookup.
