@@ -555,11 +555,19 @@ func TestIdentityCallFailureFallsBackToCreatingSeparately(t *testing.T) {
 //
 // It calls a REAL configured embedding provider — skipped, like the
 // database tests, when nothing is configured to run it against — and
-// asserts NearestEntities actually returns priya-raman as a candidate
-// for the freshly-extracted name priha-raman: the one concrete
-// name-to-name case calibrated in
-// .superpowers/sdd/2026-08-20-entity-resolution/progress.md
-// (priya-raman/priha-raman = 0.2349, well inside the 0.45 bound).
+// asserts entityCandidatesForName (not just the recall function
+// underneath it — the real Extractor method, so Cfg.applyDefaults()
+// and the Store binding are exercised too) actually returns priya-raman
+// as a candidate for the freshly-extracted name priha-raman: the one
+// concrete name-to-name case calibrated against openai/text-embedding-
+// 3-small in .superpowers/sdd/2026-08-20-entity-resolution/progress.md
+// (priya-raman/priha-raman = 0.2350, comfortably inside the 0.45 bound;
+// the worst real variant measured, priyna-raman, was 0.3201 — still
+// 0.13 of headroom below the bound). This assertion is deliberately
+// about candidate recall alone, never about a merge outcome: an empty
+// candidate list and a model declining to merge produce the same end
+// state, and conflating the two is exactly what let the inert
+// content-to-name version look correct.
 func TestEntityCandidatesForNameFindsARealVariant(t *testing.T) {
 	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -598,9 +606,14 @@ func TestEntityCandidatesForNameFindsARealVariant(t *testing.T) {
 		t.Fatalf("upsert priya-raman: %v", err)
 	}
 
-	got := entityCandidatesForNameWith(ctx, emb, st.NearestEntities, 0.45, scope, "person", "priha-raman", graphIdentityCandidateK, nil)
+	// The real path, not the DI'd core: an actual Extractor, calling its
+	// actual entityCandidatesForName method, so this also exercises
+	// Cfg.applyDefaults() and the e.Store.NearestEntities method-value
+	// binding, not only the recall algorithm underneath them.
+	ex := &Extractor{Cfg: Config{GraphCandidateDistance: 0.45}, Store: st, Embedder: emb}
+	got := ex.entityCandidatesForName(ctx, scope, "person", "priha-raman")
 	if len(got) == 0 {
-		t.Fatal("NearestEntities found no candidates for priha-raman against a real embedder — recall is structurally broken, the same way content-to-name recall was: see the doc comment above")
+		t.Fatal("entityCandidatesForName found no candidates for priha-raman against a real embedder — recall is structurally broken, the same way content-to-name recall was: see the doc comment above")
 	}
 	found := false
 	for _, m := range got {
