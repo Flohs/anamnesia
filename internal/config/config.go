@@ -81,12 +81,13 @@ type Config struct {
 	GraphMaxOps  int  // ANAMNESIA_GRAPH_MAX_OPS (default 12)
 
 	// GraphCandidateDistance is the cosine distance within which an
-	// existing entity is offered to the graph model as a possible match
-	// for something the checkpoint mentions. It does not merge anything
-	// by itself — the model decides identity — so it is deliberately
-	// loose. 0 is a legitimate value ("offer nothing"), so unlike the
-	// other numeric settings it is not defaulted when zero — it always
-	// comes from ANAMNESIA_GRAPH_CANDIDATE_DISTANCE.
+	// existing entity (same kind) is offered to a newly extracted entity
+	// as a possible match, triggering one extra disambiguation model
+	// call. It does not merge anything by itself — the model decides
+	// identity — so it is deliberately loose. 0 is a legitimate value
+	// ("offer nothing"), so unlike the other numeric settings it is not
+	// defaulted when zero — it always comes from
+	// ANAMNESIA_GRAPH_CANDIDATE_DISTANCE.
 	GraphCandidateDistance float64 // ANAMNESIA_GRAPH_CANDIDATE_DISTANCE (default 0.45)
 
 	// Decay half-lives per experience kind. Relevance falls by half over

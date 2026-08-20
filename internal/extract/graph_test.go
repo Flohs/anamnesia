@@ -179,41 +179,35 @@ func TestEntityNamesAreNormalisedBeforeUpsert(t *testing.T) {
 	}
 }
 
-// The entityCandidatesWith tests below exercise candidate recall —
-// the generous distance filter and the embedder/lookup-failure fallback
-// — without a database: the store's NearestEntities is passed in as a
-// plain function value instead of going through *store.Store, which
-// requires a live Postgres for every call. There is no kind filter to
-// test here on purpose: candidates are not filtered by kind at recall
-// time (the future op's kind isn't known yet), so kind-safety lives
-// downstream — in the prompt (graphSystemPrompt tells the model a
-// shared name under a different kind is a different thing) and in the
-// schema (the (scope, kind, name) unique index makes a same-name,
-// wrong-kind upsert create a new row rather than merge into the
-// candidate's). entityCandidates (the Extractor method) is the thin
-// wrapper that binds NearestEntities to entityCandidatesWith; it is
-// exercised end to end by TestEntityCandidatesOfferExistingEntitiesFromEarlierSessions
-// in graph_db_test.go.
+// The entityCandidatesForNameWith tests below exercise candidate
+// recall — the generous distance filter, the same-kind filter, and the
+// embedder/lookup-failure fallback — without a database: the store's
+// NearestEntities is passed in as a plain function value instead of
+// going through *store.Store, which requires a live Postgres for every
+// call. entityCandidatesForName (the Extractor method) is the thin
+// wrapper that binds NearestEntities to entityCandidatesForNameWith; it
+// and resolveIdentities' batched call are exercised end to end by the
+// DB tests in graph_db_test.go.
 
-func TestEntityCandidatesWithKeepsMatchesWithinDistance(t *testing.T) {
+func TestEntityCandidatesForNameKeepsMatchesWithinDistanceAndKind(t *testing.T) {
 	ctx := context.Background()
 	scope := anamnesia.Scope{UserID: uuid.New()}
 	existing := &anamnesia.Entity{ID: uuid.New(), Kind: "person", Name: "priya-raman"}
-	emb := &fakeEmbedder{Vecs: map[string][]float32{"the checkpoint text": {0.1, 0.2}}}
+	emb := &fakeEmbedder{Vecs: map[string][]float32{"priha-raman": {0.1, 0.2}}}
 	nearest := func(context.Context, anamnesia.Scope, []float32, int) ([]store.EntityMatch, error) {
 		return []store.EntityMatch{{Entity: existing, Distance: 0.1}}, nil
 	}
 
-	got := entityCandidatesWith(ctx, emb, nearest, 0.45, scope, "the checkpoint text", graphCandidateK, nil)
+	got := entityCandidatesForNameWith(ctx, emb, nearest, 0.45, scope, "person", "priha-raman", graphIdentityCandidateK, nil)
 	if len(got) != 1 || got[0].Entity.ID != existing.ID {
-		t.Fatalf("entityCandidatesWith = %v, want the one match within distance 0.45", got)
+		t.Fatalf("entityCandidatesForNameWith = %v, want the one same-kind match within distance 0.45", got)
 	}
 }
 
-func TestEntityCandidatesWithDropsMatchesBeyondDistance(t *testing.T) {
+func TestEntityCandidatesForNameDropsMatchesBeyondDistance(t *testing.T) {
 	ctx := context.Background()
 	scope := anamnesia.Scope{UserID: uuid.New()}
-	emb := &fakeEmbedder{Vecs: map[string][]float32{"the checkpoint text": {0.9, 0.9}}}
+	emb := &fakeEmbedder{Vecs: map[string][]float32{"sku-cache": {0.9, 0.9}}}
 	nearest := func(context.Context, anamnesia.Scope, []float32, int) ([]store.EntityMatch, error) {
 		return []store.EntityMatch{{
 			Entity:   &anamnesia.Entity{ID: uuid.New(), Kind: "project", Name: "sku-catalog"},
@@ -221,13 +215,38 @@ func TestEntityCandidatesWithDropsMatchesBeyondDistance(t *testing.T) {
 		}}, nil
 	}
 
-	got := entityCandidatesWith(ctx, emb, nearest, 0.45, scope, "the checkpoint text", graphCandidateK, nil)
+	got := entityCandidatesForNameWith(ctx, emb, nearest, 0.45, scope, "project", "sku-cache", graphIdentityCandidateK, nil)
 	if len(got) != 0 {
-		t.Errorf("entityCandidatesWith = %v, want none (distance 0.5 is beyond 0.45)", got)
+		t.Errorf("entityCandidatesForNameWith = %v, want none (distance 0.5 is beyond 0.45)", got)
 	}
 }
 
-func TestEntityCandidatesWithEmbedderErrorYieldsNoCandidates(t *testing.T) {
+// TestEntityCandidatesForNameDropsMatchesOfADifferentKind is the guard
+// this whole redesign leans on: candidates of a different kind are
+// filtered out here, before the model ever sees them — not left for the
+// model to reject. Measured against the real embedder, "rotterdam"
+// (place) and "rotterdam-warehouse" (site) sit at 0.2256, well inside
+// any workable candidate bound, so without this filter a city would be
+// offered as a candidate for a warehouse inside it.
+func TestEntityCandidatesForNameDropsMatchesOfADifferentKind(t *testing.T) {
+	ctx := context.Background()
+	scope := anamnesia.Scope{UserID: uuid.New()}
+	emb := &fakeEmbedder{Vecs: map[string][]float32{"rotterdam-warehouse": {0.5, 0.5}}}
+	nearest := func(context.Context, anamnesia.Scope, []float32, int) ([]store.EntityMatch, error) {
+		return []store.EntityMatch{{
+			// Same tiny distance as a clear match, but a different kind.
+			Entity:   &anamnesia.Entity{ID: uuid.New(), Kind: "place", Name: "rotterdam"},
+			Distance: 0.02,
+		}}, nil
+	}
+
+	got := entityCandidatesForNameWith(ctx, emb, nearest, 0.45, scope, "site", "rotterdam-warehouse", graphIdentityCandidateK, nil)
+	if len(got) != 0 {
+		t.Errorf("entityCandidatesForNameWith = %v, want none: the match is kind %q, the entity is kind %q", got, "place", "site")
+	}
+}
+
+func TestEntityCandidatesForNameEmbedderErrorYieldsNoCandidates(t *testing.T) {
 	ctx := context.Background()
 	scope := anamnesia.Scope{UserID: uuid.New()}
 	emb := &fakeEmbedder{Err: errors.New("embedding provider is down")}
@@ -237,41 +256,25 @@ func TestEntityCandidatesWithEmbedderErrorYieldsNoCandidates(t *testing.T) {
 		return nil, nil
 	}
 
-	got := entityCandidatesWith(ctx, emb, nearest, 0.45, scope, "the checkpoint text", graphCandidateK, nil)
+	got := entityCandidatesForNameWith(ctx, emb, nearest, 0.45, scope, "person", "priha-raman", graphIdentityCandidateK, nil)
 	if got != nil {
-		t.Errorf("entityCandidatesWith = %v, want nil: an embedder failure must not fail the pass, it must yield no candidates", got)
+		t.Errorf("entityCandidatesForNameWith = %v, want nil: an embedder failure must not fail the pass, it must yield no candidates", got)
 	}
 	if nearestCalled {
 		t.Error("NearestEntities was called after the embedder failed; it must never run without a vector")
 	}
 }
 
-func TestEntityCandidatesWithLookupErrorYieldsNoCandidates(t *testing.T) {
+func TestEntityCandidatesForNameLookupErrorYieldsNoCandidates(t *testing.T) {
 	ctx := context.Background()
 	scope := anamnesia.Scope{UserID: uuid.New()}
-	emb := &fakeEmbedder{Vecs: map[string][]float32{"the checkpoint text": {0.1, 0.2}}}
+	emb := &fakeEmbedder{Vecs: map[string][]float32{"priha-raman": {0.1, 0.2}}}
 	nearest := func(context.Context, anamnesia.Scope, []float32, int) ([]store.EntityMatch, error) {
 		return nil, errors.New("store is down")
 	}
 
-	got := entityCandidatesWith(ctx, emb, nearest, 0.45, scope, "the checkpoint text", graphCandidateK, nil)
+	got := entityCandidatesForNameWith(ctx, emb, nearest, 0.45, scope, "person", "priha-raman", graphIdentityCandidateK, nil)
 	if got != nil {
-		t.Errorf("entityCandidatesWith = %v, want nil: a lookup failure must not fail the pass", got)
-	}
-}
-
-func TestEntityCandidateListShapesForThePrompt(t *testing.T) {
-	id := uuid.New()
-	matches := []store.EntityMatch{{Entity: &anamnesia.Entity{ID: id, Kind: "person", Name: "priya-raman"}, Distance: 0.1}}
-	got := entityCandidateList(matches)
-	if len(got) != 1 {
-		t.Fatalf("entityCandidateList = %v, want 1 candidate", got)
-	}
-	c := got[0]
-	if c.Domain != "entity" || c.ID != id.String() || c.Body != "priya-raman" {
-		t.Errorf("candidate = %+v, want domain=entity id=%s body=priya-raman", c, id)
-	}
-	if kind, _ := c.Meta["kind"].(string); kind != "person" {
-		t.Errorf("candidate.Meta[kind] = %v, want %q", c.Meta["kind"], "person")
+		t.Errorf("entityCandidatesForNameWith = %v, want nil: a lookup failure must not fail the pass", got)
 	}
 }

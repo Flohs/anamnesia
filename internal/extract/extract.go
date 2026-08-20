@@ -69,10 +69,10 @@ type Config struct {
 	// produce. Default 12.
 	GraphMaxOps int
 	// GraphCandidateDistance is the cosine distance within which an
-	// existing entity is offered to the graph model as a possible match
-	// for something a checkpoint mentions — a recall net for the
-	// prompt, not a merge decision; the model judges identity. 0 is a
-	// legitimate value ("offer nothing"), so applyDefaults leaves it
+	// existing entity (same kind) is offered to a newly extracted
+	// entity as a possible match — recall that triggers a disambiguation
+	// model call, not a merge decision; the model judges identity. 0 is
+	// a legitimate value ("offer nothing"), so applyDefaults leaves it
 	// alone rather than treating zero as unset.
 	GraphCandidateDistance float64
 }

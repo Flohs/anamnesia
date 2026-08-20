@@ -19,13 +19,23 @@ import (
 // set, is used verbatim instead of marshaling Ops — Operation has no
 // name/from/to/props fields, so a test that needs a graph op shape
 // (ADD_ENTITY/ADD_EDGE) builds its own JSON and sets this instead.
+//
+// Verdicts/VerdictsErr answer the graph pass's second, conditional call
+// (see resolveIdentities in graph.go): Extract branches on
+// in.SchemaName to tell the two calls apart, since they decode into
+// different envelope shapes. Prompt/System/Schema hold the LAST call's
+// values, which is what a test wants when it needs to inspect the
+// disambiguation call specifically — that is always the second and
+// therefore final call in any test that triggers one.
 type fakeLLM struct {
-	Ops    []Operation
-	RawOps []json.RawMessage
-	Calls  int
-	Prompt string
-	System string
-	Schema json.RawMessage
+	Ops         []Operation
+	RawOps      []json.RawMessage
+	Verdicts    []identityVerdict
+	VerdictsErr error
+	Calls       int
+	Prompt      string
+	System      string
+	Schema      json.RawMessage
 }
 
 func mustJSON(v any) json.RawMessage {
@@ -44,6 +54,13 @@ func (f *fakeLLM) Extract(_ context.Context, in llm.DistillInput, out any) error
 	f.Prompt = in.User
 	f.System = in.System
 	f.Schema = in.Schema
+	if in.SchemaName == "anamnesia_identity_verdicts" {
+		if f.VerdictsErr != nil {
+			return f.VerdictsErr
+		}
+		raw, _ := json.Marshal(identityVerdictResponse{Verdicts: f.Verdicts})
+		return json.Unmarshal(raw, out)
+	}
 	rawOps := f.RawOps
 	if rawOps == nil {
 		rawOps = make([]json.RawMessage, len(f.Ops))

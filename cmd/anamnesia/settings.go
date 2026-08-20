@@ -191,7 +191,7 @@ var settings = []setting{
 	{Key: "graph.max_ops", Kind: kInt, Def: "12", Env: "ANAMNESIA_GRAPH_MAX_OPS",
 		Doc: "Caps how many entities and edges one checkpoint may produce."},
 	{Key: "graph.candidate_distance", Kind: kString, Def: "0.45", Env: "ANAMNESIA_GRAPH_CANDIDATE_DISTANCE",
-		Doc: "How close an existing entity's name must embed to a checkpoint's content before it is offered to the model as a possible match for something the checkpoint mentions. Cosine distance, so smaller is stricter. This does not merge anything by itself — the model decides identity, using the kind and name of each candidate it is shown — so it is deliberately loose; raise it only if relevant entities are consistently missing from what the model is offered."},
+		Doc: "How close an existing entity's name must embed to a newly extracted entity's name, and share its kind, before it is offered to the model as a possible match — triggering one extra, otherwise-skipped model call per checkpoint to ask whether the two are really the same thing. Cosine distance, so smaller is stricter. This does not merge anything by itself: the model decides identity, so it is deliberately loose; raise it only if relevant entities are consistently missing from what the model is offered."},
 }
 
 // settingByKey indexes settings for lookup.

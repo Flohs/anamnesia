@@ -81,9 +81,82 @@ Rules:
 - Prefer FEW durable relationships over many incidental ones. A relationship earns an edge when it would still be true next month; a one-off action does not.
 - Default to NOOP when nothing durable is described. Most checkpoints describe activity, not structure.
 - Output JSON only, matching: {"operations":[{"op":"...", ...}]}. No prose, no markdown fences.
-- Keep trust in [0,1]. Default 0.7 if you have no other signal.
+- Keep trust in [0,1]. Default 0.7 if you have no other signal.`
 
-The payload's "candidates" list, when present, holds entities that may already exist in this scope: each has a "body" (its name) and "meta.kind" (its kind). They are a recall net, not a verdict — some may be irrelevant. Before an ADD_ENTITY, check whether a candidate is the SAME real-world thing this text means, even under a different spelling ("Priha Raman" vs "priya-raman" is the same person misspelled) — if so, use ITS EXACT name and kind, so the two land on one node instead of forking. A candidate only matches if the kind agrees too: the same name under a different kind is a different thing (a service and a project sharing a name are not interchangeable), and two similar names can still be two different people, versions, or opposites (a read replica is not a write replica). When unsure, or when nothing fits, create a new entity — a fork is easy to fix later, a wrong merge is not.`
+// graphIdentitySystemPrompt drives the second, conditional model call:
+// see resolveIdentities. It never runs unless at least one entity this
+// checkpoint just extracted has a nearby existing entity to weigh
+// against, so most checkpoints never pay for it.
+const graphIdentitySystemPrompt = `You are resolving entity identity for a memory graph. You will be given entities just extracted from a checkpoint, each paired with one or more CANDIDATES: existing entities in the same scope whose name embedded close to it. A candidate is a possible match, not a confirmed one.
+
+For each entity, decide: is it the SAME real-world thing as one of its candidates, merely named or spelled differently ("Priha Raman" vs "priya-raman" is the same person misspelled) — or a DIFFERENT thing that happens to have a similar name (a different person, a different version, an opposite)? "priya-ramanujan" is a different person from "priya-raman", not a longer spelling of the same one. A read replica is not a write replica. A service and a project sharing a name are not interchangeable.
+
+Only report "same_as" when you are genuinely confident, and only with a candidate id offered for THAT entity. When unsure, or when none of its candidates fit, omit "same_as" — a duplicate entity is easy to fix later; a wrongly merged one is not.
+
+Output JSON only, matching: {"verdicts":[{"entity":"...","same_as":"<a candidate id from that entity's own list, or omit if none match>"}]}. No prose, no markdown fences.`
+
+// identityVerdictSchema is the JSON Schema for the identity
+// disambiguation call's response — a disjoint shape from
+// graphOperationSchema, same reasoning as that schema's own comment.
+var identityVerdictSchema = json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "verdicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "entity":  {"type": "string"},
+          "same_as": {"type": "string"}
+        },
+        "required": ["entity"]
+      }
+    }
+  },
+  "required": ["verdicts"]
+}`)
+
+// identityVerdict is one "same or different" judgment from the identity
+// disambiguation call. SameAs is a candidate's id, or empty for "this is
+// a different, new entity".
+type identityVerdict struct {
+	Entity string `json:"entity"`
+	SameAs string `json:"same_as,omitempty"`
+}
+
+type identityVerdictResponse struct {
+	Verdicts []identityVerdict `json:"verdicts"`
+}
+
+// capturedVerdicts decodes the verdicts envelope while keeping the raw
+// JSON for the trace, the same technique capturedOps uses (extract.go)
+// and for the same reason: every provider hands `out` to json.Unmarshal,
+// so implementing Unmarshaler is enough to see the document without
+// touching the llm package.
+type capturedVerdicts struct {
+	raw  json.RawMessage
+	resp identityVerdictResponse
+}
+
+func (c *capturedVerdicts) UnmarshalJSON(b []byte) error {
+	c.raw = append(c.raw[:0], b...)
+	return json.Unmarshal(b, &c.resp)
+}
+
+// identityCandidateJSON and identityQuery shape the identity
+// disambiguation call's payload: one entry per extracted entity that
+// has at least one candidate, each candidate carrying only what the
+// model needs — an id to answer with, a name and kind to judge by.
+type identityCandidateJSON struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Kind string `json:"kind"`
+}
+type identityQuery struct {
+	Entity     string                  `json:"entity"`
+	Kind       string                  `json:"kind"`
+	Candidates []identityCandidateJSON `json:"candidates"`
+}
 
 // normaliseEntityName canonicalises a name so upsert dedupes on meaning
 // rather than on the literal string ON CONFLICT sees: "The Rotterdam
@@ -98,72 +171,66 @@ func normaliseEntityName(name string) string {
 	return slugKey(s)
 }
 
-// graphCandidateK is how many nearest entities to offer the model as
-// candidates. Generous on purpose: this is recall, not a decision, so
-// the cost of including one too many is a slightly longer prompt, not a
-// wrong merge — see entityCandidatesWith.
-const graphCandidateK = 10
+// graphIdentityCandidateK is how many nearest same-named entities to
+// consider per extracted entity before asking the model to judge them.
+// Small on purpose: unlike a broad content-based recall, this is a
+// specific name lookup, so a handful of nearest neighbours is enough
+// for the model to see every plausible match.
+const graphIdentityCandidateK = 3
 
-// entityCandidates embeds the checkpoint's content and asks the store
-// for the entities in scope whose name embedding is nearest to it,
-// keeping only those within graph.candidate_distance. It does NOT
-// decide identity — see entityCandidatesWith for why a distance number
-// cannot — it only recalls entities worth putting in front of the model
-// before the (single) graph model call, so a name mentioned under a new
-// spelling can be recognised as one already known.
-func (e *Extractor) entityCandidates(ctx context.Context, scope anamnesia.Scope, content string) []store.EntityMatch {
+// entityCandidatesForName embeds one extracted entity's name and asks
+// the store for existing entities of the SAME kind within
+// graph.candidate_distance. This is recall, not a decision — identity
+// is judged by resolveIdentities' model call, never by this distance.
+//
+// Distance-threshold MERGING (deciding identity from this distance
+// alone) was tried and rejected: measured against the real embedder,
+// priya-raman/priha-raman (0.2349, the motivating typo, must merge)
+// sits CLOSER than priya-raman/priya-ramanujan (0.1165, a different
+// person, must not), auth-service/auth-service-v2 (0.1203) and
+// read-replica/write-replica (0.1365, opposites) — no threshold
+// separates the must-merge case from the must-not-merge cases, because
+// short names embed by shared prefix/token overlap, not by meaning.
+//
+// The same-kind filter is applied HERE, before the model ever sees
+// anything — not as a check on its answer. That makes the guard
+// load-bearing rather than defensive: measured against the real
+// embedder, "rotterdam" (place) and "rotterdam-warehouse" (site) sit at
+// 0.2256 — inside any workable candidate bound — so without this filter
+// a city would be offered as a candidate for a warehouse inside it
+// (Ruling 5, .superpowers/sdd/2026-08-20-entity-resolution/progress.md).
+// Filtering here means a cross-kind pair is never even asked about; the
+// (scope, kind, name) unique index is a second, independent line of
+// defence in case this filter is ever bypassed or removed.
+//
+// An embedder or lookup failure must not fail the graph pass, so either
+// simply yields no candidates for this entity — it still gets created,
+// using the model's own judgment of the extraction text, same as before
+// candidate recall existed.
+func (e *Extractor) entityCandidatesForName(ctx context.Context, scope anamnesia.Scope, kind, name string) []store.EntityMatch {
 	threshold := e.Cfg.applyDefaults().GraphCandidateDistance
-	return entityCandidatesWith(ctx, e.Embedder, e.Store.NearestEntities, threshold, scope, content, graphCandidateK, e.Log)
+	return entityCandidatesForNameWith(ctx, e.Embedder, e.Store.NearestEntities, threshold, scope, kind, name, graphIdentityCandidateK, e.Log)
 }
 
-// entityCandidatesWith is entityCandidates' logic with the store call
-// taken as a function value instead of a *store.Store, so recall can be
-// unit tested without a database.
-//
-// Distance-threshold MERGING was tried and rejected: measured against
-// the real embedder, priya-raman/priha-raman (0.2349, the motivating
-// typo, must merge) sits CLOSER than priya-raman/priya-ramanujan
-// (0.1165, a different person, must not), auth-service/auth-service-v2
-// (0.1203) and read-replica/write-replica (0.1365, opposites) — no
-// threshold separates the must-merge case from the must-not-merge
-// cases, because short names embed by shared prefix/token overlap, not
-// by meaning. So this function only narrows a candidate list; the
-// graph system prompt asks the model to judge identity — it knows
-// Ramanujan isn't Raman and a read replica isn't a write replica, which
-// a distance cannot.
-//
-// The same-kind guard now lives in two places, both load-bearing:
-// each candidate carries its kind into the prompt (graphSystemPrompt
-// tells the model a shared name under a different kind is a different
-// thing — "rotterdam" the place vs "rotterdam-warehouse" the site
-// embed within a plausible distance, per Ruling 5 in
-// .superpowers/sdd/2026-08-20-entity-resolution/progress.md), and the
-// entities table's unique index is on (scope, kind, name) — so even if
-// the model reuses a candidate's name under the WRONG kind, ON CONFLICT
-// does not fire and a new row is created rather than a wrong merge.
-// A fork is recoverable; a wrong merge is not, so the schema itself
-// makes the irreversible failure structurally impossible.
-//
-// An embedder or lookup failure must not fail the graph pass (a graph
-// that stops extracting is worse than one that occasionally forks), so
-// either simply yields no candidates: the model still extracts, using
-// only its own judgment of the text, same as before this recall step
-// existed.
-func entityCandidatesWith(
+// entityCandidatesForNameWith is entityCandidatesForName's logic with
+// the store call taken as a function value instead of a *store.Store,
+// so recall (including the same-kind filter) can be unit tested
+// without a database.
+func entityCandidatesForNameWith(
 	ctx context.Context,
 	embedder embed.Embedder,
 	nearest func(ctx context.Context, scope anamnesia.Scope, vec []float32, limit int) ([]store.EntityMatch, error),
 	threshold float64,
-	scope anamnesia.Scope, content string, k int,
+	scope anamnesia.Scope, kind, name string, k int,
 	log *slog.Logger,
 ) []store.EntityMatch {
 	if embedder == nil {
 		return nil
 	}
-	vecs, err := embedder.Embed(ctx, []string{content})
+	vecs, err := embedder.Embed(ctx, []string{name})
 	if err != nil {
 		if log != nil {
-			log.Warn("extractor: embed checkpoint content for entity candidates failed", "err", err)
+			log.Warn("extractor: embed entity name for candidate recall failed", "name", name, "err", err)
 		}
 		return nil
 	}
@@ -173,41 +240,125 @@ func entityCandidatesWith(
 	matches, err := nearest(ctx, scope, vecs[0], k)
 	if err != nil {
 		if log != nil {
-			log.Warn("extractor: nearest-entity candidate lookup failed", "err", err)
+			log.Warn("extractor: nearest-entity candidate lookup failed", "name", name, "err", err)
 		}
 		return nil
 	}
 	out := make([]store.EntityMatch, 0, len(matches))
 	for _, m := range matches {
-		if m.Distance <= threshold {
+		if m.Distance <= threshold && m.Entity.Kind == kind {
 			out = append(out, m)
 		}
 	}
 	return out
 }
 
-// entityCandidateList turns nearest-entity matches into the candidate
-// shape userPrompt already knows how to send (see extract.go): domain
-// "entity", the entity's id, its name as Body, and its kind in Meta —
-// exactly what graphSystemPrompt tells the model to read.
-func entityCandidateList(matches []store.EntityMatch) []candidate {
-	out := make([]candidate, 0, len(matches))
-	for _, m := range matches {
-		out = append(out, candidate{
-			Domain: "entity",
-			ID:     m.Entity.ID.String(),
-			Body:   m.Entity.Name,
-			Meta:   map[string]any{"kind": m.Entity.Kind},
-		})
+// entityCandidateSet is one ADD_ENTITY op's normalised name/kind
+// alongside the existing entities entityCandidatesForName found for
+// it — input to the identity disambiguation call, not yet a decision.
+type entityCandidateSet struct {
+	Name    string
+	Kind    string
+	Matches []store.EntityMatch
+}
+
+// resolveIdentities gathers, for every ADD_ENTITY op, existing entities
+// recall found nearby (same kind, within graph.candidate_distance) and
+// — only when at least one entity has any — makes ONE additional model
+// call for the whole checkpoint, presenting each extracted name against
+// its candidates and asking the model to affirm or reject each. Most
+// checkpoints have no candidates and pay for no extra call.
+//
+// The returned map holds only pairs the model affirmed AND that name a
+// candidate id actually offered for that entity — a hallucinated or
+// mismatched id is dropped, not trusted. A call that errors returns nil:
+// per instruction, an unavailable judge falls back to creating every
+// entity separately, never to merging, because a guessed merge is
+// exactly the failure this whole design exists to avoid.
+func (e *Extractor) resolveIdentities(ctx context.Context, scope anamnesia.Scope, ops []graphOperation, tr *activity.Trace) map[string]uuid.UUID {
+	var sets []entityCandidateSet
+	for _, op := range ops {
+		if strings.ToUpper(strings.TrimSpace(op.Op)) != "ADD_ENTITY" {
+			continue
+		}
+		name := normaliseEntityName(op.Name)
+		if name == "" || op.Kind == "" {
+			continue
+		}
+		if matches := e.entityCandidatesForName(ctx, scope, op.Kind, name); len(matches) > 0 {
+			sets = append(sets, entityCandidateSet{Name: name, Kind: op.Kind, Matches: matches})
+		}
 	}
-	return out
+	if len(sets) == 0 {
+		tr.Step("identity", "No extracted entity had a nearby existing candidate; nothing to disambiguate",
+			map[string]any{"entities_with_candidates": 0})
+		return nil
+	}
+
+	queries := make([]identityQuery, 0, len(sets))
+	byName := make(map[string]entityCandidateSet, len(sets))
+	for _, s := range sets {
+		byName[s.Name] = s
+		cands := make([]identityCandidateJSON, 0, len(s.Matches))
+		for _, m := range s.Matches {
+			cands = append(cands, identityCandidateJSON{ID: m.Entity.ID.String(), Name: m.Entity.Name, Kind: m.Entity.Kind})
+		}
+		queries = append(queries, identityQuery{Entity: s.Name, Kind: s.Kind, Candidates: cands})
+	}
+	payload, _ := json.Marshal(map[string]any{"entities": queries})
+
+	captured := &capturedVerdicts{}
+	if err := e.LLM.Extract(ctx, llm.DistillInput{
+		System:     graphIdentitySystemPrompt,
+		User:       string(payload),
+		MaxTok:     512,
+		Schema:     identityVerdictSchema,
+		SchemaName: "anamnesia_identity_verdicts",
+	}, captured); err != nil {
+		if e.Log != nil {
+			e.Log.Warn("extractor: identity disambiguation call failed, creating entities separately", "err", err)
+		}
+		tr.Step("identity", fmt.Sprintf("%d entities had candidates; the disambiguation call failed, so none merge", len(sets)),
+			map[string]any{"entities_with_candidates": len(sets), "error": err.Error()})
+		return nil
+	}
+
+	affirmed := make(map[string]uuid.UUID)
+	var affirmedLog []string
+	for _, v := range captured.resp.Verdicts {
+		if v.SameAs == "" {
+			continue
+		}
+		set, ok := byName[v.Entity]
+		if !ok {
+			continue // the model named an entity we never asked about
+		}
+		for _, m := range set.Matches {
+			if m.Entity.ID.String() == v.SameAs {
+				affirmed[v.Entity] = m.Entity.ID
+				affirmedLog = append(affirmedLog, fmt.Sprintf("%q merged into %q (kind %s, model-affirmed, candidate distance %.4f)",
+					v.Entity, m.Entity.Name, set.Kind, m.Distance))
+				break
+			}
+		}
+		// A same_as that matches none of this entity's own candidates is
+		// a hallucinated or mismatched id — dropped, not trusted.
+	}
+	tr.Step("identity", fmt.Sprintf("%d entities had candidates; the model affirmed %d merges", len(sets), len(affirmed)),
+		map[string]any{
+			"entities_with_candidates": len(sets),
+			"merges_affirmed":          affirmedLog,
+			"raw_response":             string(captured.raw),
+		})
+	return affirmed
 }
 
 // embedEntityName is a best-effort embed of one entity's name, so a
 // newly created entity carries a vector for a later checkpoint's
-// entityCandidates call to find it by. nil on any failure — an embedder
-// problem must not fail the graph pass, and UpsertEntity already treats
-// a nil Embedding as "no vector yet" rather than an error.
+// entityCandidatesForName call to find it by. nil on any failure — an
+// embedder problem must not fail the graph pass, and UpsertEntity
+// already treats a nil Embedding as "no vector yet" rather than an
+// error.
 func (e *Extractor) embedEntityName(ctx context.Context, name string) []float32 {
 	if e.Embedder == nil {
 		return nil
@@ -253,19 +404,12 @@ func resolveEdges(ops []graphOperation, known map[string]uuid.UUID) (resolved []
 }
 
 // runGraph is the graph pass for one claude-session-graph source: one
-// model call, then entity upserts, edge resolution and edge writes
-// against the store.
+// model call (plus, rarely, a second — see resolveIdentities), then
+// entity upserts, edge resolution and edge writes against the store.
 func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *activity.Trace) (int, error) {
 	cfg := e.Cfg.applyDefaults()
 	content := strings.TrimSpace(src.RawContent)
-
-	// Candidate recall happens before the (single) model call, not after
-	// it: it exists to help the model name an entity consistently with
-	// what already exists, not to second-guess what it named. See
-	// entityCandidatesWith for why this is recall, not a merge decision.
-	candMatches := e.entityCandidates(ctx, src.Scope, content)
-	cands := entityCandidateList(candMatches)
-	prompt := e.userPrompt(src, content, cands)
+	prompt := e.userPrompt(src, content, nil)
 
 	captured := &capturedOps{}
 	started := time.Now()
@@ -283,12 +427,11 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 	resp := captured.resp
 	tr.Step("llm", fmt.Sprintf("%s returned %d graph operations", e.LLM.Model(), len(resp.Operations)),
 		map[string]any{
-			"model":                     e.LLM.Model(),
-			"latency_ms":                time.Since(started).Milliseconds(),
-			"prompt_chars":              len(graphSystemPrompt) + len(prompt),
-			"completion_chars":          len(captured.raw),
-			"raw_response":              string(captured.raw),
-			"entity_candidates_offered": cands,
+			"model":            e.LLM.Model(),
+			"latency_ms":       time.Since(started).Milliseconds(),
+			"prompt_chars":     len(graphSystemPrompt) + len(prompt),
+			"completion_chars": len(captured.raw),
+			"raw_response":     string(captured.raw),
 		})
 
 	if len(resp.Operations) > cfg.GraphMaxOps {
@@ -310,15 +453,19 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 		ops = append(ops, op)
 	}
 
+	// Identity is resolved before any upsert: recall nearby existing
+	// entities per extracted name, and — only if that found anything —
+	// ask the model to affirm or reject each. See resolveIdentities.
+	affirmed := e.resolveIdentities(ctx, src.Scope, ops, tr)
+
 	// Upsert every ADD_ENTITY op, normalised, collecting ids by name.
-	// Identity itself was decided upstream of this: the candidates
-	// offered above give the model the chance to reuse an existing
-	// name/kind for the same real-world thing, and the ordinary
-	// (scope, kind, name) upsert then lands both on one row. This loop
-	// does not judge — a name the model chose not to reuse creates a
-	// new entity, same as it always has.
+	// An op whose name the model just affirmed is the same as an
+	// existing entity reuses that entity's id instead of upserting a
+	// new one; everything else creates normally, exactly as before any
+	// of this existed.
 	known := make(map[string]uuid.UUID)
 	upserted := make([]*anamnesia.Entity, 0, len(ops))
+	var merged []string
 	failures := make([]string, 0)
 	for _, op := range ops {
 		if strings.ToUpper(strings.TrimSpace(op.Op)) != "ADD_ENTITY" {
@@ -327,6 +474,11 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 		name := normaliseEntityName(op.Name)
 		if name == "" || op.Kind == "" {
 			failures = append(failures, fmt.Sprintf("ADD_ENTITY %q: kind and name required", op.Name))
+			continue
+		}
+		if id, ok := affirmed[name]; ok {
+			known[name] = id
+			merged = append(merged, name)
 			continue
 		}
 		ent := &anamnesia.Entity{Scope: src.Scope, Kind: op.Kind, Name: name, Props: op.Props}
@@ -426,22 +578,23 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 		}
 	}
 
-	tr.Step("graph", fmt.Sprintf("Upserted %d entities, created %d edges (%d superseded, %d dropped)",
-		len(upserted), edgesCreated, edgesSuperseded, len(dropped)),
+	tr.Step("graph", fmt.Sprintf("Upserted %d entities, merged %d, created %d edges (%d superseded, %d dropped)",
+		len(upserted), len(merged), edgesCreated, edgesSuperseded, len(dropped)),
 		map[string]any{
 			"entities_upserted": len(upserted),
+			"entities_merged":   merged,
 			"edges_created":     edgesCreated,
 			"edges_superseded":  edgesSuperseded,
 			"edges_dropped":     dropped,
 			"failures":          failures,
 		})
 
-	executed := len(upserted) + edgesCreated
+	executed := len(upserted) + len(merged) + edgesCreated
 	if executed == 0 {
 		tr.End("skipped", "The model found no durable entities or relationships")
 	} else {
 		tr.End("ok", fmt.Sprintf("Extracted %d entities and %d edges from a %s %s source",
-			len(upserted), edgesCreated, humanBytes(len(content)), src.Kind))
+			len(upserted)+len(merged), edgesCreated, humanBytes(len(content)), src.Kind))
 	}
 	return executed, nil
 }
