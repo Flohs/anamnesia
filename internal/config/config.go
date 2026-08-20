@@ -88,6 +88,13 @@ type Config struct {
 	// ("offer nothing"), so unlike the other numeric settings it is not
 	// defaulted when zero — it always comes from
 	// ANAMNESIA_GRAPH_CANDIDATE_DISTANCE.
+	//
+	// Range 0 to 1, which is fraction()'s bound below and, deliberately,
+	// not the full 0-to-2 range of a cosine distance: past 1 the two
+	// names point away from each other, and "less alike than unrelated"
+	// is not a threshold for offering them as the same thing. The same
+	// bound is enforced where the value is typed, by settings.go's
+	// kFraction, so `anamnesia config set` and the server agree.
 	GraphCandidateDistance float64 // ANAMNESIA_GRAPH_CANDIDATE_DISTANCE (default 0.45)
 
 	// Decay half-lives per experience kind. Relevance falls by half over
