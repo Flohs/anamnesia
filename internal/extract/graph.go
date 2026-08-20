@@ -8,11 +8,11 @@
 package extract
 
 import (
-	"regexp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 

@@ -14,9 +14,9 @@
 package config
 
 import (
-	"math"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
