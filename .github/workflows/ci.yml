@@ -9,11 +9,29 @@ permissions:
   contents: read
 
 jobs:
-  # Formatting, vet and unit tests. No database and no Docker needed: the
-  # tests that matter for install correctness run against temporary
-  # directories, which is why they can gate every pull request.
+  # Formatting, vet and tests, against a real database. Without one, every
+  # DB-backed test calls t.Skip and the job reports success having run 71
+  # fewer tests than it appears to — a gate that cannot turn red. pgvector
+  # rather than stock postgres: the schema declares vector columns, so
+  # Migrate fails on an image without the extension.
   check:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: anamnesia
+          POSTGRES_PASSWORD: anamnesia-test
+          POSTGRES_DB: anamnesia
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U anamnesia"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ANAMNESIA_TEST_DATABASE_URL: postgres://anamnesia:anamnesia-test@127.0.0.1:5432/anamnesia?sslmode=disable
     steps:
       - uses: actions/checkout@v4
 
@@ -36,6 +54,20 @@ jobs:
 
       - name: go test
         run: go test -race ./...
+
+      # The database is what stops the DB-backed tests skipping, and a
+      # broken DSN would put them straight back to skipping while the job
+      # stayed green. Fail if more than a couple skip: the real-embedder
+      # test skips by design here, since CI holds no provider key.
+      - name: fail if tests are skipping
+        run: |
+          skipped=$(go test ./... -count=1 -v 2>&1 | grep -c "^\s*--- SKIP" || true)
+          echo "skipped: $skipped"
+          if [ "$skipped" -gt 2 ]; then
+            echo "$skipped tests skipped — the database is not reachable, so this job is green without having run them"
+            go test ./... -count=1 -v 2>&1 | grep "^\s*--- SKIP" | head -20
+            exit 1
+          fi
 
       - name: build
         run: go build ./...
