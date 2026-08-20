@@ -93,6 +93,18 @@ func TestSourcesForEntitiesRoundTrips(t *testing.T) {
 	if len(got) != 2 {
 		t.Errorf("SourcesForEntities = %v, want both sources", got)
 	}
+	// Each source comes back paired with the entity that reached it, not
+	// as a bare id: the graph walk batches many entities into one call
+	// and needs that pairing to know which edge's trust a source
+	// inherits.
+	for _, es := range got {
+		if es.EntityID != ent.ID {
+			t.Errorf("SourcesForEntities returned entity %s, want %s", es.EntityID, ent.ID)
+		}
+		if es.SourceID != srcIDs[0] && es.SourceID != srcIDs[1] {
+			t.Errorf("SourcesForEntities returned source %s, want one of %v", es.SourceID, srcIDs)
+		}
+	}
 }
 
 func TestLookupEntitiesByName(t *testing.T) {

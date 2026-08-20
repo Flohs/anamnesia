@@ -232,6 +232,17 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 		if r.lRk > 0 {
 			s += 1.0 / (q.RRFConst + float64(r.lRk))
 		}
+		// The graph term enters at the same weight as the other two: a
+		// graph hit at rank 1 scores what a vector hit at rank 1 scores.
+		// Whether a walk deserves that much is a real question and this
+		// is not an answer to it — it is what an unweighted RRF does,
+		// and nothing here has measured the alternative. It cannot be
+		// measured yet either: `anamnesia eval` posts kind="chat-turn"
+		// sources, which never run the graph extraction pass, so every
+		// eval corpus has an empty graph and this term is always zero
+		// in it. Weighting the channel is worth revisiting once the
+		// harness can build a corpus with a graph in it and measure
+		// what the channel displaces, not before.
 		if r.gRk > 0 {
 			s += 1.0 / (q.RRFConst + float64(r.gRk))
 		}

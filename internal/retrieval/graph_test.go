@@ -2,7 +2,9 @@ package retrieval
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -695,5 +697,188 @@ func TestASlowGraphWalkDegradesInsteadOfEliminatingRetrieval(t *testing.T) {
 	}
 	if foundExp2 {
 		t.Errorf("hits = %v, want the graph-only ibex experience absent: the walk was blocked, so it cannot have contributed", hitIDs(got.hits))
+	}
+}
+
+// trustWalk is the fixture both ordering tests below share: one seed
+// source, and three neighbour entities reachable from it over edges of
+// clearly different trust, each mentioning one source with one
+// experience on it.
+//
+// The row-level trusts run the other way round on purpose. Extraction
+// stamps essentially every row 0.7 (internal/extract/extract.go), so a
+// fixture where row trust and edge trust agree would be green whichever
+// signal the walk actually ordered on. Here the weakest edge carries the
+// strongest row, so ordering by the row's own trust — which is what
+// graphExpand did before the walk kept hold of which neighbour reached
+// which source — puts exactly the wrong row first. The three
+// experiences are also inserted weakest-edge-first, so a plan that keeps
+// scan order cannot accidentally look right either.
+type trustWalk struct {
+	eng   *Engine
+	scope anamnesia.Scope
+	seed  []anamnesia.SearchHit
+	// The three graph-reachable experiences, by the trust of the edge
+	// that reaches them: 0.9, 0.5, 0.2.
+	high, mid, low uuid.UUID
+	label          map[uuid.UUID]string
+}
+
+func newTrustWalk(t *testing.T, name string) trustWalk {
+	t.Helper()
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	handle := name + "-" + uuid.NewString()[:8]
+	uid, err := st.EnsureUser(ctx, handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), handle) })
+	scope := anamnesia.Scope{UserID: uid}
+
+	source := func() *anamnesia.Source {
+		src := &anamnesia.Source{Scope: scope, Kind: "claude-session-graph", RawContent: "x"}
+		if err := st.InsertSource(ctx, src); err != nil {
+			t.Fatal(err)
+		}
+		return src
+	}
+	experience := func(src *anamnesia.Source, title string, trust float32) *anamnesia.Experience {
+		exp := &anamnesia.Experience{
+			Scope: scope, Kind: anamnesia.ExperienceCase, SourceID: &src.ID,
+			Title: title, Body: "Notes on the " + title + ".", Trust: trust,
+		}
+		if err := st.RecordExperience(ctx, exp); err != nil {
+			t.Fatal(err)
+		}
+		return exp
+	}
+	entity := func(name string, src *anamnesia.Source) *anamnesia.Entity {
+		ent := &anamnesia.Entity{Scope: scope, Kind: "topic", Name: name}
+		if err := st.UpsertEntity(ctx, ent); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RecordMention(ctx, ent.ID, src.ID); err != nil {
+			t.Fatal(err)
+		}
+		return ent
+	}
+
+	seedSrc := source()
+	seedExp := experience(seedSrc, "coypu migration", 0.5)
+	seedEnt := entity("coypu-project", seedSrc)
+
+	w := trustWalk{
+		eng:   &Engine{Store: st},
+		scope: scope,
+		seed:  []anamnesia.SearchHit{{Domain: anamnesia.DomainExperience, Experience: seedExp}},
+		label: map[uuid.UUID]string{seedExp.ID: "seed"},
+	}
+	// Weakest edge first, and carrying the highest row trust.
+	for _, n := range []struct {
+		name      string
+		edgeTrust float32
+		rowTrust  float32
+		into      *uuid.UUID
+	}{
+		{"lorikeet-project", 0.2, 0.9, &w.low},
+		{"marmoset-project", 0.5, 0.7, &w.mid},
+		{"nightjar-project", 0.9, 0.5, &w.high},
+	} {
+		src := source()
+		exp := experience(src, n.name+" review", n.rowTrust)
+		ent := entity(n.name, src)
+		if err := st.CreateEdge(ctx, &anamnesia.Edge{
+			From: seedEnt.ID, To: ent.ID, Kind: "related_to", Trust: n.edgeTrust,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		*n.into = exp.ID
+		w.label[exp.ID] = fmt.Sprintf("%s (edge %.1f, row %.1f)", n.name, n.edgeTrust, n.rowTrust)
+	}
+	return w
+}
+
+// show renders a hit list using the fixture's labels, so a failure names
+// which edge each row came in on rather than printing bare UUIDs.
+func (w trustWalk) show(ids []uuid.UUID) string {
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		if l, ok := w.label[id]; ok {
+			out[i] = l
+			continue
+		}
+		out[i] = id.String()
+	}
+	return strings.Join(out, ", ")
+}
+
+func sameIDs(got, want []uuid.UUID) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestGraphCandidatesRankByTheTrustOfTheEdgeThatReachedThem: the graph
+// channel's rank is scored into RRF exactly like a vector rank, so it
+// has to mean something. It used to mean the row's own trust, which
+// extraction sets to a near-constant 0.7 — a rank that was, on real
+// data, whatever order the rows came back in. This asserts the order is
+// the walk's own confidence: the neighbour reached over the 0.9 edge
+// first, then 0.5, then 0.2, against a fixture whose row trusts say the
+// opposite.
+func TestGraphCandidatesRankByTheTrustOfTheEdgeThatReachedThem(t *testing.T) {
+	w := newTrustWalk(t, "retrieval-graph-edge-trust")
+	out, err := w.eng.graphExpand(context.Background(), Query{
+		Scope:      w.scope,
+		Domains:    []anamnesia.Domain{anamnesia.DomainFact, anamnesia.DomainExperience},
+		GraphSeedN: 5, GraphFanout: 10, GraphK: 20,
+	}, w.seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []uuid.UUID{w.high, w.mid, w.low}
+	if got := hitIDs(out); !sameIDs(got, want) {
+		t.Errorf("graph candidates ranked\n got: %s\nwant: %s\n(the rank feeding RRF is not the walk's confidence)",
+			w.show(got), w.show(want))
+	}
+}
+
+// TestGraphKKeepsTheRowsTheWalkIsMostSureOf: GraphK is a cut, not a
+// sample. With three reachable rows and room for two, the two that
+// survive must be the ones reached over the strongest edges — including
+// through hitsForSources' own LIMIT, which does the first cut inside
+// SQL and used to make it on the same near-constant row trust.
+func TestGraphKKeepsTheRowsTheWalkIsMostSureOf(t *testing.T) {
+	w := newTrustWalk(t, "retrieval-graph-truncate")
+	out, err := w.eng.graphExpand(context.Background(), Query{
+		Scope:      w.scope,
+		Domains:    []anamnesia.Domain{anamnesia.DomainFact, anamnesia.DomainExperience},
+		GraphSeedN: 5, GraphFanout: 10, GraphK: 2,
+	}, w.seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []uuid.UUID{w.high, w.mid}
+	if got := hitIDs(out); !sameIDs(got, want) {
+		t.Errorf("GraphK=2 kept\n got: %s\nwant: %s\n(the cut is dropping rows the walk trusts more than the ones it keeps)",
+			w.show(got), w.show(want))
 	}
 }

@@ -55,9 +55,9 @@ const graphBudget = 300 * time.Millisecond
 //  3. Neighbors(entity, nil, "both", GraphFanout) for each, restricted
 //     to edges valid now
 //  4. SourcesForEntities on the neighbours, batched into one call → their
-//     sources
-//  5. facts and experiences from those sources, ranked by each row's own
-//     trust
+//     sources, each still paired with the neighbour that mentioned it
+//  5. facts and experiences from those sources, ranked by the trust of
+//     the best edge that reached them
 //
 // Cheap no-op whenever the graph has nothing to say about these hits —
 // which is every install today: step 2 finds no entities, the walk over
@@ -147,30 +147,61 @@ func (e *Engine) graphExpand(ctx context.Context, q Query, fused []anamnesia.Sea
 	}
 
 	// One batched call for every neighbour's sources, not one call per
-	// neighbour: SourcesForEntities doesn't report which neighbour
-	// reached which source, so exact per-source edge-trust order isn't
-	// recoverable from a single call — the trade this makes for O(1)
-	// round trips instead of O(|neighbours|). The candidates it returns
-	// are ranked by their own row-level trust instead, below.
-	srcIDs, err := e.Store.SourcesForEntities(ctx, neighborIDs)
+	// neighbour — O(1) round trips instead of O(|neighbours|), on a hot
+	// path with a 300ms budget. SourcesForEntities pairs each source
+	// with the neighbour that mentioned it, so batching costs nothing
+	// here: bestTrust carries the edge trust that reached that
+	// neighbour, and a source reached through several of them inherits
+	// the strongest.
+	//
+	// That trust is what orders the candidates below, and it has to be:
+	// this walk's output is ranked into RRF exactly like a vector rank,
+	// so the rank has to mean something. The row's own trust cannot be
+	// it — extraction stamps essentially every fact and experience 0.7
+	// (internal/extract/extract.go), so ordering on it is ordering on a
+	// constant, and the GraphK cut below would be keeping an arbitrary
+	// slice of whatever the graph happened to reach.
+	pairs, err := e.Store.SourcesForEntities(ctx, neighborIDs)
 	if err != nil {
 		return nil, fmt.Errorf("sources for entities: %w", err)
 	}
+	srcTrust := map[uuid.UUID]float32{}
 	var fresh []uuid.UUID
-	for _, sid := range srcIDs {
-		if !seedSources[sid] {
-			fresh = append(fresh, sid)
+	for _, p := range pairs {
+		if seedSources[p.SourceID] {
+			continue
+		}
+		t := bestTrust[p.EntityID]
+		cur, seen := srcTrust[p.SourceID]
+		if !seen {
+			fresh = append(fresh, p.SourceID)
+		}
+		if !seen || t > cur {
+			srcTrust[p.SourceID] = t
 		}
 	}
 	if len(fresh) == 0 {
 		return nil, nil
 	}
+	// Best-reached source first: hitsForSources makes the first cut, in
+	// SQL, and takes this order as the one to keep.
+	sort.SliceStable(fresh, func(i, j int) bool { return srcTrust[fresh[i]] > srcTrust[fresh[j]] })
 
 	out, err := e.hitsForSources(ctx, q.Scope, fresh, wantFacts, wantExperiences, q.OnlyRaw, q.GraphK)
 	if err != nil {
 		return nil, err
 	}
-	sort.SliceStable(out, func(i, j int) bool { return hitTrust(out[i]) > hitTrust(out[j]) })
+	// Facts and experiences arrive as two separately-limited queries, so
+	// the walk order has to be reasserted across both. Row trust breaks
+	// ties within one source, which is the only thing it can honestly
+	// decide here.
+	sort.SliceStable(out, func(i, j int) bool {
+		ti, tj := walkTrust(out[i], srcTrust), walkTrust(out[j], srcTrust)
+		if ti != tj {
+			return ti > tj
+		}
+		return hitTrust(out[i]) > hitTrust(out[j])
+	})
 	if len(out) > q.GraphK {
 		out = out[:q.GraphK]
 	}
@@ -183,6 +214,13 @@ func (e *Engine) graphExpand(ctx context.Context, q Query, fused []anamnesia.Sea
 // here, a hub entity mentioned by many sources would pull every fact and
 // experience those sources ever produced into memory before graphExpand's
 // own GraphK truncation ever runs.
+//
+// That LIMIT makes this the first cut, not graphExpand's, so sourceIDs
+// is taken as an order and not just a set: rows are returned by their
+// source's position in it, and the caller passes the sources it most
+// wants kept first. Ordering on the rows' own trust instead would decide
+// this cut on a value extraction sets to a near-constant 0.7, throwing
+// away rows the walk was sure of to keep ones it wasn't.
 func (e *Engine) hitsForSources(ctx context.Context, scope anamnesia.Scope, sourceIDs []uuid.UUID, wantFacts, wantExperiences, onlyRaw bool, limit int) ([]anamnesia.SearchHit, error) {
 	var out []anamnesia.SearchHit
 	if wantFacts {
@@ -198,7 +236,7 @@ func (e *Engine) hitsForSources(ctx context.Context, scope anamnesia.Scope, sour
 			       embed_model, valid_from, valid_to, ingested_at, invalidated_at,
 			       superseded_by, deleted_at
 			FROM facts WHERE %s
-			ORDER BY trust DESC
+			ORDER BY array_position($1::uuid[], source_id), trust DESC
 			LIMIT $%d`, strings.Join(where, " AND "), len(args))
 		facts, err := e.Store.QueryFacts(ctx, q, args)
 		if err != nil {
@@ -224,7 +262,7 @@ func (e *Engine) hitsForSources(ctx context.Context, scope anamnesia.Scope, sour
 			valid_from, valid_to, ingested_at, invalidated_at, superseded_by, deleted_at,
 			occurred_at, participants, topic, parent_id, provenance
 			FROM experiences WHERE %s
-			ORDER BY trust DESC
+			ORDER BY array_position($1::uuid[], source_id), trust DESC
 			LIMIT $%d`, strings.Join(where, " AND "), len(args))
 		exps, err := e.Store.QueryExperiences(ctx, q, args)
 		if err != nil {
@@ -253,9 +291,21 @@ func hitSourceID(h anamnesia.SearchHit) *uuid.UUID {
 	return nil
 }
 
-// hitTrust reads a hit's own row-level trust, used to rank graph
-// candidates once batching (see graphExpand) gives up exact edge-trust
-// order.
+// walkTrust reads how much the walk trusts a hit: the trust of the best
+// edge that reached the source it came from. A hit whose source isn't in
+// the map at all scores 0 — it cannot happen for anything hitsForSources
+// returned, since every one of those sources is a key.
+func walkTrust(h anamnesia.SearchHit, srcTrust map[uuid.UUID]float32) float32 {
+	id := hitSourceID(h)
+	if id == nil {
+		return 0
+	}
+	return srcTrust[*id]
+}
+
+// hitTrust reads a hit's own row-level trust, used only to break ties
+// between graph candidates the walk reached with equal confidence (see
+// graphExpand).
 func hitTrust(h anamnesia.SearchHit) float32 {
 	switch h.Domain {
 	case anamnesia.DomainFact:

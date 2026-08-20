@@ -410,26 +410,42 @@ func (s *Store) EntitiesForSources(ctx context.Context, sourceIDs []uuid.UUID) (
 	return out, rows.Err()
 }
 
+// EntitySource is one entity_mentions row: an entity, and a source that
+// mentioned it. SourcesForEntities returns these rather than a flat list
+// of source ids so a caller batching many entities into one call can
+// still tell which entity reached which source — the graph walk ranks a
+// reachable source by the trust of the edge that got to the entity
+// mentioning it (internal/retrieval/graph.go), and that association is
+// the only thing carrying that trust across the batch.
+type EntitySource struct {
+	EntityID uuid.UUID
+	SourceID uuid.UUID
+}
+
 // SourcesForEntities returns the sources that mentioned those entities. The
 // inward half: having walked to a neighbour, this is how its memory rows are
 // reached, since facts and experiences carry source_id.
-func (s *Store) SourcesForEntities(ctx context.Context, entityIDs []uuid.UUID) ([]uuid.UUID, error) {
+//
+// One row per (entity, source) pair, which entity_mentions' primary key
+// already makes unique. A source mentioned by several of the entities
+// asked about therefore appears once per entity, not once in total.
+func (s *Store) SourcesForEntities(ctx context.Context, entityIDs []uuid.UUID) ([]EntitySource, error) {
 	if len(entityIDs) == 0 {
 		return nil, nil
 	}
 	rows, err := s.Pool.Query(ctx, `
-		SELECT DISTINCT source_id FROM entity_mentions WHERE entity_id = ANY($1)`, entityIDs)
+		SELECT entity_id, source_id FROM entity_mentions WHERE entity_id = ANY($1)`, entityIDs)
 	if err != nil {
 		return nil, fmt.Errorf("sources for entities: %w", err)
 	}
 	defer rows.Close()
-	var out []uuid.UUID
+	var out []EntitySource
 	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		var es EntitySource
+		if err := rows.Scan(&es.EntityID, &es.SourceID); err != nil {
 			return nil, err
 		}
-		out = append(out, id)
+		out = append(out, es)
 	}
 	return out, rows.Err()
 }
