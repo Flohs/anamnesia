@@ -123,24 +123,22 @@ func TestLookupUserDoesNotCreateOne(t *testing.T) {
 	// The read API resolves scope with these. EnsureUser would turn a
 	// typo in a query string into a row, which is exactly what a
 	// read-only surface must not do.
-	st, scope := testStore(t)
+	st, _ := testStore(t)
 	ctx := context.Background()
 
-	before, err := st.Stats(ctx, scope)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok, err := st.LookupUser(ctx, "no-such-user-"+uuid.NewString()[:8]); err != nil {
+	// Ask about the same handle twice. If the first lookup created it,
+	// the second finds it. Counting all users instead would measure
+	// every other package's tests too, since they share this database.
+	handle := "no-such-user-" + uuid.NewString()[:8]
+	if _, ok, err := st.LookupUser(ctx, handle); err != nil {
 		t.Fatal(err)
 	} else if ok {
 		t.Fatal("an unknown handle was reported as found")
 	}
-	after, err := st.Stats(ctx, scope)
-	if err != nil {
+	if _, ok, err := st.LookupUser(ctx, handle); err != nil {
 		t.Fatal(err)
-	}
-	if after.Users != before.Users {
-		t.Errorf("users went from %d to %d: the lookup created one", before.Users, after.Users)
+	} else if ok {
+		t.Errorf("handle %q exists after being looked up: the lookup created it", handle)
 	}
 }
 
