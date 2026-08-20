@@ -269,8 +269,14 @@ func (s *Store) CreateEdge(ctx context.Context, e *anamnesia.Edge) error {
 	if e.From == uuid.Nil || e.To == uuid.Nil || e.Kind == "" {
 		return errors.New("edge: from, to, kind required")
 	}
-	if e.Trust == 0 {
+	// Trust outside [0,1] is the model's error, not a signal. A negative
+	// value is the dangerous one: graphExpand keeps a neighbour only when
+	// some edge beats the zero value of a missing map entry, so a single
+	// negative-trust edge deletes that neighbour from every future walk.
+	if e.Trust <= 0 {
 		e.Trust = 0.5
+	} else if e.Trust > 1 {
+		e.Trust = 1
 	}
 	if e.Source == "" {
 		e.Source = "system"

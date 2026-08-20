@@ -404,3 +404,68 @@ func TestNearestEntitiesDoesNotCrossProjects(t *testing.T) {
 		t.Error("a project scope was not offered a user-level entity")
 	}
 }
+
+// TestCreateEdgeClampsTrustOutOfRange: graphExpand keeps a neighbour only
+// when some edge's trust beats the zero value of a missing map entry
+// (internal/retrieval/graph.go), so an edge with negative trust does not
+// merely rank low — it deletes that neighbour from every future walk, and
+// every row reachable only through it becomes unretrievable by the graph.
+// Nothing between the model and here enforces the [0,1] the prompt asks
+// for: resolveEdges passes op.Trust straight through. Clamp it at the
+// write, where it is the last chance.
+func TestCreateEdgeClampsTrustOutOfRange(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	uid, err := st.EnsureUser(ctx, "edge-trust-clamp-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), "edge-trust-clamp-test") })
+	scope := anamnesia.Scope{UserID: uid}
+
+	from := &anamnesia.Entity{Scope: scope, Kind: "person", Name: "trust-a"}
+	to := &anamnesia.Entity{Scope: scope, Kind: "service", Name: "trust-b"}
+	for _, e := range []*anamnesia.Entity{from, to} {
+		if err := st.UpsertEntity(ctx, e); err != nil {
+			t.Fatalf("upsert %s: %v", e.Name, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		trust float32
+		want  float32
+	}{
+		{"negative", -1, 0.5},
+		{"zero", 0, 0.5},
+		{"above one", 4.2, 1},
+		{"in range", 0.8, 0.8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			edge := &anamnesia.Edge{From: from.ID, To: to.ID, Kind: "owns-" + tc.name, Trust: tc.trust}
+			if err := st.CreateEdge(ctx, edge); err != nil {
+				t.Fatalf("create edge: %v", err)
+			}
+			if edge.Trust != tc.want {
+				t.Errorf("trust %v stored as %v, want %v", tc.trust, edge.Trust, tc.want)
+			}
+			var stored float32
+			if err := st.Pool.QueryRow(ctx,
+				`SELECT trust FROM edges WHERE id = $1`, edge.ID).Scan(&stored); err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			if stored != tc.want {
+				t.Errorf("database holds trust %v, want %v", stored, tc.want)
+			}
+		})
+	}
+}

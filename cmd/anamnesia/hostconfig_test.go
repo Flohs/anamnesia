@@ -447,7 +447,12 @@ func TestActivityTracesRejectsZero(t *testing.T) {
 func TestCandidateDistanceIsRejectedWhereItIsTyped(t *testing.T) {
 	home := isolatedHome(t)
 	path := filepath.Join(home, "config.toml")
-	for _, bad := range []string{"banana", "0.4.5", "-0.1", "1.5"} {
+	// "nan" and "NaN" are the ones a range check alone lets through: NaN
+	// compares false to everything, so `f < 0 || f > 1` accepts it. A NaN
+	// threshold then makes every `distance <= threshold` false, so entity
+	// resolution finds no candidate for anything and traces as healthy
+	// while doing nothing. Inf is caught by `f > 1`; only NaN slips.
+	for _, bad := range []string{"banana", "0.4.5", "-0.1", "1.5", "nan", "NaN"} {
 		err := setConfigValue(path, "graph.candidate_distance", bad)
 		if err == nil {
 			t.Errorf("config set graph.candidate_distance %q succeeded; the server is the one that would reject it, hours later", bad)

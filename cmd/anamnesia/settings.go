@@ -10,6 +10,7 @@
 package main
 
 import (
+	"math"
 	"fmt"
 	"sort"
 	"strconv"
@@ -261,7 +262,11 @@ func (s setting) validate(raw string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("%s must be a number between 0 and 1, got %q", s.Key, raw)
 		}
-		if f < 0 || f > 1 {
+		// NaN compares false to everything, so the range check below
+		// lets it through. A NaN threshold makes every `distance <=
+		// threshold` test false, which silently turns whatever reads
+		// this setting into a no-op that still traces as healthy.
+		if math.IsNaN(f) || f < 0 || f > 1 {
 			return "", fmt.Errorf("%s must be between 0 and 1, got %q", s.Key, raw)
 		}
 		return v, nil

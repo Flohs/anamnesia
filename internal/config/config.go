@@ -14,6 +14,7 @@
 package config
 
 import (
+	"math"
 	"errors"
 	"fmt"
 	"os"
@@ -186,7 +187,9 @@ func Load() (*Config, error) {
 			fail("%s=%q is not a number", key, v)
 			return def
 		}
-		if f < 0 || f > 1 {
+		// NaN passes every comparison below, and a NaN threshold makes
+		// the comparisons that read it always false — inert, not loud.
+		if math.IsNaN(f) || f < 0 || f > 1 {
 			fail("%s=%q must be between 0 and 1", key, v)
 			return def
 		}
