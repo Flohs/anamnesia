@@ -14,6 +14,7 @@
 package config
 
 import (
+	"math"
 	"errors"
 	"fmt"
 	"os"
@@ -73,6 +74,29 @@ type Config struct {
 
 	// ExtractCommitments lets the extractor emit ADD_COMMITMENT ops.
 	ExtractCommitments bool // ANAMNESIA_EXTRACT_COMMITMENTS (default false)
+
+	// ExtractGraph lets the extractor run the graph pass (ADD_ENTITY /
+	// ADD_EDGE) on a claude-session-graph source. GraphMaxOps caps how
+	// many entities and edges one checkpoint may produce.
+	ExtractGraph bool // ANAMNESIA_GRAPH_EXTRACT (default false)
+	GraphMaxOps  int  // ANAMNESIA_GRAPH_MAX_OPS (default 12)
+
+	// GraphCandidateDistance is the cosine distance within which an
+	// existing entity (same kind) is offered to a newly extracted entity
+	// as a possible match, triggering one extra disambiguation model
+	// call. It does not merge anything by itself — the model decides
+	// identity — so it is deliberately loose. 0 is a legitimate value
+	// ("offer nothing"), so unlike the other numeric settings it is not
+	// defaulted when zero — it always comes from
+	// ANAMNESIA_GRAPH_CANDIDATE_DISTANCE.
+	//
+	// Range 0 to 1, which is fraction()'s bound below and, deliberately,
+	// not the full 0-to-2 range of a cosine distance: past 1 the two
+	// names point away from each other, and "less alike than unrelated"
+	// is not a threshold for offering them as the same thing. The same
+	// bound is enforced where the value is typed, by settings.go's
+	// kFraction, so `anamnesia config set` and the server agree.
+	GraphCandidateDistance float64 // ANAMNESIA_GRAPH_CANDIDATE_DISTANCE (default 0.45)
 
 	// Decay half-lives per experience kind. Relevance falls by half over
 	// this long since a memory was last used, per kind, which is what
@@ -153,6 +177,24 @@ func Load() (*Config, error) {
 		}
 		return b
 	}
+	fraction := func(key string, def float64) float64 {
+		v := strings.TrimSpace(os.Getenv(key))
+		if v == "" {
+			return def
+		}
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			fail("%s=%q is not a number", key, v)
+			return def
+		}
+		// NaN passes every comparison below, and a NaN threshold makes
+		// the comparisons that read it always false — inert, not loud.
+		if math.IsNaN(f) || f < 0 || f > 1 {
+			fail("%s=%q must be between 0 and 1", key, v)
+			return def
+		}
+		return f
+	}
 
 	orKey := strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY"))
 	hasOR := orKey != ""
@@ -191,6 +233,11 @@ func Load() (*Config, error) {
 		EmbedBackfill:    dur("ANAMNESIA_EMBED_BACKFILL", time.Minute),
 
 		ExtractCommitments: boolean("ANAMNESIA_EXTRACT_COMMITMENTS", false),
+
+		ExtractGraph: boolean("ANAMNESIA_GRAPH_EXTRACT", false),
+		GraphMaxOps:  num("ANAMNESIA_GRAPH_MAX_OPS", 12),
+
+		GraphCandidateDistance: fraction("ANAMNESIA_GRAPH_CANDIDATE_DISTANCE", 0.45),
 
 		DecayHalfLifeCase:     dur("ANAMNESIA_DECAY_HALF_LIFE_CASE", 336*time.Hour),
 		DecayHalfLifeStrategy: dur("ANAMNESIA_DECAY_HALF_LIFE_STRATEGY", 8760*time.Hour),

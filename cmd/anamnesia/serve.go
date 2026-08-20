@@ -136,6 +136,19 @@ func decayConfig(cfg *config.Config) decay.Config {
 	}
 }
 
+// extractConfig turns the resolved configuration into the extractor's
+// own. It is the last hop of the path a setting takes — file, resolution,
+// server environment, config.Load, here — and the only one that was
+// invisible to a test while it was a struct literal inside runServe.
+func extractConfig(cfg *config.Config) extract.Config {
+	return extract.Config{
+		ExtractCommitments:     cfg.ExtractCommitments,
+		ExtractGraph:           cfg.ExtractGraph,
+		GraphMaxOps:            cfg.GraphMaxOps,
+		GraphCandidateDistance: cfg.GraphCandidateDistance,
+	}
+}
+
 func runServe(cmd *cobra.Command, _ []string) error {
 	hc, err := applyHostEnv()
 	if err != nil {
@@ -230,12 +243,13 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		recorder = activity.New(cfg.ActivityTraces)
 	}
 
-	retr := &retrieval.Engine{Store: st, Embedder: emb, Reranker: reranker}
+	retr := &retrieval.Engine{Store: st, Embedder: emb, Reranker: reranker, Log: log}
 	briefer := &jobs.Briefer{LLM: llmc}
 
 	mcpHandler := mcp.NewHandler(mcp.Deps{
 		Store:          st,
 		Retrieval:      retr,
+		Embedder:       emb,
 		PII:            piiDet,
 		Briefer:        briefer,
 		DefaultUser:    cfg.DefaultUser,
@@ -274,7 +288,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 				DecayEvery:       cfg.DecayEvery,
 				ConsolidateEvery: cfg.ConsolidateEvery,
 				ExtractEvery:     cfg.ExtractEvery,
-				Extract:          extract.Config{ExtractCommitments: cfg.ExtractCommitments},
+				Extract:          extractConfig(cfg),
 				Decay:            decayConfig(cfg),
 			},
 			Store:     st,

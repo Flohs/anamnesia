@@ -1,0 +1,471 @@
+package store
+
+import (
+	"context"
+	"os"
+	"testing"
+
+	"github.com/google/uuid"
+
+	"github.com/flohs/anamnesia/pkg/anamnesia"
+)
+
+func TestRecordMentionIsIdempotent(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	uid, err := st.EnsureUser(ctx, "graph-mention-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), "graph-mention-test") })
+	scope := anamnesia.Scope{UserID: uid}
+
+	ent := &anamnesia.Entity{Scope: scope, Kind: "service", Name: "reconciliation-job"}
+	if err := st.UpsertEntity(ctx, ent); err != nil {
+		t.Fatal(err)
+	}
+	src := &anamnesia.Source{Scope: scope, Kind: "claude-session-graph", RawContent: "x"}
+	if err := st.InsertSource(ctx, src); err != nil {
+		t.Fatal(err)
+	}
+
+	// Twice: a re-extraction of the same source must not error.
+	for i := 0; i < 2; i++ {
+		if err := st.RecordMention(ctx, ent.ID, src.ID); err != nil {
+			t.Fatalf("RecordMention call %d: %v", i+1, err)
+		}
+	}
+	ents, err := st.EntitiesForSources(ctx, []uuid.UUID{src.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 || ents[0].ID != ent.ID {
+		t.Errorf("EntitiesForSources = %v, want exactly the one entity", ents)
+	}
+}
+
+func TestSourcesForEntitiesRoundTrips(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	uid, err := st.EnsureUser(ctx, "graph-roundtrip-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), "graph-roundtrip-test") })
+	scope := anamnesia.Scope{UserID: uid}
+
+	ent := &anamnesia.Entity{Scope: scope, Kind: "site", Name: "rotterdam"}
+	if err := st.UpsertEntity(ctx, ent); err != nil {
+		t.Fatal(err)
+	}
+	var srcIDs []uuid.UUID
+	for i := 0; i < 2; i++ {
+		src := &anamnesia.Source{Scope: scope, Kind: "claude-session-graph", RawContent: "x"}
+		if err := st.InsertSource(ctx, src); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RecordMention(ctx, ent.ID, src.ID); err != nil {
+			t.Fatal(err)
+		}
+		srcIDs = append(srcIDs, src.ID)
+	}
+	got, err := st.SourcesForEntities(ctx, []uuid.UUID{ent.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Errorf("SourcesForEntities = %v, want both sources", got)
+	}
+	// Each source comes back paired with the entity that reached it, not
+	// as a bare id: the graph walk batches many entities into one call
+	// and needs that pairing to know which edge's trust a source
+	// inherits.
+	for _, es := range got {
+		if es.EntityID != ent.ID {
+			t.Errorf("SourcesForEntities returned entity %s, want %s", es.EntityID, ent.ID)
+		}
+		if es.SourceID != srcIDs[0] && es.SourceID != srcIDs[1] {
+			t.Errorf("SourcesForEntities returned source %s, want one of %v", es.SourceID, srcIDs)
+		}
+	}
+}
+
+func TestLookupEntitiesByName(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	uid, err := st.EnsureUser(ctx, "graph-lookup-by-name-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), "graph-lookup-by-name-test") })
+	scope := anamnesia.Scope{UserID: uid}
+
+	site := &anamnesia.Entity{Scope: scope, Kind: "site", Name: "rotterdam"}
+	if err := st.UpsertEntity(ctx, site); err != nil {
+		t.Fatal(err)
+	}
+
+	// One match: the name resolves unambiguously.
+	matches, err := st.LookupEntitiesByName(ctx, scope, "rotterdam")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 || matches[0].ID != site.ID {
+		t.Errorf("LookupEntitiesByName = %v, want exactly the one site entity", matches)
+	}
+
+	// A second entity with the same name under a different kind makes
+	// the name ambiguous: both are reported, neither is picked for you.
+	person := &anamnesia.Entity{Scope: scope, Kind: "person", Name: "rotterdam"}
+	if err := st.UpsertEntity(ctx, person); err != nil {
+		t.Fatal(err)
+	}
+	matches, err = st.LookupEntitiesByName(ctx, scope, "rotterdam")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 2 {
+		t.Errorf("LookupEntitiesByName returned %d matches for an ambiguous name, want 2", len(matches))
+	}
+}
+
+func TestMentionsVanishWithTheirEntity(t *testing.T) {
+	// ON DELETE CASCADE, so a purged entity cannot leave dangling rows.
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	uid, err := st.EnsureUser(ctx, "graph-cascade-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), "graph-cascade-test") })
+	scope := anamnesia.Scope{UserID: uid}
+
+	ent := &anamnesia.Entity{Scope: scope, Kind: "service", Name: "doomed"}
+	if err := st.UpsertEntity(ctx, ent); err != nil {
+		t.Fatal(err)
+	}
+	src := &anamnesia.Source{Scope: scope, Kind: "claude-session-graph", RawContent: "x"}
+	if err := st.InsertSource(ctx, src); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordMention(ctx, ent.ID, src.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx, `DELETE FROM entities WHERE id = $1`, ent.ID); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM entity_mentions WHERE entity_id = $1`, ent.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("%d mentions survived their entity; the cascade did not fire", n)
+	}
+}
+
+func TestNearestEntitiesRanksByDistance(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	uid, err := st.EnsureUser(ctx, "entity-nearest-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), "entity-nearest-test") })
+	scope := anamnesia.Scope{UserID: uid}
+
+	// Three entities at known distances from the probe, using synthetic
+	// vectors so the assertion does not depend on an embedding model.
+	dims := 1536
+	mk := func(name string, first float32) *anamnesia.Entity {
+		v := make([]float32, dims)
+		v[0] = first
+		v[1] = 1 - first
+		e := &anamnesia.Entity{Scope: scope, Kind: "person", Name: name, Embedding: v}
+		if err := st.UpsertEntity(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	near := mk("priya-raman", 1.0)
+	mid := mk("priha-raman", 0.9)
+	far := mk("dana-okafor", 0.0)
+
+	probe := make([]float32, dims)
+	probe[0] = 1.0
+	got, err := st.NearestEntities(ctx, scope, probe, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d matches, want 3", len(got))
+	}
+	if got[0].Entity.ID != near.ID || got[1].Entity.ID != mid.ID || got[2].Entity.ID != far.ID {
+		t.Errorf("order = %s, %s, %s; want nearest first",
+			got[0].Entity.Name, got[1].Entity.Name, got[2].Entity.Name)
+	}
+	if !(got[0].Distance < got[1].Distance && got[1].Distance < got[2].Distance) {
+		t.Errorf("distances not ascending: %v, %v, %v",
+			got[0].Distance, got[1].Distance, got[2].Distance)
+	}
+	_ = far
+}
+
+func TestNearestEntitiesSkipsEntitiesWithoutAnEmbedding(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	uid, err := st.EnsureUser(ctx, "entity-nullvec-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), "entity-nullvec-test") })
+	scope := anamnesia.Scope{UserID: uid}
+
+	// Every entity created before this feature has a NULL embedding. They
+	// must be invisible to the query rather than sorting arbitrarily.
+	if err := st.UpsertEntity(ctx, &anamnesia.Entity{Scope: scope, Kind: "person", Name: "no-vector"}); err != nil {
+		t.Fatal(err)
+	}
+	probe := make([]float32, 1536)
+	probe[0] = 1
+	got, err := st.NearestEntities(ctx, scope, probe, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d matches, want 0: an entity with no embedding must not match", len(got))
+	}
+}
+
+func TestNearestEntitiesStaysInsideItsScope(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	mine, err := st.EnsureUser(ctx, "entity-scope-mine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := st.EnsureUser(ctx, "entity-scope-theirs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = st.DeleteUser(context.Background(), "entity-scope-mine")
+		_, _ = st.DeleteUser(context.Background(), "entity-scope-theirs")
+	})
+
+	v := make([]float32, 1536)
+	v[0] = 1
+	if err := st.UpsertEntity(ctx, &anamnesia.Entity{
+		Scope: anamnesia.Scope{UserID: theirs}, Kind: "person", Name: "someone-elses", Embedding: v,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.NearestEntities(ctx, anamnesia.Scope{UserID: mine}, v, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d matches from another user's scope, want 0", len(got))
+	}
+}
+
+// TestNearestEntitiesDoesNotCrossProjects is the project half of the
+// scope guard TestNearestEntitiesStaysInsideItsScope only covers for
+// users. A candidate offered here is a candidate the model may affirm as
+// the same thing, and a wrong merge is irreversible — so a scope with no
+// project must not be shown entities that belong to some arbitrary
+// project of the same user.
+func TestNearestEntitiesDoesNotCrossProjects(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	uid, err := st.EnsureUser(ctx, "entity-project-scope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), "entity-project-scope") })
+	alpha, err := st.EnsureProject(ctx, uid, "entity-project-alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beta, err := st.EnsureProject(ctx, uid, "entity-project-beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v := make([]float32, 1536)
+	v[0] = 1
+	mustUpsert := func(scope anamnesia.Scope, name string) *anamnesia.Entity {
+		ent := &anamnesia.Entity{Scope: scope, Kind: "person", Name: name, Embedding: v}
+		if err := st.UpsertEntity(ctx, ent); err != nil {
+			t.Fatal(err)
+		}
+		return ent
+	}
+	inAlpha := mustUpsert(anamnesia.Scope{UserID: uid, ProjectID: &alpha}, "alpha-person")
+	userLevel := mustUpsert(anamnesia.Scope{UserID: uid}, "user-level-person")
+
+	ids := func(matches []EntityMatch) map[uuid.UUID]bool {
+		out := make(map[uuid.UUID]bool, len(matches))
+		for _, m := range matches {
+			out[m.Entity.ID] = true
+		}
+		return out
+	}
+
+	// A user-level scope sees user-level entities and nothing else.
+	got, err := st.NearestEntities(ctx, anamnesia.Scope{UserID: uid}, v, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := ids(got)
+	if seen[inAlpha.ID] {
+		t.Error("a scope with no project was offered a project's entity as a merge candidate")
+	}
+	if !seen[userLevel.ID] {
+		t.Error("a scope with no project was not offered its own user-level entity")
+	}
+
+	// A project scope still sees its own project plus user-level, and
+	// never a sibling project.
+	got, err = st.NearestEntities(ctx, anamnesia.Scope{UserID: uid, ProjectID: &beta}, v, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen = ids(got)
+	if seen[inAlpha.ID] {
+		t.Error("a project scope was offered a sibling project's entity as a merge candidate")
+	}
+	if !seen[userLevel.ID] {
+		t.Error("a project scope was not offered a user-level entity")
+	}
+}
+
+// TestCreateEdgeClampsTrustOutOfRange: graphExpand keeps a neighbour only
+// when some edge's trust beats the zero value of a missing map entry
+// (internal/retrieval/graph.go), so an edge with negative trust does not
+// merely rank low — it deletes that neighbour from every future walk, and
+// every row reachable only through it becomes unretrievable by the graph.
+// Nothing between the model and here enforces the [0,1] the prompt asks
+// for: resolveEdges passes op.Trust straight through. Clamp it at the
+// write, where it is the last chance.
+func TestCreateEdgeClampsTrustOutOfRange(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	uid, err := st.EnsureUser(ctx, "edge-trust-clamp-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), "edge-trust-clamp-test") })
+	scope := anamnesia.Scope{UserID: uid}
+
+	from := &anamnesia.Entity{Scope: scope, Kind: "person", Name: "trust-a"}
+	to := &anamnesia.Entity{Scope: scope, Kind: "service", Name: "trust-b"}
+	for _, e := range []*anamnesia.Entity{from, to} {
+		if err := st.UpsertEntity(ctx, e); err != nil {
+			t.Fatalf("upsert %s: %v", e.Name, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		trust float32
+		want  float32
+	}{
+		{"negative", -1, 0.5},
+		{"zero", 0, 0.5},
+		{"above one", 4.2, 1},
+		{"in range", 0.8, 0.8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			edge := &anamnesia.Edge{From: from.ID, To: to.ID, Kind: "owns-" + tc.name, Trust: tc.trust}
+			if err := st.CreateEdge(ctx, edge); err != nil {
+				t.Fatalf("create edge: %v", err)
+			}
+			if edge.Trust != tc.want {
+				t.Errorf("trust %v stored as %v, want %v", tc.trust, edge.Trust, tc.want)
+			}
+			var stored float32
+			if err := st.Pool.QueryRow(ctx,
+				`SELECT trust FROM edges WHERE id = $1`, edge.ID).Scan(&stored); err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			if stored != tc.want {
+				t.Errorf("database holds trust %v, want %v", stored, tc.want)
+			}
+		})
+	}
+}

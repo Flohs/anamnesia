@@ -18,20 +18,38 @@ import (
 // ─── entities ────────────────────────────────────────────────────────
 
 // UpsertEntity creates or updates an entity keyed by (scope, kind, name).
-// Properties are replaced wholesale on conflict; pass the merged map.
+//
+// Properties MERGE on conflict, one level deep: a key present in e.Props
+// overwrites the stored value for that key, a key absent from e.Props
+// keeps whatever was already there, and a key whose value is a nested
+// object is replaced whole rather than merged recursively. Keys carrying
+// a JSON null are dropped before the merge — a null says nothing, and
+// must not erase an attribute an earlier caller established.
+//
+// Replace-wholesale was the previous rule and it silently erased props:
+// re-declaring an entity is the normal case for the graph extractor, and
+// a re-declaration usually carries whatever the model happened to
+// mention this time, which is often nothing. Merging in SQL rather than
+// read-modify-write in Go also keeps two concurrent upserts from losing
+// each other's keys.
 func (s *Store) UpsertEntity(ctx context.Context, e *anamnesia.Entity) error {
 	if e.Kind == "" || e.Name == "" {
 		return errors.New("entity: kind and name required")
 	}
-	var propsJSON []byte
-	if e.Props != nil {
-		b, err := json.Marshal(e.Props)
+	propsJSON := []byte("{}")
+	if len(e.Props) > 0 {
+		props := make(map[string]any, len(e.Props))
+		for k, v := range e.Props {
+			if v == nil {
+				continue
+			}
+			props[k] = v
+		}
+		b, err := json.Marshal(props)
 		if err != nil {
 			return fmt.Errorf("marshal props: %w", err)
 		}
 		propsJSON = b
-	} else {
-		propsJSON = []byte("{}")
 	}
 	var emb *pgvector.Vector
 	if len(e.Embedding) > 0 {
@@ -43,7 +61,7 @@ func (s *Store) UpsertEntity(ctx context.Context, e *anamnesia.Entity) error {
 		VALUES ($1, $2, $3, $4, $5::jsonb, $6)
 		ON CONFLICT (user_id, coalesce(project_id, '00000000-0000-0000-0000-000000000000'::uuid), kind, name)
 		DO UPDATE SET
-			props     = EXCLUDED.props,
+			props     = entities.props || EXCLUDED.props,
 			embedding = COALESCE(EXCLUDED.embedding, entities.embedding)
 		RETURNING id, created_at`,
 		e.Scope.UserID, e.Scope.ProjectID, e.Kind, e.Name, string(propsJSON), emb,
@@ -68,6 +86,35 @@ func (s *Store) LookupEntity(ctx context.Context, scope anamnesia.Scope, kind, n
 		  AND kind = $3 AND name = $4`,
 		scope.UserID, scope.ProjectID, kind, name)
 	return scanEntity(row)
+}
+
+// LookupEntitiesByName finds every entity in scope with the given
+// (already normalised) name, across all kinds. Unlike LookupEntity this
+// takes no kind, because a bare edge endpoint name doesn't carry one —
+// the caller decides what to do when more than one entity matches: an
+// edge endpoint is ambiguous, not resolvable to either.
+func (s *Store) LookupEntitiesByName(ctx context.Context, scope anamnesia.Scope, name string) ([]*anamnesia.Entity, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id, user_id, project_id, kind, name, props, created_at
+		FROM entities
+		WHERE user_id = $1
+		  AND coalesce(project_id, '00000000-0000-0000-0000-000000000000'::uuid)
+		      = coalesce($2, '00000000-0000-0000-0000-000000000000'::uuid)
+		  AND name = $3`,
+		scope.UserID, scope.ProjectID, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*anamnesia.Entity
+	for rows.Next() {
+		ent, err := scanEntity(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ent)
+	}
+	return out, rows.Err()
 }
 
 // ListEntities returns recent entities in scope.
@@ -133,6 +180,67 @@ func (s *Store) SetEntityEmbedding(ctx context.Context, id uuid.UUID, vec []floa
 	return err
 }
 
+// EntityMatch pairs an entity with its cosine distance from a probe vector.
+type EntityMatch struct {
+	Entity   *anamnesia.Entity
+	Distance float64
+}
+
+// NearestEntities returns the entities in scope closest to vec by cosine
+// distance, nearest first. Entities without an embedding are skipped. The
+// caller decides what distance counts as close enough; no threshold is
+// applied here.
+//
+// Scope is the same rule vectorFacts applies — the scope's own project
+// plus the user level — with the nil-project case spelled out rather
+// than left open: a scope with no project sees user-level entities ONLY,
+// never some arbitrary project's. Its one caller is merge-candidate
+// recall, and a candidate offered here is a candidate the model may
+// affirm as the same thing; a wrong merge is irreversible and a fork is
+// not, so a user-level ingest must not be able to be merged into a
+// project it never named. Leaving the predicate off entirely (which is
+// what "no project" used to mean here) offered every project the user
+// owns, and CreateEdge would then write an edge across the boundary.
+func (s *Store) NearestEntities(ctx context.Context, scope anamnesia.Scope, vec []float32, limit int) ([]EntityMatch, error) {
+	args := []any{scope.UserID, pgvector.NewVector(vec)}
+	where := []string{"user_id = $1", "embedding IS NOT NULL"}
+	if scope.ProjectID != nil {
+		args = append(args, *scope.ProjectID)
+		where = append(where, fmt.Sprintf("(project_id = $%d OR project_id IS NULL)", len(args)))
+	} else {
+		where = append(where, "project_id IS NULL")
+	}
+	args = append(args, limit)
+	q := fmt.Sprintf(`
+		SELECT id, user_id, project_id, kind, name, props, created_at, embedding <=> $2 AS distance
+		FROM entities WHERE %s
+		ORDER BY embedding <=> $2 ASC
+		LIMIT $%d`, strings.Join(where, " AND "), len(args))
+	rows, err := s.Pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EntityMatch
+	for rows.Next() {
+		var (
+			e        anamnesia.Entity
+			project  *uuid.UUID
+			propsRaw []byte
+			distance float64
+		)
+		if err := rows.Scan(&e.ID, &e.Scope.UserID, &project, &e.Kind, &e.Name, &propsRaw, &e.CreatedAt, &distance); err != nil {
+			return nil, err
+		}
+		e.Scope.ProjectID = project
+		if len(propsRaw) > 0 {
+			_ = json.Unmarshal(propsRaw, &e.Props)
+		}
+		out = append(out, EntityMatch{Entity: &e, Distance: distance})
+	}
+	return out, rows.Err()
+}
+
 func scanEntity(row rowScanner) (*anamnesia.Entity, error) {
 	var (
 		e        anamnesia.Entity
@@ -161,8 +269,14 @@ func (s *Store) CreateEdge(ctx context.Context, e *anamnesia.Edge) error {
 	if e.From == uuid.Nil || e.To == uuid.Nil || e.Kind == "" {
 		return errors.New("edge: from, to, kind required")
 	}
-	if e.Trust == 0 {
+	// Trust outside [0,1] is the model's error, not a signal. A negative
+	// value is the dangerous one: graphExpand keeps a neighbour only when
+	// some edge beats the zero value of a missing map entry, so a single
+	// negative-trust edge deletes that neighbour from every future walk.
+	if e.Trust <= 0 {
 		e.Trust = 0.5
+	} else if e.Trust > 1 {
+		e.Trust = 1
 	}
 	if e.Source == "" {
 		e.Source = "system"
@@ -289,4 +403,86 @@ func (s *Store) Neighbors(ctx context.Context, src uuid.UUID, kinds []string, di
 		edges = append(edges, &edge)
 	}
 	return ents, edges, rows.Err()
+}
+
+// ─── entity_mentions ─────────────────────────────────────────────────
+
+// RecordMention notes that a source mentioned an entity. Idempotent: a
+// re-extraction of the same source must not error.
+func (s *Store) RecordMention(ctx context.Context, entityID, sourceID uuid.UUID) error {
+	_, err := s.Pool.Exec(ctx, `
+		INSERT INTO entity_mentions (entity_id, source_id)
+		VALUES ($1, $2)
+		ON CONFLICT (entity_id, source_id) DO NOTHING`, entityID, sourceID)
+	if err != nil {
+		return fmt.Errorf("record mention: %w", err)
+	}
+	return nil
+}
+
+// EntitiesForSources returns the entities those sources mentioned. This is
+// the outward half of the bridge: a search hit knows its source, and this
+// turns that into somewhere to start walking.
+func (s *Store) EntitiesForSources(ctx context.Context, sourceIDs []uuid.UUID) ([]*anamnesia.Entity, error) {
+	if len(sourceIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT DISTINCT e.id, e.user_id, e.project_id, e.kind, e.name, e.props, e.created_at
+		  FROM entities e
+		  JOIN entity_mentions m ON m.entity_id = e.id
+		 WHERE m.source_id = ANY($1)`, sourceIDs)
+	if err != nil {
+		return nil, fmt.Errorf("entities for sources: %w", err)
+	}
+	defer rows.Close()
+	var out []*anamnesia.Entity
+	for rows.Next() {
+		ent, err := scanEntity(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ent)
+	}
+	return out, rows.Err()
+}
+
+// EntitySource is one entity_mentions row: an entity, and a source that
+// mentioned it. SourcesForEntities returns these rather than a flat list
+// of source ids so a caller batching many entities into one call can
+// still tell which entity reached which source — the graph walk ranks a
+// reachable source by the trust of the edge that got to the entity
+// mentioning it (internal/retrieval/graph.go), and that association is
+// the only thing carrying that trust across the batch.
+type EntitySource struct {
+	EntityID uuid.UUID
+	SourceID uuid.UUID
+}
+
+// SourcesForEntities returns the sources that mentioned those entities. The
+// inward half: having walked to a neighbour, this is how its memory rows are
+// reached, since facts and experiences carry source_id.
+//
+// One row per (entity, source) pair, which entity_mentions' primary key
+// already makes unique. A source mentioned by several of the entities
+// asked about therefore appears once per entity, not once in total.
+func (s *Store) SourcesForEntities(ctx context.Context, entityIDs []uuid.UUID) ([]EntitySource, error) {
+	if len(entityIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT entity_id, source_id FROM entity_mentions WHERE entity_id = ANY($1)`, entityIDs)
+	if err != nil {
+		return nil, fmt.Errorf("sources for entities: %w", err)
+	}
+	defer rows.Close()
+	var out []EntitySource
+	for rows.Next() {
+		var es EntitySource
+		if err := rows.Scan(&es.EntityID, &es.SourceID); err != nil {
+			return nil, err
+		}
+		out = append(out, es)
+	}
+	return out, rows.Err()
 }

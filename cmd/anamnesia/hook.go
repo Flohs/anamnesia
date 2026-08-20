@@ -397,6 +397,12 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 	sent := 0
 	var lastEnd int64
 	segStart := offset
+	// segmentSourceIDs collects each segment's source id as it lands, so
+	// the graph source posted below can carry them: it is the only thing
+	// that lets a later hit on a segment seed a walk into the entities
+	// that segment's checkpoint mentioned. See
+	// docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md.
+	segmentSourceIDs := make([]string, 0, len(segs))
 	for i, seg := range segs {
 		at := seg.At
 		payload := ingestPayload{
@@ -419,7 +425,8 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 		if !at.IsZero() {
 			payload.OccurredAt = &at
 		}
-		if err := httpPost(ctx, hc, "/v1/ingest", payload, nil); err != nil {
+		var resp ingestResponse
+		if err := httpPost(ctx, hc, "/v1/ingest", payload, &resp); err != nil {
 			// Advance the offset to the last segment that actually landed,
 			// so a retry re-sends only what failed rather than everything
 			// again on top of a growing transcript: without this, a
@@ -434,6 +441,9 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 			}
 			return fmt.Sprintf("ingested %d of %d segments", sent, len(segs)), err
 		}
+		if resp.SourceID != "" {
+			segmentSourceIDs = append(segmentSourceIDs, resp.SourceID)
+		}
 		sent++
 		lastEnd = seg.EndOffset
 		segStart = seg.EndOffset
@@ -441,7 +451,38 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 	if err := writeOffset(input.SessionID, input.TranscriptPath, next); err != nil {
 		return fmt.Sprintf("ingested %d segments, offset not saved", sent), err
 	}
-	return fmt.Sprintf("ingested %d segments", sent), nil
+
+	note := fmt.Sprintf("ingested %d segments", sent)
+	if hc.Bool("graph.extract") {
+		// One extra post over the whole checkpoint, after every segment has
+		// landed: a per-segment graph pass could only ever connect entities
+		// within the same segment, and the segments are already cut at
+		// topic boundaries. A failure here must not fail the checkpoint or
+		// hold back the offset already written above: the segments are the
+		// memory, this is an extra.
+		contents := make([]string, len(segs))
+		for i, seg := range segs {
+			contents[i] = seg.Content
+		}
+		payload := ingestPayload{
+			Kind:        "claude-session-graph",
+			Title:       title,
+			ExternalRef: fmt.Sprintf("%s#%d-graph", input.SessionID, offset),
+			Content:     strings.Join(contents, "\n"),
+			User:        hc.User(),
+			Project:     hc.Project(),
+			Metadata: map[string]any{
+				"segment_source_ids": segmentSourceIDs,
+			},
+		}
+		if at := segs[0].At; !at.IsZero() {
+			payload.OccurredAt = &at
+		}
+		if err := httpPost(ctx, hc, "/v1/ingest", payload, nil); err != nil {
+			note += "; graph source failed: " + err.Error()
+		}
+	}
+	return note, nil
 }
 
 // readTranscriptFrom renders the chat turns in path starting at offset,
@@ -644,6 +685,13 @@ type ingestPayload struct {
 	User         string         `json:"user,omitempty"`
 	Project      string         `json:"project,omitempty"`
 	OccurredAt   *time.Time     `json:"occurred_at,omitempty"`
+}
+
+// ingestResponse mirrors the part of httpapi.IngestResponse this file
+// needs: the source id, so a checkpoint can tell the graph source which
+// segment sources it belongs to.
+type ingestResponse struct {
+	SourceID string `json:"source_id"`
 }
 
 // ─── transcript offsets ──────────────────────────────────────────────

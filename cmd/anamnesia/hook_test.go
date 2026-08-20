@@ -609,8 +609,18 @@ func TestSegmentEndOffsetsAscendToNext(t *testing.T) {
 	}
 }
 
+// captureIngestSourceID returns the source_id captureIngests's test server
+// hands back for its nth request (1-indexed), so a test can predict what
+// id a given post received without re-deriving the format itself.
+func captureIngestSourceID(n int) string {
+	return fmt.Sprintf("6f1c1f7a-0a1a-4a7a-9a7a-%012d", n)
+}
+
 // captureIngests stands up a server that records every ingest body, and
-// points a host config at it.
+// points a host config at it. Each response carries a distinct source_id
+// (see captureIngestSourceID) — a fixed one would let every segment of a
+// checkpoint look like the same source, which is exactly the bug the
+// graph bridge needs a test to catch.
 func captureIngests(t *testing.T) (*hostConfig, *[]map[string]any) {
 	t.Helper()
 	var got []map[string]any
@@ -619,7 +629,7 @@ func captureIngests(t *testing.T) (*hostConfig, *[]map[string]any) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		got = append(got, body)
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{"source_id":"6f1c1f7a-0a1a-4a7a-9a7a-1a7a1a7a1a7a","queued":true}`))
+		fmt.Fprintf(w, `{"source_id":%q,"queued":true}`, captureIngestSourceID(len(got)))
 	}))
 	t.Cleanup(srv.Close)
 	hc := testHostConfig(t)
@@ -878,5 +888,108 @@ func TestCheckpointByteRangeStartsAtResumeOffsetNotZero(t *testing.T) {
 	gotRange, _ := (*got)[0]["metadata"].(map[string]any)["byte_range"].(string)
 	if !strings.HasPrefix(gotRange, wantPrefix) {
 		t.Errorf("byte_range = %q, want it to start at the resume offset %d", gotRange, resumeOffset)
+	}
+}
+
+func TestGraphSourceIsPostedAfterTheSegments(t *testing.T) {
+	hc, got := captureIngests(t)
+	hc.values["graph.extract"] = "true"
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "g1"}, "claude-session"); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if len(*got) != 3 {
+		t.Fatalf("posted %d sources, want 2 segments plus 1 graph source", len(*got))
+	}
+	last := (*got)[2]
+	if last["kind"] != "claude-session-graph" {
+		t.Errorf("last source kind = %v, want the graph kind", last["kind"])
+	}
+	content, _ := last["content"].(string)
+	if !strings.Contains(content, "first subject") || !strings.Contains(content, "separate subject") {
+		t.Errorf("graph source does not carry the whole checkpoint:\n%s", content)
+	}
+}
+
+// TestGraphSourceMetadataCarriesSegmentSourceIDs is the point of the fix:
+// runGraph records mentions against whatever ids the graph source's
+// metadata names, and this is the hook's half of that bridge — without
+// it, the graph source carries no way back to the sources a search hit
+// actually returns. See
+// docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md.
+func TestGraphSourceMetadataCarriesSegmentSourceIDs(t *testing.T) {
+	hc, got := captureIngests(t)
+	hc.values["graph.extract"] = "true"
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "g4"}, "claude-session"); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if len(*got) != 3 {
+		t.Fatalf("posted %d sources, want 2 segments plus 1 graph source", len(*got))
+	}
+	meta, _ := (*got)[2]["metadata"].(map[string]any)
+	gotIDs, _ := meta["segment_source_ids"].([]any)
+	wantIDs := []any{captureIngestSourceID(1), captureIngestSourceID(2)}
+	if len(gotIDs) != len(wantIDs) {
+		t.Fatalf("segment_source_ids = %v, want %v", gotIDs, wantIDs)
+	}
+	for i := range wantIDs {
+		if gotIDs[i] != wantIDs[i] {
+			t.Errorf("segment_source_ids[%d] = %v, want %v", i, gotIDs[i], wantIDs[i])
+		}
+	}
+}
+
+func TestNoGraphSourceWhenTheFlagIsOff(t *testing.T) {
+	hc, got := captureIngests(t)
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "g2"}, "claude-session"); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if len(*got) != 2 {
+		t.Errorf("posted %d sources with graph.extract off, want just the 2 segments", len(*got))
+	}
+}
+
+func TestAFailedGraphSourceDoesNotFailTheCheckpoint(t *testing.T) {
+	// The segments are the memory. The graph source is an extra, and losing
+	// it must not hold back the offset and re-send everything next time.
+	var posts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts++
+		if posts == 3 { // the graph source, after two segments
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"source_id":"6f1c1f7a-0a1a-4a7a-9a7a-1a7a1a7a1a7a","queued":true}`))
+	}))
+	t.Cleanup(srv.Close)
+	hc := testHostConfig(t)
+	hc.values["server.url"] = srv.URL
+	hc.values["graph.extract"] = "true"
+
+	path := segLines(t,
+		[3]string{"2026-03-02T09:00:00Z", "user", "the first subject, discussed at some length this morning"},
+		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
+	)
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "g3"}, "claude-session"); err != nil {
+		t.Errorf("a failed graph source failed the whole checkpoint: %v", err)
+	}
+	if off := readOffset("g3", path); off == 0 {
+		t.Error("the offset was held back by a failed graph source; the segments all landed")
 	}
 }

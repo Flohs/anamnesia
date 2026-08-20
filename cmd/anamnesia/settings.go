@@ -10,6 +10,7 @@
 package main
 
 import (
+	"math"
 	"fmt"
 	"sort"
 	"strconv"
@@ -23,6 +24,13 @@ type kind int
 const (
 	kString kind = iota
 	kInt
+	// kFraction is a number from 0 to 1 inclusive. The bound is part of
+	// the kind rather than per-setting, because it is the bound
+	// internal/config's fraction() already enforces when the server
+	// reads the value back: a kind that accepted more here would put
+	// the two ends of the path back into disagreement, which is the
+	// whole reason this kind exists.
+	kFraction
 	kBool
 	kDuration
 	kSecret // string, but masked in output
@@ -184,6 +192,14 @@ var settings = []setting{
 		Doc: "Record what the server is doing, in memory, and serve it on /v1/activity. Off makes those routes 404 and every recording call a no-op."},
 	{Key: "activity.traces", Kind: kInt, Def: "200", Env: "ANAMNESIA_ACTIVITY_TRACES",
 		Doc: "How many recent traces to keep. They live in memory only, so a restart clears them. Use activity.enabled to switch recording off; this is a size, and sizes are positive."},
+
+	// ─── graph ───────────────────────────────────────────────────────
+	{Key: "graph.extract", Kind: kBool, Def: "false", Env: "ANAMNESIA_GRAPH_EXTRACT",
+		Doc: "Extract entities and relationships from a session, in one extra model call per checkpoint. Off by default: it costs a call, and an install that never reads the graph should not pay for it."},
+	{Key: "graph.max_ops", Kind: kInt, Def: "12", Env: "ANAMNESIA_GRAPH_MAX_OPS",
+		Doc: "Caps how many entities and edges one checkpoint may produce."},
+	{Key: "graph.candidate_distance", Kind: kFraction, Def: "0.45", Env: "ANAMNESIA_GRAPH_CANDIDATE_DISTANCE",
+		Doc: "How close an existing entity's name must embed to a newly extracted entity's name, and share its kind, before it is offered to the model as a possible match — triggering one extra, otherwise-skipped model call per checkpoint to ask whether the two are really the same thing. Cosine distance from 0 to 1, so smaller is stricter. This does not merge anything by itself: the model decides identity, so it is deliberately loose; raise it only if relevant entities are consistently missing from what the model is offered. Past 1 the two names point away from each other, which is not a candidate for being the same thing, so 1 is the ceiling."},
 }
 
 // settingByKey indexes settings for lookup.
@@ -238,6 +254,22 @@ func (s setting) validate(raw string) (string, error) {
 			return "", fmt.Errorf("%s must be positive, got %d", s.Key, n)
 		}
 		return strconv.Itoa(n), nil
+	case kFraction:
+		if v == "" {
+			return "", nil
+		}
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return "", fmt.Errorf("%s must be a number between 0 and 1, got %q", s.Key, raw)
+		}
+		// NaN compares false to everything, so the range check below
+		// lets it through. A NaN threshold makes every `distance <=
+		// threshold` test false, which silently turns whatever reads
+		// this setting into a no-op that still traces as healthy.
+		if math.IsNaN(f) || f < 0 || f > 1 {
+			return "", fmt.Errorf("%s must be between 0 and 1, got %q", s.Key, raw)
+		}
+		return v, nil
 	case kBool:
 		if v == "" {
 			return "", nil

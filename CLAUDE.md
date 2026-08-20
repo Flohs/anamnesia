@@ -76,7 +76,7 @@ decay-aware scoring on experiences (`relevance` recomputed hourly).
 ## Verifying a change
 
 ```bash
-make lint                                   # gofmt, vet, tests
+make lint                                   # gofmt, vet, tests (starts a test DB)
 export ANAMNESIA_HOME=/tmp/anamnesia-dev    # never touch the real install
 ./bin/anamnesia setup --no-hooks --no-start
 ./bin/anamnesia start && ./bin/anamnesia doctor --deep

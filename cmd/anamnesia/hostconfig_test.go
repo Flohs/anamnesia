@@ -430,6 +430,85 @@ func TestActivityTracesRejectsZero(t *testing.T) {
 	}
 }
 
+// TestCandidateDistanceIsRejectedWhereItIsTyped: graph.candidate_distance
+// is the only fractional setting there is, and a fraction declared as a
+// string is checked nowhere until the server reads it — `config set`
+// reports success, the value lands in the file, and the failure surfaces
+// as `anamnesia start` leaving you without a server and an error naming
+// an environment variable you never typed. A bad value has to be an error
+// naming the setting, at the point of entry.
+//
+// 1.5 is in the list on purpose: the accepted range is 0 to 1, the same
+// range internal/config's fraction() enforces on the way in to the
+// server. Cosine distance runs to 2, but past 1 the filter is offering
+// names that point away from each other as candidates for being the same
+// thing, and the two ends of the path have to agree about the bound or
+// this test's whole point is lost.
+func TestCandidateDistanceIsRejectedWhereItIsTyped(t *testing.T) {
+	home := isolatedHome(t)
+	path := filepath.Join(home, "config.toml")
+	// "nan" and "NaN" are the ones a range check alone lets through: NaN
+	// compares false to everything, so `f < 0 || f > 1` accepts it. A NaN
+	// threshold then makes every `distance <= threshold` false, so entity
+	// resolution finds no candidate for anything and traces as healthy
+	// while doing nothing. Inf is caught by `f > 1`; only NaN slips.
+	for _, bad := range []string{"banana", "0.4.5", "-0.1", "1.5", "nan", "NaN"} {
+		err := setConfigValue(path, "graph.candidate_distance", bad)
+		if err == nil {
+			t.Errorf("config set graph.candidate_distance %q succeeded; the server is the one that would reject it, hours later", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "graph.candidate_distance") {
+			t.Errorf("rejecting %q said %q, want the setting named", bad, err)
+		}
+	}
+	if err := setConfigValue(path, "graph.candidate_distance", "0.6"); err != nil {
+		t.Errorf("config set graph.candidate_distance 0.6: %v", err)
+	}
+}
+
+// TestGraphSettingsReachTheExtractor walks the whole path the three graph
+// settings take to the thing that consumes them: the config file, then
+// hostConfig resolution, then the environment `anamnesia start` hands the
+// server, then config.Load reading that environment back, then serve.go
+// turning it into the extractor's own config. That last hop is one line
+// no other test looks at, which is how a setting ends up declared,
+// documented, defaulted — and never wired to anything.
+func TestGraphSettingsReachTheExtractor(t *testing.T) {
+	home := isolatedHome(t)
+	writeConfig(t, filepath.Join(home, "config.toml"), `
+[graph]
+extract = "true"
+max_ops = "7"
+candidate_distance = "0.3"
+`)
+	hc, err := loadHostConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range hc.ServerEnv() {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			t.Fatalf("server environment entry %q is not key=value", kv)
+		}
+		t.Setenv(k, v)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := extractConfig(cfg)
+	if !got.ExtractGraph {
+		t.Error("graph.extract = true never reached the extractor")
+	}
+	if got.GraphMaxOps != 7 {
+		t.Errorf("GraphMaxOps = %d, want 7", got.GraphMaxOps)
+	}
+	if got.GraphCandidateDistance != 0.3 {
+		t.Errorf("GraphCandidateDistance = %v, want 0.3", got.GraphCandidateDistance)
+	}
+}
+
 func TestConfigSnapshotMasksSecrets(t *testing.T) {
 	home := isolatedHome(t)
 	writeConfig(t, filepath.Join(home, "config.toml"), `
