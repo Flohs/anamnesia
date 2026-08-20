@@ -274,7 +274,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 				DecayEvery:       cfg.DecayEvery,
 				ConsolidateEvery: cfg.ConsolidateEvery,
 				ExtractEvery:     cfg.ExtractEvery,
-				Extract:          extract.Config{ExtractCommitments: cfg.ExtractCommitments, ExtractGraph: cfg.ExtractGraph, GraphMaxOps: cfg.GraphMaxOps},
+				Extract:          extract.Config{ExtractCommitments: cfg.ExtractCommitments, ExtractGraph: cfg.ExtractGraph, GraphMaxOps: cfg.GraphMaxOps, GraphMergeDistance: cfg.GraphMergeDistance},
 				Decay:            decayConfig(cfg),
 			},
 			Store:     st,

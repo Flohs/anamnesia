@@ -282,3 +282,133 @@ func TestGraphBridgeConnectsSegmentSourcesToEntities(t *testing.T) {
 		t.Fatalf("EntitiesForSources(segment ids) = %d entities, want 2 — this is the exact join graphExpand relies on to seed a walk from a search hit", len(mentioned))
 	}
 }
+
+// TestEntityResolutionMergesTwoSpellingsOfOneName is the regression this
+// whole plan exists for:
+// docs/superpowers/specs/2026-08-19-entity-identity-does-not-hold.md found
+// two real sessions discussing one person land as two disconnected
+// subgraphs — "priha-raman" in one session, "priya-raman" in the next —
+// because entity identity was exact string equality on a model-produced
+// name. Run runGraph twice, once per spelling, with a fakeEmbedder that
+// places the two spellings within graph.merge_distance of each other and
+// everything else far apart. Afterwards there must be exactly one person
+// entity, with both sessions' edges attached to it.
+//
+// Before the fix in this commit, this test fails: with no entity
+// resolution, "priha-raman" and "priya-raman" upsert as two distinct
+// rows (ON CONFLICT dedupes on the literal name, and the two spellings
+// are literally different strings), so ListEntities(kind="person")
+// returns 3, not 2, and the "covers" edge attaches to a node the first
+// session's "owns" edge never reaches.
+func TestEntityResolutionMergesTwoSpellingsOfOneName(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	user := "entity-resolution-test-" + uuid.NewString()[:8]
+	uid, err := st.EnsureUser(ctx, user)
+	if err != nil {
+		t.Fatalf("ensure user: %v", err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), user) })
+	scope := anamnesia.Scope{UserID: uid}
+
+	// priya-raman and priha-raman embed almost identically (cosine
+	// distance ~0.00005, well under the 0.05 threshold this test uses);
+	// dana-okafor and the job entity are orthogonal to everything, so
+	// they never get close enough to merge with anyone. The extra zero
+	// components (padding out to the schema's real embedding width) do
+	// not change any cosine distance.
+	vec1536 := func(x, y, z float32) []float32 {
+		v := make([]float32, 1536)
+		v[0], v[1], v[2] = x, y, z
+		return v
+	}
+	emb := &fakeEmbedder{Vecs: map[string][]float32{
+		"priya-raman":                      vec1536(1, 0, 0),
+		"priha-raman":                      vec1536(0.99, 0.01, 0),
+		"dana-okafor":                      vec1536(0, 1, 0),
+		"nightly-stock-reconciliation-job": vec1536(0, 0, 1),
+	}}
+
+	newSource := func(content string) *anamnesia.Source {
+		src := &anamnesia.Source{Scope: scope, Kind: graphSourceKind, OccurredAt: time.Now().UTC(), RawContent: content}
+		if err := st.InsertSource(ctx, src); err != nil {
+			t.Fatalf("insert source: %v", err)
+		}
+		return src
+	}
+	run := func(src *anamnesia.Source, ops []graphOperation) {
+		ex := &Extractor{
+			Cfg:      Config{ExtractGraph: true, GraphMergeDistance: 0.05},
+			Store:    st,
+			Embedder: emb,
+			LLM:      &fakeLLM{RawOps: marshalGraphOps(t, ops)},
+		}
+		if _, err := ex.Run(ctx, src); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	}
+
+	src1 := newSource("Priya Raman owns the nightly stock reconciliation job.")
+	run(src1, []graphOperation{
+		{Op: "ADD_ENTITY", Kind: "person", Name: "priya-raman"},
+		{Op: "ADD_ENTITY", Kind: "project", Name: "nightly-stock-reconciliation-job"},
+		{Op: "ADD_EDGE", From: "priya-raman", To: "nightly-stock-reconciliation-job", Kind: "owns"},
+	})
+
+	src2 := newSource("Dana Okafor covers priha raman while she is on leave.")
+	run(src2, []graphOperation{
+		{Op: "ADD_ENTITY", Kind: "person", Name: "dana-okafor"},
+		{Op: "ADD_ENTITY", Kind: "person", Name: "priha-raman"},
+		{Op: "ADD_EDGE", From: "dana-okafor", To: "priha-raman", Kind: "covers"},
+	})
+
+	people, err := st.ListEntities(ctx, scope, "person", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(people) != 2 {
+		names := make([]string, len(people))
+		for i, p := range people {
+			names[i] = p.Name
+		}
+		t.Fatalf("ListEntities(person) = %d, want 2 (one merged priya/priha-raman, one dana-okafor); got %v", len(people), names)
+	}
+
+	var raman *anamnesia.Entity
+	for _, p := range people {
+		if p.Name == "priya-raman" || p.Name == "priha-raman" {
+			raman = p
+		}
+	}
+	if raman == nil {
+		t.Fatalf("neither spelling of raman survived: %v", people)
+	}
+
+	_, ownsEdges, err := st.Neighbors(ctx, raman.ID, []string{"owns"}, "out", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ownsEdges) != 1 {
+		t.Errorf("owns edges from the merged entity = %d, want 1 (from the first session)", len(ownsEdges))
+	}
+
+	_, coversEdges, err := st.Neighbors(ctx, raman.ID, []string{"covers"}, "in", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(coversEdges) != 1 {
+		t.Errorf("covers edges into the merged entity = %d, want 1 (from the second session)", len(coversEdges))
+	}
+}

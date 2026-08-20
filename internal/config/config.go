@@ -80,6 +80,13 @@ type Config struct {
 	ExtractGraph bool // ANAMNESIA_GRAPH_EXTRACT (default false)
 	GraphMaxOps  int  // ANAMNESIA_GRAPH_MAX_OPS (default 12)
 
+	// GraphMergeDistance is the cosine distance below which a new
+	// entity's name is treated as the same thing as an existing one.
+	// Smaller is stricter; 0 is a legitimate value ("merge only identical
+	// names"), so unlike the other numeric settings it is not defaulted
+	// when zero — it always comes from ANAMNESIA_GRAPH_MERGE_DISTANCE.
+	GraphMergeDistance float64 // ANAMNESIA_GRAPH_MERGE_DISTANCE (default 0.28)
+
 	// Decay half-lives per experience kind. Relevance falls by half over
 	// this long since a memory was last used, per kind, which is what
 	// makes an episode fade while an approach does not.
@@ -159,6 +166,22 @@ func Load() (*Config, error) {
 		}
 		return b
 	}
+	fraction := func(key string, def float64) float64 {
+		v := strings.TrimSpace(os.Getenv(key))
+		if v == "" {
+			return def
+		}
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			fail("%s=%q is not a number", key, v)
+			return def
+		}
+		if f < 0 || f > 1 {
+			fail("%s=%q must be between 0 and 1", key, v)
+			return def
+		}
+		return f
+	}
 
 	orKey := strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY"))
 	hasOR := orKey != ""
@@ -200,6 +223,8 @@ func Load() (*Config, error) {
 
 		ExtractGraph: boolean("ANAMNESIA_GRAPH_EXTRACT", false),
 		GraphMaxOps:  num("ANAMNESIA_GRAPH_MAX_OPS", 12),
+
+		GraphMergeDistance: fraction("ANAMNESIA_GRAPH_MERGE_DISTANCE", 0.28),
 
 		DecayHalfLifeCase:     dur("ANAMNESIA_DECAY_HALF_LIFE_CASE", 336*time.Hour),
 		DecayHalfLifeStrategy: dur("ANAMNESIA_DECAY_HALF_LIFE_STRATEGY", 8760*time.Hour),

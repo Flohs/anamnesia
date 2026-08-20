@@ -11,13 +11,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/flohs/anamnesia/internal/activity"
+	"github.com/flohs/anamnesia/internal/embed"
 	"github.com/flohs/anamnesia/internal/llm"
+	"github.com/flohs/anamnesia/internal/store"
 	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
@@ -91,6 +94,80 @@ func normaliseEntityName(name string) string {
 	s := strings.ToLower(strings.TrimSpace(name))
 	s = strings.TrimPrefix(s, "the ")
 	return slugKey(s)
+}
+
+// entityResolution is what resolveEntity decided for one ADD_ENTITY op:
+// either an existing entity's id was reused (Reused true, with the name
+// and distance that justified it, for the trace), or a new row was
+// upserted under a fresh id.
+type entityResolution struct {
+	ID       uuid.UUID
+	Reused   bool
+	Existing string // the absorbing entity's name, set when Reused
+	Distance float64
+}
+
+// resolveEntity decides whether name (already normalised by the caller)
+// refers to an entity that already exists in scope under a different
+// spelling, or is new. It embeds the name, asks the store for the
+// nearest entities, and reuses the closest one when it is within
+// graph.merge_distance AND shares kind — see resolveEntityWith for why
+// the kind guard is not negotiable. Otherwise it upserts a new entity
+// with the embedding attached, so a later session can match against it.
+//
+// An embedder or lookup failure must not fail the graph pass (a graph
+// that stops extracting is worse than one that occasionally forks), so
+// either falls back to today's exact-name upsert.
+func (e *Extractor) resolveEntity(ctx context.Context, scope anamnesia.Scope, kind, name string, props map[string]any) (entityResolution, error) {
+	threshold := e.Cfg.applyDefaults().GraphMergeDistance
+	return resolveEntityWith(ctx, e.Embedder, e.Store.NearestEntities, e.Store.UpsertEntity, threshold, scope, kind, name, props, e.Log)
+}
+
+// resolveEntityWith is resolveEntity's logic with the store calls taken
+// as function values instead of a *store.Store, so the merge decision —
+// the threshold check, the kind guard, and the embedder-failure fallback
+// — can be unit tested without a database.
+//
+// The kind guard (matches[0].Entity.Kind == kind) is deliberate and not
+// redundant: a name-only embedding cannot tell "checkout-service" the
+// service from "checkout-service" the project apart, and measurement
+// against the real embedder found a real case of this shape ("rotterdam"
+// vs "rotterdam-warehouse" embed within a plausible threshold — see
+// Ruling 5, .superpowers/sdd/2026-08-20-entity-resolution/progress.md).
+// Merging is irreversible, so a kind mismatch always creates rather than
+// guesses.
+func resolveEntityWith(
+	ctx context.Context,
+	embedder embed.Embedder,
+	nearest func(ctx context.Context, scope anamnesia.Scope, vec []float32, limit int) ([]store.EntityMatch, error),
+	upsert func(ctx context.Context, e *anamnesia.Entity) error,
+	threshold float64,
+	scope anamnesia.Scope, kind, name string, props map[string]any,
+	log *slog.Logger,
+) (entityResolution, error) {
+	ent := &anamnesia.Entity{Scope: scope, Kind: kind, Name: name, Props: props}
+	if embedder != nil {
+		vecs, err := embedder.Embed(ctx, []string{name})
+		if err != nil {
+			if log != nil {
+				log.Warn("extractor: embed entity name failed, falling back to exact-name upsert", "name", name, "err", err)
+			}
+		} else if len(vecs) > 0 {
+			ent.Embedding = vecs[0]
+			matches, err := nearest(ctx, scope, ent.Embedding, 3)
+			if err != nil {
+				if log != nil {
+					log.Warn("extractor: nearest-entity lookup failed, falling back to exact-name upsert", "name", name, "err", err)
+				}
+			} else if len(matches) > 0 && matches[0].Distance <= threshold && matches[0].Entity.Kind == kind {
+				return entityResolution{ID: matches[0].Entity.ID, Reused: true, Existing: matches[0].Entity.Name, Distance: matches[0].Distance}, nil
+			}
+		}
+	}
+	if err := upsert(ctx, ent); err != nil {
+		return entityResolution{}, err
+	}
+	return entityResolution{ID: ent.ID}, nil
 }
 
 // resolveEdges turns ADD_EDGE operations naming entities by name into
@@ -170,9 +247,14 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 		ops = append(ops, op)
 	}
 
-	// Upsert every ADD_ENTITY op, normalised, collecting ids by name.
+	// Resolve every ADD_ENTITY op, normalised, collecting ids by name.
+	// resolveEntity either reuses an existing entity whose embedded name
+	// is within graph.merge_distance (same kind only — see
+	// resolveEntityWith) or upserts a new one, so two spellings of the
+	// same thing land on one node instead of forking the graph.
 	known := make(map[string]uuid.UUID)
-	upserted := make([]*anamnesia.Entity, 0, len(ops))
+	upsertedCount := 0
+	var merges []string
 	failures := make([]string, 0)
 	for _, op := range ops {
 		if strings.ToUpper(strings.TrimSpace(op.Op)) != "ADD_ENTITY" {
@@ -183,16 +265,20 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 			failures = append(failures, fmt.Sprintf("ADD_ENTITY %q: kind and name required", op.Name))
 			continue
 		}
-		ent := &anamnesia.Entity{Scope: src.Scope, Kind: op.Kind, Name: name, Props: op.Props}
-		if err := e.Store.UpsertEntity(ctx, ent); err != nil {
+		res, err := e.resolveEntity(ctx, src.Scope, op.Kind, name, op.Props)
+		if err != nil {
 			if e.Log != nil {
 				e.Log.Warn("extractor: upsert entity failed", "err", err)
 			}
 			failures = append(failures, "ADD_ENTITY "+name+": "+err.Error())
 			continue
 		}
-		known[name] = ent.ID
-		upserted = append(upserted, ent)
+		known[name] = res.ID
+		if res.Reused {
+			merges = append(merges, fmt.Sprintf("%q merged into %q (kind %s, distance %.4f)", name, res.Existing, op.Kind, res.Distance))
+			continue
+		}
+		upsertedCount++
 	}
 
 	// Resolve edge endpoints not created this pass against entities from
@@ -272,22 +358,23 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 		}
 	}
 
-	tr.Step("graph", fmt.Sprintf("Upserted %d entities, created %d edges (%d superseded, %d dropped)",
-		len(upserted), edgesCreated, edgesSuperseded, len(dropped)),
+	tr.Step("graph", fmt.Sprintf("Upserted %d entities, merged %d, created %d edges (%d superseded, %d dropped)",
+		upsertedCount, len(merges), edgesCreated, edgesSuperseded, len(dropped)),
 		map[string]any{
-			"entities_upserted": len(upserted),
+			"entities_upserted": upsertedCount,
+			"entities_merged":   merges,
 			"edges_created":     edgesCreated,
 			"edges_superseded":  edgesSuperseded,
 			"edges_dropped":     dropped,
 			"failures":          failures,
 		})
 
-	executed := len(upserted) + edgesCreated
+	executed := upsertedCount + len(merges) + edgesCreated
 	if executed == 0 {
 		tr.End("skipped", "The model found no durable entities or relationships")
 	} else {
 		tr.End("ok", fmt.Sprintf("Extracted %d entities and %d edges from a %s %s source",
-			len(upserted), edgesCreated, humanBytes(len(content)), src.Kind))
+			upsertedCount+len(merges), edgesCreated, humanBytes(len(content)), src.Kind))
 	}
 	return executed, nil
 }
