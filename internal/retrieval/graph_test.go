@@ -632,6 +632,17 @@ func TestASlowGraphWalkDegradesInsteadOfEliminatingRetrieval(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Shrink the budget for this test. The lock below is ACCESS EXCLUSIVE
+	// on a table every other package's DB tests also touch, and they run
+	// in parallel against one database — so the lock is held for exactly
+	// one budget, and a smaller budget is a shorter stall for everyone
+	// else. The property under test is "the walk gives up and retrieval
+	// still returns", which does not depend on how long the giving-up
+	// takes.
+	restore := graphBudget
+	graphBudget = 20 * time.Millisecond
+	t.Cleanup(func() { graphBudget = restore })
+
 	// Block the walk. lock_timeout keeps this from waiting forever if
 	// another package's DB test happens to hold a conflicting lock on the
 	// shared test database at this moment.

@@ -44,7 +44,11 @@ const maxGraphSeedEntities = 20
 // pathological fan-out. Without it, that tail is paid out of the hook's
 // deadline, the handler never writes a response, and the prompt gets no
 // memory at all.
-const graphBudget = 300 * time.Millisecond
+// A var, not a const, only so the timeout test can shrink it: it blocks
+// the walk with an ACCESS EXCLUSIVE lock on `edges`, and every other
+// package's DB tests run in parallel against the same database and wait
+// out whatever it holds. Shrinking the budget shrinks the lock.
+var graphBudget = 300 * time.Millisecond
 
 // graphExpand walks out from the top q.GraphSeedN hits of fused (the
 // vector+lexical fused ranking, already sorted) and returns up to
@@ -236,7 +240,7 @@ func (e *Engine) hitsForSources(ctx context.Context, scope anamnesia.Scope, sour
 			       embed_model, valid_from, valid_to, ingested_at, invalidated_at,
 			       superseded_by, deleted_at
 			FROM facts WHERE %s
-			ORDER BY array_position($1::uuid[], source_id), trust DESC
+			ORDER BY (SELECT ord FROM unnest($1::uuid[]) WITH ORDINALITY AS o(sid, ord) WHERE o.sid = source_id), trust DESC
 			LIMIT $%d`, strings.Join(where, " AND "), len(args))
 		facts, err := e.Store.QueryFacts(ctx, q, args)
 		if err != nil {
@@ -262,7 +266,7 @@ func (e *Engine) hitsForSources(ctx context.Context, scope anamnesia.Scope, sour
 			valid_from, valid_to, ingested_at, invalidated_at, superseded_by, deleted_at,
 			occurred_at, participants, topic, parent_id, provenance
 			FROM experiences WHERE %s
-			ORDER BY array_position($1::uuid[], source_id), trust DESC
+			ORDER BY (SELECT ord FROM unnest($1::uuid[]) WITH ORDINALITY AS o(sid, ord) WHERE o.sid = source_id), trust DESC
 			LIMIT $%d`, strings.Join(where, " AND "), len(args))
 		exps, err := e.Store.QueryExperiences(ctx, q, args)
 		if err != nil {
