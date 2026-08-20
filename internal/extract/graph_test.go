@@ -301,3 +301,30 @@ func TestEntityCandidatesForNameTreatsKindCaseDriftAsTheSameKind(t *testing.T) {
 		t.Fatalf("entityCandidatesForNameWith = %v, want the match: kind %q and kind %q are the same kind, and dropping it makes entity resolution a silent no-op for this pair forever", got, "Person", "person")
 	}
 }
+
+// TestEdgeKindIsNormalised: nothing constrains the kind a model writes on
+// an ADD_EDGE, so one relation arrives as "depends on", "depends_on" and
+// "Depends On" across three checkpoints and the graph ends up describing
+// the same relation three ways. Entity kind is normalised for exactly
+// this reason; an edge's was not.
+func TestEdgeKindIsNormalised(t *testing.T) {
+	from, to := uuid.New(), uuid.New()
+	known := map[string]uuid.UUID{"alpha": from, "beta": to}
+	ops := []graphOperation{
+		{Op: "ADD_EDGE", From: "alpha", To: "beta", Kind: "Depends On"},
+		{Op: "ADD_EDGE", From: "alpha", To: "beta", Kind: "depends_on"},
+		{Op: "ADD_EDGE", From: "alpha", To: "beta", Kind: "  DEPENDS   on  "},
+	}
+	resolved, dropped := resolveEdges(ops, known)
+	if len(dropped) != 0 {
+		t.Fatalf("dropped %v, want none: both endpoints resolve", dropped)
+	}
+	if len(resolved) != 3 {
+		t.Fatalf("resolved %d edges, want 3", len(resolved))
+	}
+	for _, e := range resolved {
+		if e.Kind != "depends_on" {
+			t.Errorf("edge kind %q, want %q: three spellings of one relation must land on one kind", e.Kind, "depends_on")
+		}
+	}
+}

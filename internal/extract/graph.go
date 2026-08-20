@@ -8,6 +8,7 @@
 package extract
 
 import (
+	"regexp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -197,6 +198,27 @@ func NormaliseEntityName(name string) string {
 func NormaliseEntityKind(kind string) string {
 	return slugKey(kind)
 }
+
+// normaliseEdgeKind canonicalises an edge's kind. Nothing constrains what
+// the model writes there, so one relation arrives as "depends on",
+// "depends_on" and "Depends On" across three checkpoints and the graph
+// describes it three ways.
+//
+// Not slugKey, deliberately: slugKey rewrites "_" to "-", and every edge
+// kind this codebase already writes is underscored — reads_from,
+// depends_on, reports_to, escalation_contact. Running names through
+// slugKey would rename the entire existing corpus of edge kinds to a new
+// spelling and fork them against every row written before it. Lowercase,
+// trim, and collapse any run of separators to a single underscore: three
+// spellings converge, and a kind already in the house style is returned
+// exactly as it came in.
+func normaliseEdgeKind(kind string) string {
+	k := strings.ToLower(strings.TrimSpace(kind))
+	k = edgeKindSepRE.ReplaceAllString(k, "_")
+	return strings.Trim(k, "_")
+}
+
+var edgeKindSepRE = regexp.MustCompile(`[^a-z0-9]+`)
 
 // entityKey is the identity an extracted entity is tracked under while a
 // checkpoint executes: kind AND name, never name alone. (scope, kind,
@@ -481,7 +503,14 @@ func resolveEdges(ops []graphOperation, known map[string]uuid.UUID) (resolved []
 		case !toOK:
 			dropped = append(dropped, fmt.Sprintf("edge %q -> %q (%s): %q did not resolve to an entity", op.From, op.To, op.Kind, op.To))
 		default:
-			resolved = append(resolved, anamnesia.Edge{From: fromID, To: toID, Kind: op.Kind, Props: op.Props, Trust: op.Trust})
+			// Kind is normalised for the same reason an entity's is:
+			// nothing constrains what the model writes, and "depends
+			// on", "depends_on" and "Depends On" are one relation
+			// wearing three spellings. The retrieval walk passes nil
+			// kinds (internal/retrieval/graph.go), so this changes no
+			// query — it keeps the graph from describing one edge
+			// three ways.
+			resolved = append(resolved, anamnesia.Edge{From: fromID, To: toID, Kind: normaliseEdgeKind(op.Kind), Props: op.Props, Trust: op.Trust})
 		}
 	}
 	return resolved, dropped
