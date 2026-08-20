@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -22,6 +23,28 @@ import (
 // number of Neighbors calls below unbounded, on a hot path with a 2.5s
 // budget.
 const maxGraphSeedEntities = 20
+
+// graphBudget bounds what the walk may spend. Search runs graphExpand
+// under a context.WithTimeout of this length, derived from the request
+// context, so an overrun makes the walk's next store call fail — which
+// Search already handles by keeping the fused-only ranking. Deriving it
+// is what makes that safe: cancelling a derived context cannot cancel
+// the request's, so the vector and lexical hits computed before the walk
+// starts are never touched by a graph timeout.
+//
+// The number: the retrieve hook gives the whole request 2.5s
+// (cmd/anamnesia/hook.go), and handleRetrieve calls Search twice — once
+// for the project, once for cross-project hits (internal/httpapi/
+// server.go) — so this is spent at most twice. 300ms caps the channel at
+// 600ms of that 2.5s and leaves the rest for embedding the query, the
+// vector and lexical queries, reranking and the response. Against a
+// healthy local Postgres the walk costs tens of milliseconds — every
+// query shape it issues has a supporting index — so the budget only
+// bites on the tail: lock contention, a stalled connection, a
+// pathological fan-out. Without it, that tail is paid out of the hook's
+// deadline, the handler never writes a response, and the prompt gets no
+// memory at all.
+const graphBudget = 300 * time.Millisecond
 
 // graphExpand walks out from the top q.GraphSeedN hits of fused (the
 // vector+lexical fused ranking, already sorted) and returns up to

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -544,5 +545,155 @@ func TestInScope(t *testing.T) {
 		if got := inScope(c.candidate, c.want); got != c.in {
 			t.Errorf("%s: inScope(%+v, %+v) = %v, want %v", c.name, c.candidate, c.want, got, c.in)
 		}
+	}
+}
+
+// TestASlowGraphWalkDegradesInsteadOfEliminatingRetrieval: the comment
+// above graphExpand's call site in retrieval.go promises that "a slow or
+// broken graph mid-walk must degrade retrieval, not turn a working one
+// into no memory injected at all". Broken is covered by the err != nil
+// path; SLOW is what this test is about. The retrieve hook gives the
+// whole request 2.5s (cmd/anamnesia/hook.go) and handleRetrieve runs
+// Search twice, so a walk that just keeps waiting eats the deadline, the
+// handler never writes a response, and the prompt gets no memory at all
+// — the opposite of degrading.
+//
+// The fixture is TestTheGraphSurfacesARowNeitherSearchFinds', where the
+// graph channel is known to contribute exp2 and nothing else finds it,
+// with one addition: an ACCESS EXCLUSIVE lock on `edges`, which makes
+// every plain SELECT against that table wait. Store.Neighbors is the only
+// thing in the read path that touches edges, so this blocks precisely the
+// per-seed-entity round trips the walk makes — for real, through pgx,
+// not by simulating a slow store. The lock is released the moment Search
+// returns, so it holds for about one graph budget; a Search that ignores
+// its budget is bounded by the select below rather than hanging the
+// suite.
+func TestASlowGraphWalkDegradesInsteadOfEliminatingRetrieval(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	handle := "retrieval-slow-graph-" + uuid.NewString()[:8]
+	uid, err := st.EnsureUser(ctx, handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = st.DeleteUser(context.Background(), handle) })
+	scope := anamnesia.Scope{UserID: uid}
+
+	src1 := &anamnesia.Source{Scope: scope, Kind: "claude-session-graph", RawContent: "x"}
+	if err := st.InsertSource(ctx, src1); err != nil {
+		t.Fatal(err)
+	}
+	src2 := &anamnesia.Source{Scope: scope, Kind: "claude-session-graph", RawContent: "x"}
+	if err := st.InsertSource(ctx, src2); err != nil {
+		t.Fatal(err)
+	}
+	exp1 := &anamnesia.Experience{
+		Scope: scope, Kind: anamnesia.ExperienceCase, SourceID: &src1.ID,
+		Title: "narwhal migration", Body: "Notes on the narwhal migration rollout.",
+	}
+	if err := st.RecordExperience(ctx, exp1); err != nil {
+		t.Fatal(err)
+	}
+	exp2 := &anamnesia.Experience{
+		Scope: scope, Kind: anamnesia.ExperienceCase, SourceID: &src2.ID,
+		Title: "ibex patrol", Body: "Notes on the ibex crossing patrol logs.",
+	}
+	if err := st.RecordExperience(ctx, exp2); err != nil {
+		t.Fatal(err)
+	}
+	ent1 := &anamnesia.Entity{Scope: scope, Kind: "topic", Name: "narwhal-project"}
+	if err := st.UpsertEntity(ctx, ent1); err != nil {
+		t.Fatal(err)
+	}
+	ent2 := &anamnesia.Entity{Scope: scope, Kind: "topic", Name: "ibex-project"}
+	if err := st.UpsertEntity(ctx, ent2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordMention(ctx, ent1.ID, src1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordMention(ctx, ent2.ID, src2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateEdge(ctx, &anamnesia.Edge{From: ent1.ID, To: ent2.ID, Kind: "related_to", Trust: 0.9}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Block the walk. lock_timeout keeps this from waiting forever if
+	// another package's DB test happens to hold a conflicting lock on the
+	// shared test database at this moment.
+	conn, err := st.Pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '10s'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "LOCK TABLE edges IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatalf("could not lock the edges table to block the graph walk: %v", err)
+	}
+
+	type result struct {
+		hits []anamnesia.SearchHit
+		err  error
+		took time.Duration
+	}
+	done := make(chan result, 1)
+	eng := &Engine{Store: st}
+	go func() {
+		started := time.Now()
+		hits, err := eng.Search(ctx, Query{Scope: scope, Text: "narwhal"})
+		done <- result{hits: hits, err: err, took: time.Since(started)}
+	}()
+
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(2 * time.Second):
+		// Still waiting on the locked table: the walk has no budget of
+		// its own and is spending the caller's. Unblock it so the suite
+		// can finish, then report.
+		_ = tx.Rollback(context.Background())
+		got = <-done
+		t.Fatalf("Search took %s against a blocked graph walk: the walk has no budget of its own, so it spends the whole 2.5s retrieve deadline and the prompt gets no memory at all", got.took)
+	}
+	if got.err != nil {
+		t.Fatalf("Search returned an error (%v) when only the graph channel was slow: vector and lexical results were already computed and must still be returned", got.err)
+	}
+
+	var foundExp1, foundExp2 bool
+	for _, h := range got.hits {
+		if h.Experience == nil {
+			continue
+		}
+		switch h.Experience.ID {
+		case exp1.ID:
+			foundExp1 = true
+		case exp2.ID:
+			foundExp2 = true
+		}
+	}
+	if !foundExp1 {
+		t.Errorf("hits = %v after %s, want the directly-matching narwhal experience: a slow graph must degrade retrieval, not eliminate it", hitIDs(got.hits), got.took)
+	}
+	if foundExp2 {
+		t.Errorf("hits = %v, want the graph-only ibex experience absent: the walk was blocked, so it cannot have contributed", hitIDs(got.hits))
 	}
 }

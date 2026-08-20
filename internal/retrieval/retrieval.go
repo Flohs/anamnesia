@@ -271,7 +271,16 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 	// mid-walk must degrade retrieval, not turn a working one into no
 	// memory injected at all. Log it (if a logger is wired) and keep
 	// going with the fused-only `out`.
-	graphHits, err := e.graphExpand(ctx, q, out)
+	//
+	// SLOW is the half a fallback on error cannot cover on its own, so
+	// the walk gets a deadline of its own (graphBudget, see graph.go):
+	// overrunning it fails the walk's next store call, which lands on
+	// exactly the same path. The context is derived from the request's,
+	// never the other way round — cancelling it cannot cancel the
+	// caller's, so `out` is untouched by a graph timeout.
+	graphCtx, cancelGraph := context.WithTimeout(ctx, graphBudget)
+	graphHits, err := e.graphExpand(graphCtx, q, out)
+	cancelGraph()
 	if err != nil {
 		if e.Log != nil {
 			e.Log.Warn("graph expand failed, continuing without it", "error", err)
