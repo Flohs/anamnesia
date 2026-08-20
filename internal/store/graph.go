@@ -162,6 +162,54 @@ func (s *Store) SetEntityEmbedding(ctx context.Context, id uuid.UUID, vec []floa
 	return err
 }
 
+// EntityMatch pairs an entity with its cosine distance from a probe vector.
+type EntityMatch struct {
+	Entity   *anamnesia.Entity
+	Distance float64
+}
+
+// NearestEntities returns the entities in scope closest to vec by cosine
+// distance, nearest first. Entities without an embedding are skipped. The
+// caller decides what distance counts as close enough; no threshold is
+// applied here.
+func (s *Store) NearestEntities(ctx context.Context, scope anamnesia.Scope, vec []float32, limit int) ([]EntityMatch, error) {
+	args := []any{scope.UserID, pgvector.NewVector(vec)}
+	where := []string{"user_id = $1", "embedding IS NOT NULL"}
+	if scope.ProjectID != nil {
+		args = append(args, *scope.ProjectID)
+		where = append(where, fmt.Sprintf("(project_id = $%d OR project_id IS NULL)", len(args)))
+	}
+	args = append(args, limit)
+	q := fmt.Sprintf(`
+		SELECT id, user_id, project_id, kind, name, props, created_at, embedding <=> $2 AS distance
+		FROM entities WHERE %s
+		ORDER BY embedding <=> $2 ASC
+		LIMIT $%d`, strings.Join(where, " AND "), len(args))
+	rows, err := s.Pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EntityMatch
+	for rows.Next() {
+		var (
+			e        anamnesia.Entity
+			project  *uuid.UUID
+			propsRaw []byte
+			distance float64
+		)
+		if err := rows.Scan(&e.ID, &e.Scope.UserID, &project, &e.Kind, &e.Name, &propsRaw, &e.CreatedAt, &distance); err != nil {
+			return nil, err
+		}
+		e.Scope.ProjectID = project
+		if len(propsRaw) > 0 {
+			_ = json.Unmarshal(propsRaw, &e.Props)
+		}
+		out = append(out, EntityMatch{Entity: &e, Distance: distance})
+	}
+	return out, rows.Err()
+}
+
 func scanEntity(row rowScanner) (*anamnesia.Entity, error) {
 	var (
 		e        anamnesia.Entity
