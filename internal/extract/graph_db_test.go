@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/flohs/anamnesia/internal/embed"
 	"github.com/flohs/anamnesia/internal/store"
 	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
@@ -536,5 +537,78 @@ func TestIdentityCallFailureFallsBackToCreatingSeparately(t *testing.T) {
 			names[i] = p.Name
 		}
 		t.Fatalf("ListEntities(person) = %d, want 2 (a judge that's down must never merge); got %v", len(people), names)
+	}
+}
+
+// TestEntityCandidatesForNameFindsARealVariant guards against exactly
+// the failure the graph-bridge incident already taught this project
+// once (docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md
+// — a hand-built fixture proved a mechanism production could never
+// assemble): every other test in this file injects candidates via
+// fakeEmbedder, so none of them can observe an empty candidate list. An
+// earlier version of this design embedded the whole checkpoint's
+// CONTENT and matched it against entity NAME vectors — content-to-name
+// is a different regime than what graph.candidate_distance was
+// calibrated against, and measured against the real embedder it never
+// retrieved anything (content/priha-raman = 0.7614, bound 0.45:
+// MISSED). This test would have caught that immediately.
+//
+// It calls a REAL configured embedding provider — skipped, like the
+// database tests, when nothing is configured to run it against — and
+// asserts NearestEntities actually returns priya-raman as a candidate
+// for the freshly-extracted name priha-raman: the one concrete
+// name-to-name case calibrated in
+// .superpowers/sdd/2026-08-20-entity-resolution/progress.md
+// (priya-raman/priha-raman = 0.2349, well inside the 0.45 bound).
+func TestEntityCandidatesForNameFindsARealVariant(t *testing.T) {
+	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ANAMNESIA_TEST_DATABASE_URL not set")
+	}
+	var provider, model, baseURL, apiKey string
+	switch {
+	case os.Getenv("OPENROUTER_API_KEY") != "":
+		provider, model, apiKey = "openrouter", "openai/text-embedding-3-small", os.Getenv("OPENROUTER_API_KEY")
+	case os.Getenv("OPENAI_API_KEY") != "":
+		provider, model, baseURL, apiKey = "openai", "text-embedding-3-small", "https://api.openai.com/v1", os.Getenv("OPENAI_API_KEY")
+	default:
+		t.Skip("no embedding provider credentials (OPENROUTER_API_KEY or OPENAI_API_KEY) set; this test needs a REAL embedder, not fakeEmbedder — see the doc comment for why")
+	}
+	// 1536 matches the test database's migrated embedding width (schema
+	// v9 at the time of writing), the same width every other test in
+	// this file assumes via vec1536.
+	emb, err := embed.New(provider, model, baseURL, apiKey, 1536)
+	if err != nil {
+		t.Fatalf("construct real embedder: %v", err)
+	}
+
+	st, scope := newGraphTestStore(t, "entity-real-embedder-test")
+	ctx := context.Background()
+
+	// Seed one entity exactly the way runGraph does on a real ADD_ENTITY:
+	// upsert, then attach the name's own embedding (embedEntityName).
+	vecs, err := emb.Embed(ctx, []string{"priya-raman"})
+	if err != nil {
+		t.Fatalf("embed priya-raman: %v", err)
+	}
+	if len(vecs) == 0 {
+		t.Fatal("embedder returned no vector for priya-raman")
+	}
+	if err := st.UpsertEntity(ctx, &anamnesia.Entity{Scope: scope, Kind: "person", Name: "priya-raman", Embedding: vecs[0]}); err != nil {
+		t.Fatalf("upsert priya-raman: %v", err)
+	}
+
+	got := entityCandidatesForNameWith(ctx, emb, st.NearestEntities, 0.45, scope, "person", "priha-raman", graphIdentityCandidateK, nil)
+	if len(got) == 0 {
+		t.Fatal("NearestEntities found no candidates for priha-raman against a real embedder — recall is structurally broken, the same way content-to-name recall was: see the doc comment above")
+	}
+	found := false
+	for _, m := range got {
+		if m.Entity.Name == "priya-raman" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("candidates for priha-raman did not include priya-raman: %v", got)
 	}
 }
