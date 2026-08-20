@@ -278,3 +278,26 @@ func TestEntityCandidatesForNameLookupErrorYieldsNoCandidates(t *testing.T) {
 		t.Errorf("entityCandidatesForNameWith = %v, want nil: a lookup failure must not fail the pass", got)
 	}
 }
+
+// TestEntityCandidatesForNameTreatsKindCaseDriftAsTheSameKind is the
+// recall half of the kind-normalisation finding: the same-kind filter is
+// what decides whether an existing entity is ever offered to the model
+// at all, so a stored kind that differs only in case must not hide it.
+// Nothing constrains what the model writes in "kind" — the schema types
+// it as a bare string with no enum, and the prompt only asks for lower
+// case NAMES — and anamnesia_graph_entity upserts a raw kind too.
+func TestEntityCandidatesForNameTreatsKindCaseDriftAsTheSameKind(t *testing.T) {
+	ctx := context.Background()
+	scope := anamnesia.Scope{UserID: uuid.New()}
+	// Stored by an earlier checkpoint whose model wrote "Person".
+	existing := &anamnesia.Entity{ID: uuid.New(), Kind: "Person", Name: "priya-raman"}
+	emb := &fakeEmbedder{Vecs: map[string][]float32{"priha-raman": {0.1, 0.2}}}
+	nearest := func(context.Context, anamnesia.Scope, []float32, int) ([]store.EntityMatch, error) {
+		return []store.EntityMatch{{Entity: existing, Distance: 0.1}}, nil
+	}
+
+	got := entityCandidatesForNameWith(ctx, emb, nearest, 0.45, scope, "person", "priha-raman", graphIdentityCandidateK, nil)
+	if len(got) != 1 || got[0].Entity.ID != existing.ID {
+		t.Fatalf("entityCandidatesForNameWith = %v, want the match: kind %q and kind %q are the same kind, and dropping it makes entity resolution a silent no-op for this pair forever", got, "Person", "person")
+	}
+}

@@ -93,7 +93,9 @@ For each entity, decide: is it the SAME real-world thing as one of its candidate
 
 Only report "same_as" when you are genuinely confident, and only with a candidate id offered for THAT entity. When unsure, or when none of its candidates fit, omit "same_as" — a duplicate entity is easy to fix later; a wrongly merged one is not.
 
-Output JSON only, matching: {"verdicts":[{"entity":"...","same_as":"<a candidate id from that entity's own list, or omit if none match>"}]}. No prose, no markdown fences.`
+Echo back the "kind" each entity was given along with its name. Two entities in one checkpoint can share a name under different kinds, and the kind is what says which of them your verdict is about.
+
+Output JSON only, matching: {"verdicts":[{"entity":"...","kind":"...","same_as":"<a candidate id from that entity's own list, or omit if none match>"}]}. No prose, no markdown fences.`
 
 // identityVerdictSchema is the JSON Schema for the identity
 // disambiguation call's response — a disjoint shape from
@@ -107,9 +109,10 @@ var identityVerdictSchema = json.RawMessage(`{
         "type": "object",
         "properties": {
           "entity":  {"type": "string"},
+          "kind":    {"type": "string"},
           "same_as": {"type": "string"}
         },
-        "required": ["entity"]
+        "required": ["entity","kind"]
       }
     }
   },
@@ -119,8 +122,16 @@ var identityVerdictSchema = json.RawMessage(`{
 // identityVerdict is one "same or different" judgment from the identity
 // disambiguation call. SameAs is a candidate's id, or empty for "this is
 // a different, new entity".
+//
+// Kind is what makes a verdict attributable to exactly one of the
+// entities we asked about: one checkpoint can extract two entities
+// sharing a name under different kinds, and each is asked about
+// separately (they get different candidates, because recall filters by
+// kind). Without the kind echoed back, both would consume the same
+// verdict — see resolveIdentities' verdict loop.
 type identityVerdict struct {
 	Entity string `json:"entity"`
+	Kind   string `json:"kind,omitempty"`
 	SameAs string `json:"same_as,omitempty"`
 }
 
@@ -169,6 +180,35 @@ func normaliseEntityName(name string) string {
 	s := strings.ToLower(strings.TrimSpace(name))
 	s = strings.TrimPrefix(s, "the ")
 	return slugKey(s)
+}
+
+// normaliseEntityKind canonicalises a kind for exactly the same reason
+// normaliseEntityName canonicalises a name, and it matters just as much:
+// kind is half of the (scope, kind, name) unique key AND the whole of
+// the same-kind candidate filter, yet nothing constrains what ends up in
+// it — graphOperationSchema types it as a bare string with no enum, the
+// prompt asks for lower-case names and says nothing about kind, and
+// anamnesia_graph_entity upserts whatever the caller passes. A model
+// writing "Person" in one checkpoint and "person" in the next would
+// otherwise produce two entities that can never be offered as each
+// other's candidate: entity resolution silently inert for that pair,
+// forever, with no log line. Unlike a name, a kind has no leading "the"
+// to strip, so this is slugKey alone.
+func normaliseEntityKind(kind string) string {
+	return slugKey(kind)
+}
+
+// entityKey is the identity an extracted entity is tracked under while a
+// checkpoint executes: kind AND name, never name alone. (scope, kind,
+// name) is what the unique index calls one entity, and the same-kind
+// candidate filter is only load-bearing if every map downstream of it
+// keeps the kind too — keyed by bare name, a verdict about a `project`
+// gets applied to a `place` of the same name, and a city is merged into
+// a warehouse. Both halves are already normalised by the time they get
+// here; NUL separates them because slugKey can never produce one, so no
+// two distinct (kind, name) pairs can collide on a key.
+func entityKey(kind, name string) string {
+	return kind + "\x00" + name
 }
 
 // graphIdentityCandidateK is how many nearest same-named entities to
@@ -245,8 +285,14 @@ func entityCandidatesForNameWith(
 		return nil
 	}
 	out := make([]store.EntityMatch, 0, len(matches))
+	want := normaliseEntityKind(kind)
 	for _, m := range matches {
-		if m.Distance <= threshold && m.Entity.Kind == kind {
+		// Both sides normalised: a stored kind can carry any casing (an
+		// entity written before normalisation existed, or one written
+		// through anamnesia_graph_entity, which upserts a raw kind), and
+		// a candidate must not be hidden by that. See
+		// normaliseEntityKind.
+		if m.Distance <= threshold && normaliseEntityKind(m.Entity.Kind) == want {
 			out = append(out, m)
 		}
 	}
@@ -269,12 +315,14 @@ type entityCandidateSet struct {
 // its candidates and asking the model to affirm or reject each. Most
 // checkpoints have no candidates and pay for no extra call.
 //
-// The returned map holds only pairs the model affirmed AND that name a
-// candidate id actually offered for that entity — a hallucinated or
-// mismatched id is dropped, not trusted. A call that errors returns nil:
-// per instruction, an unavailable judge falls back to creating every
-// entity separately, never to merging, because a guessed merge is
-// exactly the failure this whole design exists to avoid.
+// The returned map is keyed by entityKey — kind and name, matching what
+// runGraph looks an op up by — and holds only pairs the model affirmed
+// AND that name a candidate id actually offered for that entity: a
+// hallucinated or mismatched id is dropped, not trusted. A call that
+// errors returns nil: per instruction, an unavailable judge falls back
+// to creating every entity separately, never to merging, because a
+// guessed merge is exactly the failure this whole design exists to
+// avoid.
 func (e *Extractor) resolveIdentities(ctx context.Context, scope anamnesia.Scope, ops []graphOperation, tr *activity.Trace) map[string]uuid.UUID {
 	var sets []entityCandidateSet
 	for _, op := range ops {
@@ -282,11 +330,12 @@ func (e *Extractor) resolveIdentities(ctx context.Context, scope anamnesia.Scope
 			continue
 		}
 		name := normaliseEntityName(op.Name)
-		if name == "" || op.Kind == "" {
+		kind := normaliseEntityKind(op.Kind)
+		if name == "" || kind == "" {
 			continue
 		}
-		if matches := e.entityCandidatesForName(ctx, scope, op.Kind, name); len(matches) > 0 {
-			sets = append(sets, entityCandidateSet{Name: name, Kind: op.Kind, Matches: matches})
+		if matches := e.entityCandidatesForName(ctx, scope, kind, name); len(matches) > 0 {
+			sets = append(sets, entityCandidateSet{Name: name, Kind: kind, Matches: matches})
 		}
 	}
 	if len(sets) == 0 {
@@ -296,9 +345,17 @@ func (e *Extractor) resolveIdentities(ctx context.Context, scope anamnesia.Scope
 	}
 
 	queries := make([]identityQuery, 0, len(sets))
-	byName := make(map[string]entityCandidateSet, len(sets))
+	byKey := make(map[string]entityCandidateSet, len(sets))
+	// keysByName exists only for the verdict loop's fallback: a verdict
+	// that names no kind is still attributable when exactly one of the
+	// entities we asked about carries that name.
+	keysByName := make(map[string][]string, len(sets))
 	for _, s := range sets {
-		byName[s.Name] = s
+		key := entityKey(s.Kind, s.Name)
+		if _, seen := byKey[key]; !seen {
+			keysByName[s.Name] = append(keysByName[s.Name], key)
+		}
+		byKey[key] = s
 		cands := make([]identityCandidateJSON, 0, len(s.Matches))
 		for _, m := range s.Matches {
 			cands = append(cands, identityCandidateJSON{ID: m.Entity.ID.String(), Name: m.Entity.Name, Kind: m.Entity.Kind})
@@ -329,15 +386,37 @@ func (e *Extractor) resolveIdentities(ctx context.Context, scope anamnesia.Scope
 		if v.SameAs == "" {
 			continue
 		}
-		set, ok := byName[v.Entity]
+		name := normaliseEntityName(v.Entity)
+		key := entityKey(normaliseEntityKind(v.Kind), name)
+		set, ok := byKey[key]
 		if !ok {
-			continue // the model named an entity we never asked about
+			// No exact (kind, name) match — the model omitted the kind,
+			// or wrote one we never asked about. The verdict is still
+			// attributable when exactly one of the entities we asked
+			// about carries that name; when two do, it is not, and a
+			// verdict that cannot be pinned to one entity is dropped
+			// rather than applied to the wrong one. Same rule as a
+			// same_as id matching none of that entity's own candidates:
+			// a fork is visible and fixable, a wrong merge is neither.
+			//
+			// Second line of defence, not the only one: because recall
+			// filters candidates by kind, two same-name sets hold
+			// disjoint candidate ids, so the id match below would refuse
+			// a misattributed verdict anyway. This makes the rule
+			// explicit rather than a consequence of that filter still
+			// being there.
+			keys := keysByName[name]
+			if len(keys) != 1 {
+				continue
+			}
+			key = keys[0]
+			set = byKey[key]
 		}
 		for _, m := range set.Matches {
 			if m.Entity.ID.String() == v.SameAs {
-				affirmed[v.Entity] = m.Entity.ID
+				affirmed[key] = m.Entity.ID
 				affirmedLog = append(affirmedLog, fmt.Sprintf("%q merged into %q (kind %s, model-affirmed, candidate distance %.4f)",
-					v.Entity, m.Entity.Name, set.Kind, m.Distance))
+					set.Name, m.Entity.Name, set.Kind, m.Distance))
 				break
 			}
 		}
@@ -382,6 +461,11 @@ func (e *Extractor) embedEntityName(ctx context.Context, name string) []float32 
 // up from an earlier checkpoint. An edge whose endpoint does not resolve
 // is dropped rather than silently discarded, with a reason recorded so
 // the trace can say why the graph looks the way it does.
+//
+// Name alone, deliberately: an ADD_EDGE endpoint carries no kind, so it
+// cannot be keyed the way entities are (see entityKey). A name that is
+// ambiguous across kinds is therefore left out of this map entirely by
+// the caller, which drops the edge instead of guessing — see runGraph.
 func resolveEdges(ops []graphOperation, known map[string]uuid.UUID) (resolved []anamnesia.Edge, dropped []string) {
 	for _, op := range ops {
 		if strings.ToUpper(strings.TrimSpace(op.Op)) != "ADD_EDGE" {
@@ -458,12 +542,32 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 	// ask the model to affirm or reject each. See resolveIdentities.
 	affirmed := e.resolveIdentities(ctx, src.Scope, ops, tr)
 
-	// Upsert every ADD_ENTITY op, normalised, collecting ids by name.
-	// An op whose name the model just affirmed is the same as an
+	// Upsert every ADD_ENTITY op, normalised, collecting ids by
+	// entityKey — kind AND name, because that is what identifies an
+	// entity and two ops in one checkpoint can share a name under
+	// different kinds. An op the model just affirmed is the same as an
 	// existing entity reuses that entity's id instead of upserting a
 	// new one; everything else creates normally, exactly as before any
 	// of this existed.
 	known := make(map[string]uuid.UUID)
+	// idsByName records which entities this checkpoint landed on per
+	// bare NAME, for edge endpoints: an ADD_EDGE names entities by name
+	// only, with no kind, so it cannot form an entityKey. A name that
+	// two kinds share this pass therefore cannot be resolved to one
+	// entity, and its edges are dropped rather than pointed at whichever
+	// op happened to run last — the rule the LookupEntitiesByName branch
+	// below already applies to endpoints from earlier checkpoints, for
+	// the same reason: a wrong edge would be believed, a missing one is
+	// merely invisible.
+	idsByName := make(map[string][]uuid.UUID)
+	rememberName := func(name string, id uuid.UUID) {
+		for _, existing := range idsByName[name] {
+			if existing == id {
+				return
+			}
+		}
+		idsByName[name] = append(idsByName[name], id)
+	}
 	upserted := make([]*anamnesia.Entity, 0, len(ops))
 	var merged []string
 	failures := make([]string, 0)
@@ -472,16 +576,19 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 			continue
 		}
 		name := normaliseEntityName(op.Name)
-		if name == "" || op.Kind == "" {
+		kind := normaliseEntityKind(op.Kind)
+		if name == "" || kind == "" {
 			failures = append(failures, fmt.Sprintf("ADD_ENTITY %q: kind and name required", op.Name))
 			continue
 		}
-		if id, ok := affirmed[name]; ok {
-			known[name] = id
+		key := entityKey(kind, name)
+		if id, ok := affirmed[key]; ok {
+			known[key] = id
+			rememberName(name, id)
 			merged = append(merged, name)
 			continue
 		}
-		ent := &anamnesia.Entity{Scope: src.Scope, Kind: op.Kind, Name: name, Props: op.Props}
+		ent := &anamnesia.Entity{Scope: src.Scope, Kind: kind, Name: name, Props: op.Props}
 		// Attach the name's embedding (best-effort; nil on any failure —
 		// UpsertEntity already treats a nil Embedding as "no vector yet")
 		// so THIS entity becomes findable as a candidate the next time
@@ -497,8 +604,21 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 			failures = append(failures, "ADD_ENTITY "+name+": "+err.Error())
 			continue
 		}
-		known[name] = ent.ID
+		known[key] = ent.ID
+		rememberName(name, ent.ID)
 		upserted = append(upserted, ent)
+	}
+
+	// endpoints is what edges resolve against: bare name to one entity
+	// id. A name this checkpoint landed on exactly one entity for
+	// resolves; one it landed on two (the same name under two kinds)
+	// does not, and is reported as ambiguous below when an edge actually
+	// names it.
+	endpoints := make(map[string]uuid.UUID, len(idsByName))
+	for name, ids := range idsByName {
+		if len(ids) == 1 {
+			endpoints[name] = ids[0]
+		}
 	}
 
 	// Resolve edge endpoints not created this pass against entities from
@@ -518,10 +638,16 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 			if name == "" || queried[name] {
 				continue
 			}
-			if _, ok := known[name]; ok {
+			if _, ok := endpoints[name]; ok {
 				continue
 			}
 			queried[name] = true
+			if len(idsByName[name]) > 1 {
+				// Ambiguous within this checkpoint itself, so there is
+				// nothing to look up: the name is not one entity here.
+				ambiguous = append(ambiguous, fmt.Sprintf("entity %q is ambiguous: this checkpoint extracted %d entities sharing that name across kinds", name, len(idsByName[name])))
+				continue
+			}
 			matches, err := e.Store.LookupEntitiesByName(ctx, src.Scope, name)
 			if err != nil {
 				if e.Log != nil {
@@ -533,14 +659,14 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 			case 0:
 				// Left unresolved: resolveEdges reports it below.
 			case 1:
-				known[name] = matches[0].ID
+				endpoints[name] = matches[0].ID
 			default:
 				ambiguous = append(ambiguous, fmt.Sprintf("entity %q is ambiguous: %d entities share that name across kinds", name, len(matches)))
 			}
 		}
 	}
 
-	resolved, dropped := resolveEdges(ops, known)
+	resolved, dropped := resolveEdges(ops, endpoints)
 	dropped = append(dropped, ambiguous...)
 
 	edgesCreated, edgesSuperseded := 0, 0
@@ -570,7 +696,19 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 	// provenance, but it must not be the only one — see
 	// docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md.
 	mentionSources := append([]uuid.UUID{src.ID}, e.segmentSourceIDsFromMetadata(src.Metadata)...)
+	// Every entity this checkpoint touched: the ones its ADD_ENTITY ops
+	// landed on (known, one per kind+name — two entities sharing a name
+	// each get their own mention), plus any resolved from an earlier
+	// checkpoint to carry an edge. Deduped, since an endpoint resolved
+	// this pass is usually also in known.
+	mentioned := make(map[uuid.UUID]bool, len(known)+len(endpoints))
 	for _, id := range known {
+		mentioned[id] = true
+	}
+	for _, id := range endpoints {
+		mentioned[id] = true
+	}
+	for id := range mentioned {
 		for _, sourceID := range mentionSources {
 			if err := e.Store.RecordMention(ctx, id, sourceID); err != nil && e.Log != nil {
 				e.Log.Warn("extractor: record mention failed", "err", err)

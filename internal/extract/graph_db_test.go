@@ -625,3 +625,305 @@ func TestEntityCandidatesForNameFindsARealVariant(t *testing.T) {
 		t.Errorf("candidates for priha-raman did not include priya-raman: %v", got)
 	}
 }
+
+// TestASameNameEntityOfADifferentKindIsNeverMergedAway is failure
+// scenario A of the cross-kind review finding: one checkpoint mentions
+// "rotterdam" both as a place and as the name of a migration project, so
+// the model emits an ADD_ENTITY for each. An existing entity
+// rotterdam-warehouse (kind project) is offered as a candidate to the
+// PROJECT op only — the same-kind filter in entityCandidatesForName does
+// its job — and the model affirms the merge. The place must still be
+// created as its own entity: nothing the model said about a project can
+// be applied to a place, and a wrong merge is irreversible and silent
+// while a fork is visible and fixable.
+//
+// Measured against the real embedder, rotterdam/rotterdam-warehouse sit
+// 0.2256 apart (.superpowers/sdd/2026-08-20-entity-resolution/
+// progress.md), inside any usable candidate bound — so this is not a
+// hypothetical pairing, it is the one the same-kind filter exists for.
+func TestASameNameEntityOfADifferentKindIsNeverMergedAway(t *testing.T) {
+	st, scope := newGraphTestStore(t, "entity-cross-kind-merge-test")
+	ctx := context.Background()
+
+	emb := &fakeEmbedder{Vecs: map[string][]float32{
+		"rotterdam-warehouse": vec1536(1, 0, 0),
+		"rotterdam":           vec1536(0.99, 0.01, 0),
+	}}
+	warehouse := &anamnesia.Entity{
+		Scope: scope, Kind: "project", Name: "rotterdam-warehouse",
+		Embedding: vec1536(1, 0, 0),
+	}
+	if err := st.UpsertEntity(ctx, warehouse); err != nil {
+		t.Fatalf("upsert rotterdam-warehouse: %v", err)
+	}
+
+	src := &anamnesia.Source{Scope: scope, Kind: graphSourceKind, OccurredAt: time.Now().UTC(),
+		RawContent: "The rotterdam migration project ships this quarter; the team in Rotterdam runs it."}
+	if err := st.InsertSource(ctx, src); err != nil {
+		t.Fatalf("insert source: %v", err)
+	}
+
+	fake := &fakeLLM{
+		RawOps: marshalGraphOps(t, []graphOperation{
+			{Op: "ADD_ENTITY", Kind: "place", Name: "rotterdam"},
+			{Op: "ADD_ENTITY", Kind: "project", Name: "rotterdam"},
+		}),
+		// The verdict a real model would give: it was only ever asked
+		// about the project (the place op has no candidate of its own
+		// kind), and rotterdam-warehouse is that project's candidate.
+		Verdicts: []identityVerdict{{Entity: "rotterdam", SameAs: warehouse.ID.String()}},
+	}
+	ex := &Extractor{Cfg: Config{ExtractGraph: true, GraphCandidateDistance: 0.45}, Store: st, Embedder: emb, LLM: fake}
+	if _, err := ex.Run(ctx, src); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if fake.Calls != 2 {
+		t.Fatalf("made %d model calls, want 2: the project op has a candidate, so the disambiguation call must run — this test proves nothing if it didn't", fake.Calls)
+	}
+
+	if _, err := st.LookupEntity(ctx, scope, "place", "rotterdam"); err != nil {
+		t.Errorf("the place %q was not created: %v — a verdict about a project was applied to a place, merging a city into a warehouse", "rotterdam", err)
+	}
+	all, err := st.ListEntities(ctx, scope, "", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		names := make([]string, len(all))
+		for i, a := range all {
+			names[i] = a.Kind + "/" + a.Name
+		}
+		t.Errorf("ListEntities = %d, want 2 (project/rotterdam-warehouse and place/rotterdam); got %v", len(all), names)
+	}
+}
+
+// TestTwoSameNameKindsBothLandWithTheirOwnMentions is failure scenario B
+// of the same finding, and it needs no model error at all: the same two
+// ops, no candidates anywhere (no embedder, so nothing is ever recalled
+// and the disambiguation call never runs). Both entities are created
+// either way — the (scope, kind, name) index sees to that — but every
+// map keyed by bare name keeps only the last one, so an edge naming
+// "rotterdam" resolves to whichever came second, and only that one gets
+// an entity_mentions row. The other is permanently invisible to
+// graphExpand, which joins on exactly those rows.
+func TestTwoSameNameKindsBothLandWithTheirOwnMentions(t *testing.T) {
+	st, scope := newGraphTestStore(t, "entity-cross-kind-mentions-test")
+	ctx := context.Background()
+
+	src := &anamnesia.Source{Scope: scope, Kind: graphSourceKind, OccurredAt: time.Now().UTC(),
+		RawContent: "stock-reconciliation reads from rotterdam; the rotterdam project owns the rollout."}
+	if err := st.InsertSource(ctx, src); err != nil {
+		t.Fatalf("insert source: %v", err)
+	}
+
+	fake := &fakeLLM{RawOps: marshalGraphOps(t, []graphOperation{
+		{Op: "ADD_ENTITY", Kind: "service", Name: "stock-reconciliation"},
+		{Op: "ADD_ENTITY", Kind: "place", Name: "rotterdam"},
+		{Op: "ADD_ENTITY", Kind: "project", Name: "rotterdam"},
+		{Op: "ADD_EDGE", From: "stock-reconciliation", To: "rotterdam", Kind: "reads_from", Trust: 0.8},
+	})}
+	ex := &Extractor{Cfg: Config{ExtractGraph: true}, Store: st, LLM: fake}
+	n, err := ex.Run(ctx, src)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if fake.Calls != 1 {
+		t.Fatalf("made %d model calls, want 1: no embedder means no candidates, so the disambiguation call must not run", fake.Calls)
+	}
+	// Three entities, no edge: "rotterdam" names two entities of
+	// different kinds this pass, and an ADD_EDGE endpoint carries no
+	// kind, so the edge is dropped rather than pointed at whichever one
+	// happened to be written last.
+	if n != 3 {
+		t.Errorf("executed = %d, want 3 (three entities, and an ambiguous edge dropped rather than guessed)", n)
+	}
+	all, err := st.ListEntities(ctx, scope, "", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("ListEntities = %d, want 3", len(all))
+	}
+	service, err := st.LookupEntity(ctx, scope, "service", "stock-reconciliation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, edges, err := st.Neighbors(ctx, service.ID, []string{"reads_from"}, "out", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(edges) != 0 {
+		t.Errorf("an ambiguous endpoint produced %d edges anyway: an edge pointing at the wrong rotterdam would be believed downstream", len(edges))
+	}
+
+	// The part graphExpand depends on: EVERY entity this checkpoint
+	// created carries a mention of the source, not just the last one to
+	// claim its name.
+	mentioned, err := st.EntitiesForSources(ctx, []uuid.UUID{src.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mentioned) != 3 {
+		names := make([]string, len(mentioned))
+		for i, m := range mentioned {
+			names[i] = m.Kind + "/" + m.Name
+		}
+		t.Errorf("EntitiesForSources = %d entities, want 3 — an entity with no mention row is permanently invisible to the graph walk; got %v", len(mentioned), names)
+	}
+}
+
+// TestKindCaseDriftStillLandsOnOneEntity: nothing in the graph prompt or
+// the operation schema constrains the CASE of "kind", so a model can
+// write "Person" in one checkpoint and "person" in the next. Both halves
+// of the machinery that keeps entities from forking are keyed on it —
+// the (scope, kind, name) unique index, and the same-kind candidate
+// filter — so unless kind is normalised the way name already is, the two
+// spellings become two entities that can never be offered as each
+// other's candidate. That is entity resolution going permanently,
+// silently inert for that pair, with no log line to notice.
+func TestKindCaseDriftStillLandsOnOneEntity(t *testing.T) {
+	st, scope := newGraphTestStore(t, "entity-kind-case-drift-test")
+	ctx := context.Background()
+
+	emb := &fakeEmbedder{Vecs: map[string][]float32{"priya-raman": vec1536(1, 0, 0)}}
+	newSource := func(content string) *anamnesia.Source {
+		src := &anamnesia.Source{Scope: scope, Kind: graphSourceKind, OccurredAt: time.Now().UTC(), RawContent: content}
+		if err := st.InsertSource(ctx, src); err != nil {
+			t.Fatalf("insert source: %v", err)
+		}
+		return src
+	}
+
+	src1 := newSource("Priya Raman owns the nightly stock reconciliation job.")
+	fake1 := &fakeLLM{RawOps: marshalGraphOps(t, []graphOperation{{Op: "ADD_ENTITY", Kind: "Person", Name: "Priya Raman"}})}
+	ex1 := &Extractor{Cfg: Config{ExtractGraph: true, GraphCandidateDistance: 0.45}, Store: st, Embedder: emb, LLM: fake1}
+	if _, err := ex1.Run(ctx, src1); err != nil {
+		t.Fatalf("run session 1: %v", err)
+	}
+
+	src2 := newSource("Priya Raman is back from leave.")
+	fake2 := &fakeLLM{RawOps: marshalGraphOps(t, []graphOperation{{Op: "ADD_ENTITY", Kind: "person", Name: "priya-raman"}})}
+	ex2 := &Extractor{Cfg: Config{ExtractGraph: true, GraphCandidateDistance: 0.45}, Store: st, Embedder: emb, LLM: fake2}
+	if _, err := ex2.Run(ctx, src2); err != nil {
+		t.Fatalf("run session 2: %v", err)
+	}
+	if fake2.Calls != 2 {
+		t.Errorf("session 2 made %d model calls, want 2: the entity session 1 created must be offered as a candidate, and a kind that differs only in case must not hide it", fake2.Calls)
+	}
+
+	all, err := st.ListEntities(ctx, scope, "", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 {
+		kinds := make([]string, len(all))
+		for i, a := range all {
+			kinds[i] = a.Kind + "/" + a.Name
+		}
+		t.Errorf("ListEntities = %d, want 1: %q and %q are the same kind; got %v", len(all), "Person", "person", kinds)
+	}
+}
+
+// TestAVerdictIsAppliedToTheEntityItNames is the other half of the
+// cross-kind fix: when BOTH same-name entities have candidates of their
+// own kind, two questions go to the model under one name, and only the
+// kind echoed back says which one an answer is about.
+//
+// The two subtests are the two outcomes that must follow. Kinded: the
+// verdict lands on the project and only the project — verified by
+// mutation, ignoring the verdict's kind makes that subtest fail.
+// Kindless: it could be about either, and a verdict that cannot be
+// pinned to one entity is dropped — both entities are created
+// separately, the same fail-safe direction as a hallucinated same_as id,
+// because a fork is visible and fixable while a wrong merge is neither.
+//
+// Honest limit on the kindless half: it does NOT isolate the ambiguity
+// check in resolveIdentities, and cannot. Candidate recall filters by
+// kind, so two same-name sets have disjoint candidate lists, and an id
+// affirmed for one of them can never match the other's — the same_as id
+// check alone already drops this verdict, and neutering the ambiguity
+// check leaves this subtest green (checked by doing exactly that; not
+// committed). No fixture can separate the two while recall stays
+// kind-filtered, which is the point: the ambiguity check is the second,
+// independent line of defence for the day something loosens that filter,
+// exactly as the (scope, kind, name) index backs up the filter itself.
+func TestAVerdictIsAppliedToTheEntityItNames(t *testing.T) {
+	// Two existing entities, one per kind, each a candidate for the
+	// extracted "rotterdam" of its own kind.
+	setup := func(t *testing.T, prefix string) (*store.Store, anamnesia.Scope, *anamnesia.Entity, *fakeEmbedder, *anamnesia.Source) {
+		t.Helper()
+		st, scope := newGraphTestStore(t, prefix)
+		ctx := context.Background()
+		warehouse := &anamnesia.Entity{Scope: scope, Kind: "project", Name: "rotterdam-warehouse", Embedding: vec1536(0.98, 0.02, 0)}
+		if err := st.UpsertEntity(ctx, warehouse); err != nil {
+			t.Fatalf("upsert rotterdam-warehouse: %v", err)
+		}
+		if err := st.UpsertEntity(ctx, &anamnesia.Entity{Scope: scope, Kind: "place", Name: "rotterdam-centraal", Embedding: vec1536(0.97, 0.03, 0)}); err != nil {
+			t.Fatalf("upsert rotterdam-centraal: %v", err)
+		}
+		src := &anamnesia.Source{Scope: scope, Kind: graphSourceKind, OccurredAt: time.Now().UTC(),
+			RawContent: "The rotterdam project ships this quarter; the team meets in rotterdam."}
+		if err := st.InsertSource(ctx, src); err != nil {
+			t.Fatalf("insert source: %v", err)
+		}
+		emb := &fakeEmbedder{Vecs: map[string][]float32{"rotterdam": vec1536(1, 0, 0)}}
+		return st, scope, warehouse, emb, src
+	}
+	ops := marshalGraphOps(t, []graphOperation{
+		{Op: "ADD_ENTITY", Kind: "place", Name: "rotterdam"},
+		{Op: "ADD_ENTITY", Kind: "project", Name: "rotterdam"},
+	})
+
+	t.Run("with the kind echoed back", func(t *testing.T) {
+		st, scope, warehouse, emb, src := setup(t, "entity-verdict-kinded-test")
+		ctx := context.Background()
+		fake := &fakeLLM{
+			RawOps:   ops,
+			Verdicts: []identityVerdict{{Entity: "rotterdam", Kind: "project", SameAs: warehouse.ID.String()}},
+		}
+		ex := &Extractor{Cfg: Config{ExtractGraph: true, GraphCandidateDistance: 0.45}, Store: st, Embedder: emb, LLM: fake}
+		if _, err := ex.Run(ctx, src); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		if fake.Calls != 2 {
+			t.Fatalf("made %d model calls, want 2: both ops have a candidate of their own kind, so the disambiguation call must run", fake.Calls)
+		}
+		if _, err := st.LookupEntity(ctx, scope, "place", "rotterdam"); err != nil {
+			t.Errorf("the place %q was not created: %v — the verdict named the project", "rotterdam", err)
+		}
+		if _, err := st.LookupEntity(ctx, scope, "project", "rotterdam"); err == nil {
+			t.Error("project/rotterdam was created as its own entity: the verdict said it is rotterdam-warehouse")
+		}
+		all, err := st.ListEntities(ctx, scope, "", 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(all) != 3 {
+			t.Errorf("ListEntities = %d, want 3 (the two existing entities plus place/rotterdam)", len(all))
+		}
+	})
+
+	t.Run("without a kind, when the name alone is ambiguous", func(t *testing.T) {
+		st, scope, warehouse, emb, src := setup(t, "entity-verdict-kindless-test")
+		ctx := context.Background()
+		fake := &fakeLLM{
+			RawOps:   ops,
+			Verdicts: []identityVerdict{{Entity: "rotterdam", SameAs: warehouse.ID.String()}},
+		}
+		ex := &Extractor{Cfg: Config{ExtractGraph: true, GraphCandidateDistance: 0.45}, Store: st, Embedder: emb, LLM: fake}
+		if _, err := ex.Run(ctx, src); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		all, err := st.ListEntities(ctx, scope, "", 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(all) != 4 {
+			names := make([]string, len(all))
+			for i, a := range all {
+				names[i] = a.Kind + "/" + a.Name
+			}
+			t.Errorf("ListEntities = %d, want 4: the verdict names two entities at once, so it merges neither; got %v", len(all), names)
+		}
+	})
+}
