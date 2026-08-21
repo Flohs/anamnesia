@@ -74,6 +74,9 @@ func init() {
 	root.PersistentFlags().CountVarP(&rf.verbose, "verbose", "v", "increase logging verbosity (-v / -vv)")
 	root.PersistentFlags().BoolVar(&rf.allowRoot, "allow-root", false, "permit running under sudo (see the warning it prints)")
 
+	// --project takes a slug the user already has, so offer those.
+	_ = root.RegisterFlagCompletionFunc("project", completeProjectSlug)
+
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		rf.log = newLogger(rf.verbose, cmd.ErrOrStderr())
 		return refuseSudo(cmd)
@@ -112,6 +115,10 @@ func init() {
 // invoking user's home nor start anything long-lived.
 var rootSafeCommands = map[string]bool{
 	"version": true, "help": true, "completion": true, "doctor": true, "status": true,
+	// The hidden commands a shell calls on every tab press. Refusing
+	// them would make completion under sudo print a refusal instead of
+	// completing.
+	cobra.ShellCompRequestCmd: true, cobra.ShellCompNoDescRequestCmd: true,
 }
 
 // refuseSudo stops a command that was escalated from a normal account.

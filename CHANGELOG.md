@@ -232,6 +232,32 @@ were rebuilt around being verifiable.
 
 ### Added
 
+- **Tab completion for commands, flags, and the values that go with them.**
+  Cobra has generated a completion script all along and nothing ever
+  installed it, so the feature existed and no user ever met it. `setup` and
+  `install` now write it and add one line to `~/.zshrc` or `~/.bashrc` to
+  source it; fish needs no line, because it loads its completions directory
+  itself. The rc file is backed up before it is first touched,
+  `--no-completion` skips the step entirely, and `uninstall` takes the line
+  out again, leaving the file as it was.
+
+  What is new beyond the stock script is that arguments complete, not only
+  command and flag names. `settings.go` is already the single declaration of
+  every setting, so `config get` and `config set` offer exactly the keys the
+  command would accept, each with its own documentation beside it, and then
+  the values an enum or a boolean setting allows. A key whose value cannot
+  be enumerated, a model name or an API key, offers nothing rather than a
+  guess. `project move` and `--project` complete the project slugs that
+  actually exist, bounded to 300ms and silent when the database cannot be
+  reached: a tab press must never hang a prompt, and a stopped stack must
+  never put an error in front of one.
+
+  The script is a shim that calls `anamnesia __complete`, so it cannot go
+  stale. New commands and new settings come from whichever binary is on
+  `PATH`, which is why installing it once is enough and `update` does not
+  have to rewrite it. `doctor` reports it, and warns rather than fails when
+  it is absent: a red doctor has to keep meaning that the install is broken.
+
 - **Mid-session flushing, on a gated `Stop` hook.** Work no longer waits for
   a session to end: once `ingest.flush_bytes` (default 16384) of new
   transcript accumulates, or `ingest.flush_after` (default 20m) passes, the

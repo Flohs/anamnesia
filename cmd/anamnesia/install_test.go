@@ -64,6 +64,9 @@ func writeJSONFile(t *testing.T, path string, v any) {
 // installInto runs the install path against a scratch config directory.
 func installInto(t *testing.T, dir string) {
 	t.Helper()
+	// Installing now writes shell completion and sources it from a shell
+	// rc, so without a scratch HOME this would edit the developer's own.
+	t.Setenv("HOME", t.TempDir())
 	installF = installFlags{scope: "user", configDir: dir}
 	backedUp = map[string]bool{}
 	hc := testHostConfig(t)

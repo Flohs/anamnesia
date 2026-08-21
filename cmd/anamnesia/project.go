@@ -50,8 +50,9 @@ func projectMoveCmd() *cobra.Command {
 			"The project moved FROM is the one this directory resolves to, the same\n" +
 			"way the hooks resolve it. Reports what would move and exits; pass\n" +
 			"--apply to carry it out.",
-		Args: cobra.ExactArgs(1),
-		RunE: runProjectMove,
+		Args:              cobra.ExactArgs(1),
+		RunE:              runProjectMove,
+		ValidArgsFunction: completeProjectSlugArg,
 	}
 	c.Flags().StringVar(&projectMoveFrom, "from", "", "move this project instead of the one this directory resolves to")
 	c.Flags().BoolVar(&projectMoveApply, "apply", false, "carry the move out instead of only reporting it")

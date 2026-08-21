@@ -101,6 +101,12 @@ func init() {
 	configListCmd.Flags().BoolVar(&configSecretsFlag, "show-secrets", false, "print API keys and passwords in full")
 
 	configCmd.AddCommand(configGetCmd, configSetCmd, configListCmd, configPathCmd, configEditCmd)
+
+	// settings.go is the only list of valid keys, so the shell can offer
+	// exactly the ones `set` would accept rather than a stale copy.
+	configCmd.ValidArgsFunction = completeSettingKey
+	configSetCmd.ValidArgsFunction = completeSettingKey
+	configGetCmd.ValidArgsFunction = completeSettingKeyOnly
 }
 
 // targetConfigPath is the file a write applies to.

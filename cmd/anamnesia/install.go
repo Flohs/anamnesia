@@ -76,9 +76,10 @@ var anamnesiaHooks = []hookSpec{
 }
 
 type installFlags struct {
-	scope     string
-	configDir string
-	dryRun    bool
+	scope        string
+	configDir    string
+	dryRun       bool
+	noCompletion bool
 }
 
 var (
@@ -106,6 +107,7 @@ func init() {
 	installCmd.Flags().StringVar(&installF.scope, "scope", "user", "user (~/.claude) or project ($PWD/.claude)")
 	installCmd.Flags().StringVar(&installF.configDir, "config-dir", "", "override the config directory (testing escape hatch)")
 	installCmd.Flags().BoolVar(&installF.dryRun, "dry-run", false, "print the resulting JSON instead of writing it")
+	installCmd.Flags().BoolVar(&installF.noCompletion, "no-completion", false, "do not install shell completion or touch your shell's rc file")
 
 	uninstallCmd.Flags().StringVar(&uninstallF.scope, "scope", "user", "user or project")
 	uninstallCmd.Flags().StringVar(&uninstallF.configDir, "config-dir", "", "override the config directory")
@@ -214,7 +216,11 @@ func applyInstall(hc *hostConfig, out io.Writer) error {
 	}
 	fmt.Fprintf(out, "  wired MCP server in %s (%s/mcp)\n", paths.mcp, hc.ServerURL())
 	fmt.Fprintf(out, "  hooks call %s\n", self)
-	return nil
+
+	if installF.noCompletion {
+		return nil
+	}
+	return installCompletion(out)
 }
 
 func runUninstall(cmd *cobra.Command, _ []string) error {
@@ -262,6 +268,9 @@ func runUninstall(cmd *cobra.Command, _ []string) error {
 	fmt.Fprintf(out, "✦ removed %d hook entries from %s\n", settingsRemoved, paths.settings)
 	if mcpRemoved {
 		fmt.Fprintf(out, "✦ removed mcpServers.anamnesia from %s\n", paths.mcp)
+	}
+	if err := removeCompletion(out); err != nil {
+		return err
 	}
 
 	if !uninstallAll {

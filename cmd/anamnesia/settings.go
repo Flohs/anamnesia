@@ -248,6 +248,26 @@ func knownKeys() []string {
 	return out
 }
 
+// valueCompletions returns the values this setting accepts, for shell
+// completion. Only kinds with a closed set have one: offering a guess for
+// a model name or an API key would be worse than offering nothing.
+func (s setting) valueCompletions() []string {
+	switch s.Kind {
+	case kEnum:
+		out := make([]string, 0, len(s.Values))
+		for _, v := range s.Values {
+			// The empty value means "unset". There is nothing to type.
+			if v != "" {
+				out = append(out, v)
+			}
+		}
+		return out
+	case kBool:
+		return []string{"true", "false"}
+	}
+	return nil
+}
+
 // validate checks a raw string against the setting's kind, returning the
 // normalised form. This is the gate that stops a typo becoming a silent
 // fallback to the default hours later.

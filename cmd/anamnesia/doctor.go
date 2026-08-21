@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -108,6 +109,7 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 	}
 	add(checkHooks(hc))
 	add(checkMCP(hc))
+	add(checkCompletion())
 	add(checkHookActivity())
 	if doctorDeep && health != nil {
 		add(checkCanary(ctx, hc))
@@ -186,6 +188,38 @@ func lamp(s checkStatus) string {
 }
 
 // ─── individual checks ───────────────────────────────────────────────
+
+// checkCompletion reports shell tab completion. It warns and never fails:
+// a missing completion costs a user nothing but keystrokes, and a red
+// doctor has to keep meaning that the install is broken.
+func checkCompletion() check {
+	k := detectShell()
+	if k == "" {
+		return check{Name: "completion", Status: statusOK,
+			Message: fmt.Sprintf("not applicable (no script for shell %q)", os.Getenv("SHELL"))}
+	}
+	script, err := k.scriptPath()
+	if err != nil {
+		return check{Name: "completion", Status: statusWarn, Message: err.Error()}
+	}
+	if !fileExists(script) {
+		return check{Name: "completion", Status: statusWarn, Message: "not installed",
+			Fix: "run `anamnesia install`"}
+	}
+	rc, err := k.rcPath()
+	if err != nil {
+		return check{Name: "completion", Status: statusWarn, Message: err.Error()}
+	}
+	if rc != "" {
+		raw, readErr := os.ReadFile(rc)
+		if readErr != nil || !rcSourcesScript(string(raw), script) {
+			return check{Name: "completion", Status: statusWarn,
+				Message: fmt.Sprintf("%s does not source %s", rc, script),
+				Fix:     "run `anamnesia install`"}
+		}
+	}
+	return check{Name: "completion", Status: statusOK, Message: script}
+}
 
 func checkConfig(hc *hostConfig) check {
 	c := check{Name: "config", Status: statusOK, Message: hc.GlobalPath}

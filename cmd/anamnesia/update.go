@@ -132,6 +132,7 @@ func runUpdate(cmd *cobra.Command, _ []string) error {
 		installF.scope = updateScope
 		installF.configDir = updateConfigDir
 		installF.dryRun = false
+		installF.noCompletion = false
 		if err := applyInstall(hc, out); err != nil {
 			return err
 		}

@@ -91,7 +91,8 @@ anamnesia setup
 ```
 
 That is the whole installation. It creates your config, wires Claude Code,
-starts the database and the server, and tells you whether it worked:
+installs tab completion for your shell, starts the database and the server,
+and tells you whether it worked:
 
 ```
 Setting up Anamnesia
@@ -99,6 +100,8 @@ Setting up Anamnesia
   wired 4 hooks in ~/.claude/settings.json
   wired MCP server in ~/.claude.json (http://127.0.0.1:8181/mcp)
   hooks call /usr/local/bin/anamnesia
+  wrote zsh completion to ~/.anamnesia/completions/anamnesia.zsh (~/.zshrc updated)
+    open a new shell, or `source ~/.zshrc`, to use it
   pulling pgvector/pgvector:pg16 (first run only, this can take a minute)
   creating container anamnesia-postgres on 127.0.0.1:5434
   waiting for postgres to accept connections
@@ -242,6 +245,32 @@ anamnesia migrate    apply migrations (--dims rebuilds the vector columns)
 anamnesia install    (re)wire Claude Code only
 anamnesia uninstall  remove the wiring (--purge also deletes stored memory)
 ```
+
+### Tab completion
+
+`setup` and `install` write a completion script for your shell and add one
+line to `~/.zshrc` or `~/.bashrc` to source it (fish needs no line: it loads
+its completions directory itself). The rc file is backed up first, and
+`anamnesia uninstall` takes the line out again.
+
+It completes commands and flags, and the values that go with them: every
+setting `config set` accepts, the values an enum or a boolean setting allows,
+and the project slugs you actually have.
+
+```
+$ anamnesia config set embed.<TAB>
+embed.provider  -- Vector embeddings for retrieval
+embed.model     -- Leave empty for the provider default
+embed.dims      -- Embedding width
+
+$ anamnesia config set rerank.provider <TAB>
+none  cohere  openrouter
+```
+
+The script only calls `anamnesia __complete`, so it never goes stale: new
+commands and new settings come from whichever binary is on your `PATH`, and
+upgrading does not need it rewritten. Pass `--no-completion` to `setup` or
+`install` to skip the whole step and leave your shell config alone.
 
 ## Updating
 
@@ -490,6 +519,7 @@ python scripts/longmemeval/harness.py --dataset ./data/longmemeval_s_cleaned.jso
   start.lock      guards concurrent auto-starts
   hooks.log       one line per hook run, which is what doctor reads
   offsets/        how far each session's transcript has been read
+  completions/    the tab-completion script your shell sources
 ```
 
 Your memory itself lives in the Docker volume `anamnesia-pgdata`, so it
@@ -497,9 +527,10 @@ survives restarts, upgrades and `anamnesia uninstall`. Removing that volume
 deletes everything, which is what `anamnesia uninstall --purge` does on
 purpose.
 
-Anamnesia also adds its hook entries to `~/.claude/settings.json` and its MCP
-entry to `~/.claude.json`, backing both up before it first touches them.
-`anamnesia uninstall` removes exactly those entries and leaves the rest alone.
+Anamnesia also adds its hook entries to `~/.claude/settings.json`, its MCP
+entry to `~/.claude.json`, and one line to `~/.zshrc` or `~/.bashrc` for tab
+completion, backing each up before it first touches it. `anamnesia uninstall`
+removes exactly those entries and leaves the rest alone.
 
 See [SECURITY.md](SECURITY.md) for what is stored, what leaves your machine,
 and what to change before exposing the server beyond loopback.

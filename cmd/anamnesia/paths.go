@@ -10,6 +10,7 @@
 //	  start.lock       serialises concurrent auto-starts from hooks
 //	  hooks.log        one JSONL line per hook run, for `anamnesia doctor`
 //	  offsets/         per-session transcript read offsets
+//	  completions/     the shell completion script `install` writes
 //
 // ANAMNESIA_HOME overrides the root, which is what lets the tests exercise
 // the real code paths without touching the developer's own install.

@@ -18,10 +18,11 @@ import (
 )
 
 var (
-	setupNoHooks   bool
-	setupNoStart   bool
-	setupScope     string
-	setupConfigDir string
+	setupNoHooks      bool
+	setupNoStart      bool
+	setupNoCompletion bool
+	setupScope        string
+	setupConfigDir    string
 )
 
 var setupCmd = &cobra.Command{
@@ -40,6 +41,7 @@ var setupCmd = &cobra.Command{
 func init() {
 	setupCmd.Flags().BoolVar(&setupNoHooks, "no-hooks", false, "skip patching Claude Code's config")
 	setupCmd.Flags().BoolVar(&setupNoStart, "no-start", false, "skip starting the stack")
+	setupCmd.Flags().BoolVar(&setupNoCompletion, "no-completion", false, "do not install shell completion or touch your shell's rc file")
 	setupCmd.Flags().StringVar(&setupScope, "scope", "user", "hook scope: user (~/.claude) or project ($PWD/.claude)")
 	setupCmd.Flags().StringVar(&setupConfigDir, "config-dir", "", "override the config directory (testing escape hatch)")
 	setupCmd.Flags().BoolVar(&adoptContainer, "adopt", false,
@@ -73,6 +75,7 @@ func runSetup(cmd *cobra.Command, _ []string) error {
 		installF.scope = setupScope
 		installF.configDir = setupConfigDir
 		installF.dryRun = false
+		installF.noCompletion = setupNoCompletion
 		if err := applyInstall(hc, out); err != nil {
 			return err
 		}
