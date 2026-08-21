@@ -197,3 +197,55 @@ func TestANewExperienceStillTriggersAFreshDistillation(t *testing.T) {
 		t.Errorf("summaries = %d, want %d: a cluster that gained a member is not the cluster that was already distilled", got, before+1)
 	}
 }
+
+// TestTheUserLevelScopeDoesNotSwallowEveryProject.
+//
+// activeScopes groups by (user_id, project_id), so a single experience
+// with no project makes (user, nil) an active scope. But
+// candidatesForConsolidation OMITS the project filter when ProjectID is
+// nil rather than filtering `project_id IS NULL`, so that scope's pass
+// pulled every experience the user owned, across every project.
+//
+// Two things go wrong. Those experiences get consolidated a second time,
+// having already been folded inside their own project. And the summary is
+// written with the scope it was consolidated under — project_id NULL —
+// which retrieval treats as user-level and returns in EVERY project,
+// because the read path matches `project_id = $n OR project_id IS NULL`.
+// So one summary blending two unrelated projects leaks into all of them.
+func TestTheUserLevelScopeDoesNotSwallowEveryProject(t *testing.T) {
+	st, scope := consolidateFixture(t, 2)
+	ctx := context.Background()
+
+	// One project-less experience: enough to make (user, nil) active,
+	// but on its own below MinCluster, so it must distil nothing.
+	lone := &anamnesia.Experience{
+		Scope: anamnesia.Scope{UserID: scope.UserID},
+		Kind:  anamnesia.ExperienceCase, Title: "no project", Body: "body",
+	}
+	if err := st.RecordExperience(ctx, lone); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if err := st.SetExperienceEmbedding(ctx, lone.ID, unitVec(), "test"); err != nil {
+		t.Fatalf("embed: %v", err)
+	}
+
+	if err := ConsolidationRun(ctx, st, &fakeDistiller{}, ConsolidateConfig{}, discardLog(),
+		7*24*time.Hour, activity.New(4)); err != nil {
+		t.Fatalf("consolidation: %v", err)
+	}
+
+	var userLevel int
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM experiences
+		 WHERE user_id=$1 AND project_id IS NULL AND abstraction=1 AND deleted_at IS NULL`,
+		scope.UserID).Scan(&userLevel); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if userLevel != 0 {
+		t.Errorf("the project-less scope wrote %d user-level summaries from one lone experience: it clustered other projects' rows, and a user-level summary is returned in every project", userLevel)
+	}
+	// The project's own consolidation must be untouched.
+	if got := abstractionOneCount(t, st, scope); got != 1 {
+		t.Errorf("the project's own summary count = %d, want 1", got)
+	}
+}

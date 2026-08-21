@@ -25,6 +25,19 @@ were rebuilt around being verifiable.
   rejected where it is typed, because it is unreachable by any cosine and
   would reintroduce exactly this failure.
 
+- **A single project-less experience made consolidation merge every
+  project.** `activeScopes` groups by `(user_id, project_id)`, so one row
+  with no project makes `(user, nil)` an active scope. The candidate query
+  then omitted the project filter for that scope instead of matching
+  `project_id IS NULL`, so the pass pulled in every experience the user
+  owned, across every project, and clustered them together. The summary was
+  written under the scope it ran as — `project_id` NULL — which the read
+  path treats as user-level and returns in *every* project, because it
+  matches `project_id = $n OR project_id IS NULL`. So one summary blending
+  two unrelated projects leaked into all of them, and the experiences it
+  covered were consolidated a second time despite already being folded
+  inside their own project.
+
 - **Every consolidation pass re-distilled clusters it had already
   distilled.** Consolidation is deliberately additive: it does not supersede
   its sources, because doing that once invalidated every source row and

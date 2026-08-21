@@ -242,6 +242,14 @@ func candidatesForConsolidation(ctx context.Context, st *store.Store, scope anam
 	if scope.ProjectID != nil {
 		args = append(args, *scope.ProjectID)
 		where = append(where, fmt.Sprintf("project_id = $%d", len(args)))
+	} else {
+		// activeScopes groups by (user_id, project_id), so a nil project
+		// is the scope of the user's project-less rows — not "any
+		// project". Omitting the filter here made a single project-less
+		// experience pull in every project the user had, cluster them
+		// together, and write the summary at project_id NULL, which
+		// retrieval returns in every project.
+		where = append(where, "project_id IS NULL")
 	}
 	args = append(args, window.String())
 	where = append(where,
@@ -310,6 +318,8 @@ func distilledMemberSets(ctx context.Context, st *store.Store, scope anamnesia.S
 	if scope.ProjectID != nil {
 		args = append(args, *scope.ProjectID)
 		where = append(where, fmt.Sprintf("project_id = $%d", len(args)))
+	} else {
+		where = append(where, "project_id IS NULL")
 	}
 	where = append(where,
 		"abstraction > 0",
