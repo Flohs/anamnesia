@@ -7,6 +7,19 @@ were rebuilt around being verifiable.
 
 ### Fixed
 
+- **A session whose transcript was gone counted as a broken hook.**
+  `SessionEnd` fires for sessions whose transcript was never written or has
+  already been removed, and the checkpoint reported "no such file or
+  directory" as a failure. Measured on one install: 6 of 54 session-end hooks
+  failed that way, two in the same second, which looks like a batch cleanup
+  of stale sessions.
+
+  Nothing was lost, because there was nothing to ingest. But hooks record
+  their outcome precisely so `doctor` can report one that silently fails
+  every turn, and six false failures dilute the only signal there is. A
+  missing transcript is now an outcome, not an error. A transcript that
+  exists but cannot be read still fails, which is the case worth seeing.
+
 - **An older assertion could overwrite a newer one, and did.** On a live
   install `project.schema_version` read v10 and was superseded by v8 four
   seconds later; the schema was, and is, v10. The same key took

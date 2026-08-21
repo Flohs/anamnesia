@@ -993,3 +993,55 @@ func TestAFailedGraphSourceDoesNotFailTheCheckpoint(t *testing.T) {
 		t.Error("the offset was held back by a failed graph source; the segments all landed")
 	}
 }
+
+// TestAMissingTranscriptIsNotAHookFailure.
+//
+// SessionEnd fires for sessions whose transcript was never written or has
+// already been removed — measured on one install, 6 of 54 session-end
+// hooks failed with "no such file or directory", two of them in the same
+// second, which looks like a batch cleanup of stale sessions.
+//
+// Nothing was lost, because there was nothing to ingest. But it was
+// recorded as a hook failure, and hooks record their outcome precisely so
+// doctor can report one that silently fails every turn. Six false
+// failures dilute that signal, which is the only signal there is.
+func TestAMissingTranscriptIsNotAHookFailure(t *testing.T) {
+	hc, got := captureIngests(t)
+	missing := filepath.Join(t.TempDir(), "never-written.jsonl")
+
+	note, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: missing, SessionID: "gone"}, "claude-session", checkpointScope{})
+	if err != nil {
+		t.Errorf("a transcript that does not exist was reported as a failure: %v", err)
+	}
+	if note == "" {
+		t.Error("no note recorded, so the log cannot say why nothing was checkpointed")
+	}
+	if len(*got) != 0 {
+		t.Errorf("posted %d sources for a transcript that does not exist", len(*got))
+	}
+}
+
+// TestAnUnreadableTranscriptIsStillAFailure guards the over-correction:
+// only a MISSING transcript is benign. One that exists but cannot be read
+// is a real problem, and swallowing it would hide exactly the case doctor
+// exists to catch.
+//
+// Skipped as root, which can read a mode-000 file. CI runners are not
+// root, so this runs there; a skip here is honest about not having tested
+// it rather than a pass that proved nothing.
+func TestAnUnreadableTranscriptIsStillAFailure(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root, which ignores file permissions")
+	}
+	hc, _ := captureIngests(t)
+	path := filepath.Join(t.TempDir(), "locked.jsonl")
+	if err := os.WriteFile(path, []byte("{\"type\":\"user\"}\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := doCheckpoint(context.Background(), hc,
+		claudeHookInput{TranscriptPath: path, SessionID: "locked"}, "claude-session", checkpointScope{}); err == nil {
+		t.Error("an unreadable transcript was reported as success, so doctor would never see it")
+	}
+}

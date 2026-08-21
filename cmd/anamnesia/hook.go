@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -426,6 +427,15 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 	offset := readOffset(input.SessionID, input.TranscriptPath)
 	segs, next, err := readTranscriptFrom(input.TranscriptPath, offset,
 		hc.Dur("ingest.segment_gap"), hc.Int("ingest.segment_max_bytes"))
+	if errors.Is(err, fs.ErrNotExist) {
+		// SessionEnd fires for sessions whose transcript was never
+		// written or has already been removed. There is nothing to
+		// checkpoint, which is an outcome rather than a failure: hooks
+		// record their result so doctor can report one that silently
+		// fails every turn, and logging this as an error dilutes the
+		// only signal doctor has.
+		return "no transcript to checkpoint", nil
+	}
 	if err != nil {
 		return "", err
 	}
