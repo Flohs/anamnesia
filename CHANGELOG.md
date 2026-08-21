@@ -219,6 +219,21 @@ were rebuilt around being verifiable.
 
 ### Added
 
+- **`anamnesia recover`, for transcripts no checkpoint ever claimed.** A
+  checkpoint fires on PreCompact and SessionEnd; a session that crashes or is
+  killed fires neither, so its last stretch of work is never ingested. It is
+  not lost — Claude Code writes the transcript continuously and the offset
+  file records how far anamnesia read — but nothing ever went back for it.
+  Session start now spawns a sweep in the background, and it can be run by
+  hand with `--dry-run` to see what it would collect.
+
+  The only judgement it makes is deciding a session is over, and that is a
+  question about the file: a transcript nobody has written to for
+  `ingest.recover_idle` (default 15m) is not being written to any more. A
+  recovered tail is filed under the project it came from, read from the
+  working directory the transcript itself records, so it never lands under
+  whichever directory the sweep happened to run in.
+
 - **`anamnesia project prune`, for the project entries that hold nothing.**
   Projects used to be created by reading, so opening a directory filed it
   whether or not anything was ever stored there. That is fixed at the
@@ -521,6 +536,13 @@ were rebuilt around being verifiable.
   verifies a real stack.
 
 ### Changed
+
+- **Consolidation traces one scope at a time.** The activity recorder's
+  detail budget is per trace, and a pass opened a single trace covering every
+  scope, so on an install with several projects the budget was spent on
+  whichever came first and the rest recorded only "truncated". Each scope now
+  gets its own trace, labelled with its user and project, so the console can
+  filter consolidation the way it filters ingest and retrieve.
 
 - **`ingest.segment_max_bytes` now defaults to 4000, was 32768.** The cap is
   not only about topic boundaries: it bounds how much the extractor has to hold
