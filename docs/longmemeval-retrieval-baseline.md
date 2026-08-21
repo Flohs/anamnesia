@@ -1,6 +1,7 @@
 # LongMemEval retrieval baseline
 
-Recorded 2026-08-21. Machine-readable copy:
+Recorded 2026-08-21, on a corpus rebuilt after the two write-path fixes
+(`aabb82f`, `3666b2e`). Machine-readable copy:
 [`superpowers/plans/lme-retrieval-baseline-2026-08-21.json`](./superpowers/plans/lme-retrieval-baseline-2026-08-21.json).
 
 This is **not** a LongMemEval score. It measures retrieval alone: whether
@@ -14,47 +15,65 @@ published LongMemEval number.
 30 questions, 56 gold evidence sessions, all scored.
 
 ```
-recall@1  0.334    recall@5  0.688    recall@10  0.871    recall@20  0.871    MRR  0.667
+recall@1  0.540    recall@5  0.880    recall@10  0.943    recall@20  0.943    MRR  0.915
 ```
 
 | evidence status | count | what it means |
 |---|---|---|
-| `retrieved` | 49 (87.5%) | the gold session's rows ranked |
-| `stored_not_retrieved` | 3 (5.4%) | a miss with no capture verdict, or rows carry the answer |
-| `answer_elsewhere` | 3 (5.4%) | captured, but attributed to another source |
+| `retrieved` | 52 (92.9%) | the gold session's rows ranked |
+| `stored_not_retrieved` | 2 (3.6%) | a miss with no capture verdict, or rows carry the answer |
+| `answer_elsewhere` | 0 | captured, but attributed to another source |
 | `answer_missing` | 1 (1.8%) | no row anywhere carries the answer |
-| `not_stored` | 0 | |
+| `not_stored` | 1 (1.8%) | the session produced no rows at all |
 | `not_ingested` | 0 | |
 
-The recall figures moved slightly from the first cut (0.854 to 0.871)
-because retrying the credit-failed sources added facts to fifteen of the
-questions. That is corpus growth, not the classifier: capture analysis
-cannot affect recall@k, which is computed purely from ranked source ids
-against gold ids.
+**The previous entry, for comparison** (same 30 questions, corpus built
+before the write-path fixes): recall@1 0.334, recall@5 0.688,
+recall@10/@20 0.871, MRR 0.667, with `answer_elsewhere` at 3.
+
+**Do not read that delta as the fixes' doing.** This corpus was rebuilt,
+so the comparison is not paired: extraction is nondeterministic, and this
+run had a 1.2% malformed-JSON rate against roughly 14% in the earliest
+runs, so the corpus is simply better independent of any code change. A
+0.25 jump in MRR is not attributable to two SQL predicates. Only
+`--skip-ingest` re-scoring against a fixed corpus is a paired
+comparison.
+
+What *is* attributable is the write-path measure below, taken over 4,379
+facts rather than 56 evidence sessions.
 
 recall@20 by ability (2 to 8 questions each, indicative only):
 
 ```
-knowledge-update           n=5   1.000
+single-session-assistant   n=3   1.000
 single-session-preference  n=2   1.000
-multi-session              n=8   0.871
-temporal-reasoning         n=8   0.833
-single-session-user        n=4   0.750
-single-session-assistant   n=3   0.667
+single-session-user        n=4   1.000
+temporal-reasoning         n=8   0.938
+multi-session              n=8   0.912
+knowledge-update           n=5   0.900
 ```
 
 Retrieval channels, over 600 hits:
 
 ```
-vector      563  (93.8%)
+vector      573  (95.5%)
 lexical       0  ( 0.0%)
-graph        64  (10.7%)   of which graph_only 37 (6.2%)
+graph        53  ( 8.8%)   of which graph_only 27 (4.5%)
 reranked    600  (100.0%)
 ```
 
 ## What it says
 
-**Provenance and ranking are comparable, at 3 misses each.** An earlier
+**Misattributed provenance: 35.8% → 31.3% → 20.5%.** The share of facts
+attributed to a source containing no word of them, measured over 4,379
+facts. The `UPDATE_FACT` fix (no-op updates taking authorship) took 4.5
+points; the `ADD_FACT` fix (a repeated value taking authorship, `aabb82f`)
+took a further 10.8. `answer_elsewhere` went 6 → 3 → **0**: no gold
+evidence in this corpus is now lost to misattribution. Facts missing an
+embedding: 0 of 6,293, so the re-embed-on-change fix (`3666b2e`) is not
+stranding rows mid-backfill.
+
+**Historical note on the previous entry.** An earlier
 version of this file claimed provenance dominated 6:1. That was wrong,
 and the story of how is worth keeping. The capture analysis called a miss
 `answer_elsewhere` whenever *any* content word of the gold answer
@@ -88,8 +107,8 @@ not at all. The hand-built corpus behind `anamnesia eval` shows the same
 signature one cutoff lower (`recall@5 == recall@10`), so this is a
 property of the pipeline rather than of one corpus.
 
-**The graph contributes.** 37 of its 64 hits were reached by no other
-channel, across 19 of 30 questions. Note this requires `graph.extract` on
+**The graph contributes.** 27 of its 53 hits were reached by no other
+channel, across 16 of 30 questions. Note this requires `graph.extract` on
 **and** the harness posting `claude-session-graph` sources; without the
 second, the graph pass never runs and the channel reports a structural 0.
 
@@ -190,21 +209,20 @@ Recorded with `worker.extract_concurrency=8`, `worker.embed_backfill=2s`,
 `openai/gpt-4o-mini` and `text-embedding-3-small` (1536) via OpenRouter,
 with `cohere/rerank-v3.5`. Schema v9.
 
-Final corpus: 2,872 sources (2,764 done, 100 skipped, 8 failed), 6,342
-facts, 1,185 experiences, 5,808 entities, 2,812 edges.
+Final corpus: 2,872 sources (2,739 done, 101 skipped, 32 failed), 6,293
+facts, 1,156 experiences, 5,804 entities, 2,832 edges. Built at commit
+`912e61d`, after the provenance (`aabb82f`) and re-embed (`3666b2e`)
+fixes.
 
-Two things happened during the run that matter for interpreting it:
+The 32 failures are all `unexpected end of JSON input`, the model
+breaking its own operations schema: 1.2% here, against roughly 14%
+observed early in the session on the same model and prompt. **That
+instability is the single biggest confounder in this document.** Two
+corpora built from identical inputs differ by more than most changes
+being measured, which is why a rebuild can never be a paired comparison
+and why `--skip-ingest` re-scoring exists.
 
-- The OpenRouter account ran out of credits partway through, failing 669
-  sources across seven questions. They were recovered by resetting those
-  rows to `pending` rather than re-POSTing, which preserved their
-  `external_ref` and the graph sources' `segment_source_ids`. All seven
-  came back with 169-268 facts each.
-- Three questions have integer gold answers and crashed the scorer
-  (`answer_terms` assumed a string). Fixed, and those three were
-  re-scored with `--skip-ingest` against the same corpus.
-
-The 0.3% final extraction failure rate (8 of 2,872) is much lower than
-the ~14% malformed-JSON rate observed early in the session, so the
-extractor's reliability with `gpt-4o-mini` is not stable across runs and
-is worth watching.
+Earlier entries were built through an OpenRouter credit outage that
+failed 669 sources across seven questions; those were recovered by
+resetting the rows to `pending` rather than re-POSTing, preserving their
+`external_ref` and the graph sources' `segment_source_ids`.
