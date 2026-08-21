@@ -178,8 +178,8 @@ var settings = []setting{
 	// ─── ingest ──────────────────────────────────────────────────────
 	{Key: "ingest.segment_gap", Kind: kDuration, Def: "20m", Env: "", Zeroable: true,
 		Doc: "A pause longer than this starts a new segment when a checkpoint is cut up, so the surprise gate judges one subject at a time rather than a whole session. Set to 0 to send each checkpoint as a single source, which is what earlier versions did."},
-	{Key: "ingest.segment_max_bytes", Kind: kInt, Def: "32768", Env: "", Zeroable: true,
-		Doc: "A segment is cut when it grows past this, because a long unbroken session is still not one idea. Set to 0 to disable the size cut."},
+	{Key: "ingest.segment_max_bytes", Kind: kInt, Def: "4000", Env: "", Zeroable: true,
+		Doc: "A segment is cut when it grows past this, because a long unbroken session is still not one idea. It is also what bounds how much the extractor has to hold at once: attention degrades over a long input, so a bigger segment does not mean more extracted, it means less. Measured on three real 21KB sessions, the same content yielded 14 unique facts at 32768 and 74 at 4000 — and the ones only the smaller cap found were standing preferences like \"branch instead of committing directly to main\", exactly what memory is for. The cost is one model call per segment, so 3 calls became 18. Raise it to spend less, set to 0 to disable the size cut."},
 
 	// ─── decay ───────────────────────────────────────────────────────
 	{Key: "decay.half_life_case", Kind: kDuration, Def: "336h", Env: "ANAMNESIA_DECAY_HALF_LIFE_CASE",

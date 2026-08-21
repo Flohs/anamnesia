@@ -400,6 +400,18 @@ were rebuilt around being verifiable.
 
 ### Changed
 
+- **`ingest.segment_max_bytes` now defaults to 4000, was 32768.** The cap is
+  not only about topic boundaries: it bounds how much the extractor has to hold
+  at once, and attention degrades over a long input, so a bigger segment does
+  not mean more extracted, it means less. Measured on three real 21KB sessions
+  through the production prompt, the same content yielded **14 unique facts at
+  32768 and 74 at 4000** — and the ones only the smaller cap found were standing
+  preferences like "branch instead of committing directly to main", which is
+  exactly what memory is for. The cost is one model call per segment: those
+  three sessions went from 3 calls to 18. Raise it to spend less; 0 still
+  disables the size cut. Existing memory is untouched — this affects new
+  checkpoints only.
+
 - **Retrieval fails instead of returning nothing.** A configured embedder that
   errored was captured, used for a trace message, and then ignored, so `Search`
   carried on without its main channel and the caller got an ordinary empty
