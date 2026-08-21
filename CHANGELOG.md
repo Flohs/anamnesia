@@ -177,6 +177,27 @@ were rebuilt around being verifiable.
 
 ### Added
 
+- **`anamnesia project move <to>`, for one product built in several
+  repositories.** A project slug defaults to the repository directory name,
+  so a SaaS split across an API, a core service and a docs repo becomes
+  three projects that cannot see each other: the read path scopes to
+  `project_id = $n OR project_id IS NULL`, and consolidation clusters
+  strictly inside a scope. Run in a repository, the command moves every row
+  that names its project into `<to>` and writes `.anamnesia.toml` so future
+  sessions file there too.
+
+  Both halves are needed and the order matters. Moving the rows without
+  writing the file leaves the next session filing under the old name, which
+  reopens the split with the older memories now elsewhere. Writing the file
+  first makes the old slug unresolvable, so there is nothing left to move.
+
+  It reports and exits unless given `--apply`, and refuses rather than
+  guesses when the two projects share a fact key or skill name, naming
+  each one: only one row per key can live in the target, and discarding a
+  fact the user never chose to lose is not a repair. Entities in the source
+  block the move outright, because merging them means repointing every edge
+  at the survivor, which is its own piece of work.
+
 - **Facts keep their history instead of being overwritten.** `UpsertFact` was
   `INSERT … ON CONFLICT DO UPDATE`, so there was one row per key forever and a
   changed value destroyed the previous one. The table has carried `valid_to`,
