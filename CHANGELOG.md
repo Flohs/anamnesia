@@ -7,6 +7,24 @@ were rebuilt around being verifiable.
 
 ### Fixed
 
+- **An older assertion could overwrite a newer one, and did.** On a live
+  install `project.schema_version` read v10 and was superseded by v8 four
+  seconds later; the schema was, and is, v10. The same key took
+  `project.current_release` from rc5 backwards to rc4. The extractor applies
+  `UPDATE_FACT` in whatever order sources drain, and with segmentation and
+  `worker.extract_concurrency` that order is not deterministic, so whichever
+  assertion landed last won regardless of which described a later moment.
+
+  A value change is now refused when the stored value was asserted from
+  later content, comparing the `occurred_at` of the sources behind each.
+  The refusal is a distinct error, `ErrStaleAssertion`, so a caller can tell
+  "already known better" from "this did not work"; the extractor records it
+  in the source's trace like any other operation outcome.
+
+  Only extraction is constrained. A write with no source is a person stating
+  what is true now, through the CLI or `anamnesia_facts_upsert`, and always
+  wins. A stored row with no source never becomes unchangeable either.
+
 - **Opening a directory created a project, before anything was stored in
   it.** `resolveScope` called `EnsureProject`, and eleven HTTP endpoints and
   seventeen MCP tools used it, most of them reads. `SessionStart` and

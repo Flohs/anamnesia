@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"os"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/flohs/anamnesia/internal/activity"
+	"github.com/flohs/anamnesia/internal/llm"
 	"github.com/flohs/anamnesia/internal/store"
 	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
@@ -74,7 +76,7 @@ func TestUnrelatedExperiencesStillDoNotCluster(t *testing.T) {
 
 // consolidateFixture writes n identical-direction experiences in a fresh
 // scope, so they are guaranteed to form one cluster.
-func consolidateFixture(t *testing.T, n int) (*store.Store, anamnesia.Scope) {
+func consolidateFixture(t *testing.T, n int) (*store.Store, anamnesia.Scope, []string) {
 	t.Helper()
 	dsn := os.Getenv("ANAMNESIA_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -98,6 +100,7 @@ func consolidateFixture(t *testing.T, n int) (*store.Store, anamnesia.Scope) {
 		t.Fatalf("ensure project: %v", err)
 	}
 	scope := anamnesia.Scope{UserID: uid, ProjectID: &pid}
+	ids := make([]string, 0, n)
 	for i := 0; i < n; i++ {
 		exp := &anamnesia.Experience{
 			Scope: scope, Kind: anamnesia.ExperienceCase,
@@ -109,8 +112,50 @@ func consolidateFixture(t *testing.T, n int) (*store.Store, anamnesia.Scope) {
 		if err := st.SetExperienceEmbedding(ctx, exp.ID, unitVec(), "test"); err != nil {
 			t.Fatalf("embed: %v", err)
 		}
+		ids = append(ids, exp.ID.String())
 	}
-	return st, scope
+	return st, scope, ids
+}
+
+// recordingDistiller notes which experience ids each distillation was
+// asked about.
+//
+// Counting calls is not enough here: ConsolidationRun is server-wide, and
+// the test database is shared with every other package, which creates
+// scopes of its own while this test runs. A second pass legitimately
+// distils clusters that appeared elsewhere in between, so a global call
+// counter reports work this test never asked for. What this test is
+// actually about is whether ITS cluster was handed to the model twice.
+type recordingDistiller struct {
+	fakeDistiller
+	submitted [][]string
+}
+
+func (r *recordingDistiller) Distill(ctx context.Context, in llm.DistillInput, out any) error {
+	var rows []struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal([]byte(in.User), &rows)
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	r.submitted = append(r.submitted, ids)
+	return r.fakeDistiller.Distill(ctx, in, out)
+}
+
+// timesSubmitted counts how often a cluster containing id was distilled.
+func (r *recordingDistiller) timesSubmitted(id string) int {
+	n := 0
+	for _, ids := range r.submitted {
+		for _, got := range ids {
+			if got == id {
+				n++
+				break
+			}
+		}
+	}
+	return n
 }
 
 func abstractionOneCount(t *testing.T, st *store.Store, scope anamnesia.Scope) int {
@@ -138,9 +183,9 @@ func abstractionOneCount(t *testing.T, st *store.Store, scope anamnesia.Scope) i
 // being a health-check curiosity and starts duplicating real memory,
 // paying for an LLM call each time.
 func TestASecondPassDoesNotRedistilTheSameCluster(t *testing.T) {
-	st, scope := consolidateFixture(t, 3)
+	st, scope, ids := consolidateFixture(t, 3)
 	ctx := context.Background()
-	lm := &fakeDistiller{}
+	lm := &recordingDistiller{}
 
 	run := func() {
 		if err := ConsolidationRun(ctx, st, lm, ConsolidateConfig{}, discardLog(),
@@ -154,14 +199,13 @@ func TestASecondPassDoesNotRedistilTheSameCluster(t *testing.T) {
 	if afterFirst != 1 {
 		t.Fatalf("first pass wrote %d summaries, want exactly 1", afterFirst)
 	}
-	callsAfterFirst := lm.calls
 
 	run()
 	if got := abstractionOneCount(t, st, scope); got != afterFirst {
 		t.Errorf("second pass over unchanged data wrote another summary: %d then %d. Every restart would add one more.", afterFirst, got)
 	}
-	if lm.calls != callsAfterFirst {
-		t.Errorf("the distiller was called again for an already-distilled cluster: %d then %d calls", callsAfterFirst, lm.calls)
+	if n := lm.timesSubmitted(ids[0]); n != 1 {
+		t.Errorf("this cluster was distilled %d times, want 1: the second pass paid for a model call on work already done", n)
 	}
 }
 
@@ -169,7 +213,7 @@ func TestASecondPassDoesNotRedistilTheSameCluster(t *testing.T) {
 // over-correction: the guard must key on the cluster's membership, not
 // simply "this scope already has a summary".
 func TestANewExperienceStillTriggersAFreshDistillation(t *testing.T) {
-	st, scope := consolidateFixture(t, 3)
+	st, scope, _ := consolidateFixture(t, 3)
 	ctx := context.Background()
 	lm := &fakeDistiller{}
 
@@ -213,7 +257,7 @@ func TestANewExperienceStillTriggersAFreshDistillation(t *testing.T) {
 // because the read path matches `project_id = $n OR project_id IS NULL`.
 // So one summary blending two unrelated projects leaks into all of them.
 func TestTheUserLevelScopeDoesNotSwallowEveryProject(t *testing.T) {
-	st, scope := consolidateFixture(t, 2)
+	st, scope, _ := consolidateFixture(t, 2)
 	ctx := context.Background()
 
 	// One project-less experience: enough to make (user, nil) active,

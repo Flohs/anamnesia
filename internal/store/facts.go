@@ -17,6 +17,15 @@ import (
 
 // UpsertFact creates a new fact or updates an existing one keyed by
 // (scope, fact_scope, key). Embeddings are written when non-nil.
+// ErrStaleAssertion is returned when a value change is refused because
+// the stored value was asserted from later content than the incoming one.
+//
+// A refusal is not a failure: the extractor logs it into the source's
+// trace like any other op outcome, and the current value stands. It is a
+// distinct error so a caller can tell "this was already known better"
+// from "this did not work".
+var ErrStaleAssertion = errors.New("fact: the stored value comes from later content")
+
 func (s *Store) UpsertFact(ctx context.Context, f *anamnesia.Fact) error {
 	if f.Key == "" {
 		return errors.New("fact: key required")
@@ -68,19 +77,25 @@ func (s *Store) UpsertFact(ctx context.Context, f *anamnesia.Fact) error {
 		var (
 			curID    uuid.UUID
 			sameVal  bool
+			curAt    *time.Time
 			curFound = true
 		)
+		// curAt is when the CONTENT that asserted the stored value
+		// happened, not when the row was written. Those differ whenever a
+		// checkpoint is processed after the fact, which is the normal
+		// case: sources are queued and drained by a worker.
 		err := tx.QueryRow(ctx, `
-			SELECT id, value = $5::jsonb
-			  FROM facts
-			 WHERE user_id = $1
-			   AND coalesce(project_id, '00000000-0000-0000-0000-000000000000'::uuid)
+			SELECT f.id, f.value = $5::jsonb, s.occurred_at
+			  FROM facts f
+			  LEFT JOIN sources s ON s.id = f.source_id
+			 WHERE f.user_id = $1
+			   AND coalesce(f.project_id, '00000000-0000-0000-0000-000000000000'::uuid)
 			     = coalesce($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-			   AND fact_scope = $3 AND key = $4
-			   AND deleted_at IS NULL AND superseded_by IS NULL
-			   FOR UPDATE`,
+			   AND f.fact_scope = $3 AND f.key = $4
+			   AND f.deleted_at IS NULL AND f.superseded_by IS NULL
+			   FOR UPDATE OF f`,
 			f.Scope.UserID, f.Scope.ProjectID, string(f.FactKind), f.Key, string(valueJSON),
-		).Scan(&curID, &sameVal)
+		).Scan(&curID, &sameVal, &curAt)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
 			curFound = false
@@ -108,6 +123,37 @@ func (s *Store) UpsertFact(ctx context.Context, f *anamnesia.Fact) error {
 			}
 			f.ID = curID
 			return nil
+		}
+
+		// A changed value only supersedes the stored one if it was
+		// asserted from content at least as recent.
+		//
+		// Observed live: project.schema_version read v10 and was
+		// superseded by v8 four seconds later, and project.current_release
+		// went from rc5 back to rc4. The extractor applies operations in
+		// whatever order sources drain, and with segmentation and
+		// worker.extract_concurrency that order is not deterministic, so
+		// the last writer won regardless of which described a later
+		// moment.
+		//
+		// Only extraction is constrained. A write with no source is a
+		// person stating what is true now, through the CLI or
+		// anamnesia_facts_upsert, and always wins. A stored row with no
+		// source is never made permanently unchangeable either: with
+		// nothing to compare, the incoming value stands.
+		if curFound && !sameVal && curAt != nil && f.SourceID != nil {
+			var newAt time.Time
+			if err := tx.QueryRow(ctx,
+				`SELECT occurred_at FROM sources WHERE id = $1`, *f.SourceID).Scan(&newAt); err != nil {
+				if !errors.Is(err, pgx.ErrNoRows) {
+					return err
+				}
+			} else if newAt.Before(*curAt) {
+				f.ID = curID
+				return fmt.Errorf("%w: %q holds a value from %s, this one comes from %s",
+					ErrStaleAssertion, f.Key,
+					curAt.UTC().Format(time.RFC3339), newAt.UTC().Format(time.RFC3339))
+			}
 		}
 
 		// The new row's id is generated here so the old row can point at
