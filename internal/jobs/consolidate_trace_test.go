@@ -47,7 +47,8 @@ func TestConsolidationRecordsItsReasoning(t *testing.T) {
 	if err := st.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	uid, err := st.EnsureUser(ctx, "consolidate-"+uuid.NewString()[:8])
+	handle := "consolidate-" + uuid.NewString()[:8]
+	uid, err := st.EnsureUser(ctx, handle)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +75,11 @@ func TestConsolidationRecordsItsReasoning(t *testing.T) {
 		}
 	}
 
-	rec := activity.New(4)
+	// A ring large enough that this scope's trace is not evicted.
+	// ConsolidationRun is server-wide and now opens one trace per scope,
+	// and the test database is shared with every other package, so a pass
+	// covers far more scopes than this test creates.
+	rec := activity.New(4096)
 	lm := &fakeDistiller{}
 	if err := ConsolidationRun(ctx, st, lm, ConsolidateConfig{}, discardLog(), 7*24*time.Hour, rec); err != nil {
 		t.Fatalf("consolidation: %v", err)
@@ -83,33 +88,63 @@ func TestConsolidationRecordsItsReasoning(t *testing.T) {
 		t.Fatal("the distiller was never called, so there is nothing to trace")
 	}
 
+	// The pass opens with a survey of the scopes it covers.
 	snap := rec.Snapshot()
-	if len(snap.Traces) != 1 {
-		t.Fatalf("traces = %d, want one per pass", len(snap.Traces))
+	var sawScopes bool
+	for _, head := range snap.Traces {
+		tr, ok := rec.Trace(head.ID)
+		if !ok || len(tr.Steps) == 0 {
+			continue
+		}
+		if tr.Steps[0].Name == "scopes" {
+			if scopes, ok := tr.Steps[0].Detail["scopes"].([]map[string]any); ok && len(scopes) > 0 {
+				sawScopes = true
+			}
+		}
 	}
-	tr, _ := rec.Trace(snap.Traces[0].ID)
-	if tr.Kind != "consolidate" || tr.Status != "ok" {
-		t.Errorf("trace = %s/%s, want consolidate/ok", tr.Kind, tr.Status)
+	if !sawScopes {
+		t.Error("no trace surveyed the scopes the pass covered")
 	}
-	// A pass is server-wide, so it may also fold other scopes that
-	// happen to be in this database. The shape being asserted is one
-	// scope's worth of it: the pass opens with scopes, and every
-	// distillation is a cluster, then a distil, then a write.
-	if tr.Steps[0].Name != "scopes" {
-		t.Fatalf("first step = %q, want scopes", tr.Steps[0].Name)
+
+	// This scope's own trace carries the reasoning: what clustered, what
+	// the model made of it, and what was written. Found by its content
+	// rather than by position, because a server-wide pass traces every
+	// scope in the shared database, not only this one.
+	// Found by this test's own user handle, which is unique per run. The
+	// fake distiller returns one fixed title for every call, so searching
+	// by result would match whichever scope in the shared database
+	// happened to be consolidated first.
+	var tr *activity.Trace
+	for _, head := range snap.Traces {
+		if head.User != handle {
+			continue
+		}
+		if cand, ok := rec.Trace(head.ID); ok {
+			tr = cand
+			break
+		}
 	}
-	if scopes, ok := tr.Steps[0].Detail["scopes"].([]map[string]any); !ok || len(scopes) == 0 {
-		t.Errorf("scopes step = %v, want the scopes it covered", tr.Steps[0].Detail)
+	if tr == nil {
+		t.Fatal("this scope got no trace of its own, so nothing recorded why it folded what it did")
+	}
+	if tr.Kind != "consolidate" {
+		t.Errorf("trace kind = %q, want consolidate", tr.Kind)
+	}
+	if tr.Project != "consolidate-project" {
+		t.Errorf("trace project = %q, want the scope it consolidated: a trace that names no project cannot be filtered to one", tr.Project)
 	}
 	distil := -1
-	for i, s := range tr.Steps {
-		if s.Name == "distil" && s.Detail["result_title"] == "the team standardised on pnpm" {
+	for i, st := range tr.Steps {
+		if st.Name == "distil" {
 			distil = i
 			break
 		}
 	}
 	if distil < 0 {
-		t.Fatalf("no distil step carried the model's result: %v", stepNames(tr.Steps))
+		t.Fatalf("no distil step in this scope's trace: %v", stepNames(tr.Steps))
+	}
+	if tr.Steps[distil].Detail["result_title"] != "the team standardised on pnpm" {
+		t.Errorf("distil step = %v, want the model's result", tr.Steps[distil].Detail)
 	}
 	if tr.Steps[distil].Detail["model"] != "fake-distiller" {
 		t.Errorf("distil step = %v, want the model named", tr.Steps[distil].Detail)

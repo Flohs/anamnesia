@@ -67,13 +67,13 @@ type cluster struct {
 
 // ConsolidationRun executes one consolidation pass across every active
 // (user, project) scope touched in the last `since` window.
-func ConsolidationRun(ctx context.Context, st *store.Store, lm llm.Client, cfg ConsolidateConfig, log *slog.Logger, since time.Duration, rec *activity.Recorder) error {
+func ConsolidationRun(ctx context.Context, storeOf *store.Store, lm llm.Client, cfg ConsolidateConfig, log *slog.Logger, since time.Duration, rec *activity.Recorder) error {
 	cfg = applyConsolidateDefaults(cfg)
 	if since <= 0 {
 		since = cfg.Window
 	}
 
-	scopes, err := activeScopes(ctx, st, since)
+	scopes, err := activeScopes(ctx, storeOf, since)
 	if err != nil {
 		return fmt.Errorf("active scopes: %w", err)
 	}
@@ -82,23 +82,39 @@ func ConsolidationRun(ctx context.Context, st *store.Store, lm llm.Client, cfg C
 	// the user wrote. Being able to read why is the point.
 	tr := rec.Begin("consolidate", "", "")
 	tr.Step("scopes", fmt.Sprintf("%d scopes active in the last %s", len(scopes), since),
-		map[string]any{"scopes": scopeDetails(ctx, st, scopes), "window": since.String()})
+		map[string]any{"scopes": scopeDetails(ctx, storeOf, scopes), "window": since.String()})
 	if len(scopes) == 0 {
 		tr.End("skipped", "Nothing has been written recently enough to consolidate")
 		return nil
 	}
 	written := 0
 	for _, sc := range scopes {
-		n, err := consolidateScope(ctx, st, lm, cfg, log, sc, tr)
+		// One trace per scope, not one per pass. The detail budget is
+		// per trace, so a single pass-wide trace spends it on whichever
+		// scope happened to come first and records the rest as
+		// "truncated" — losing exactly the account of what was folded
+		// that the trace exists to give. Labelling each with its user
+		// and project also lets the console filter consolidation the way
+		// it filters everything else; the pass-level trace cannot, since
+		// it spans every scope and carries no project at all.
+		st := rec.Begin("consolidate", scopeUser(ctx, storeOf, sc), scopeProject(ctx, storeOf, sc))
+		n, err := consolidateScope(ctx, storeOf, lm, cfg, log, sc, st)
 		written += n
 		if err != nil {
 			if log != nil {
 				log.Warn("consolidate scope failed",
 					"user_id", sc.UserID, "project_id", sc.ProjectID, "err", err)
 			}
-			tr.Fail("scope", err)
+			st.Fail("scope", err)
+			st.End("failed", "Consolidation failed for this scope")
 			// Continue with other scopes — one bad scope shouldn't block
 			// the rest.
+			continue
+		}
+		if n == 0 {
+			st.End("skipped", "No cluster was large enough to distil")
+		} else {
+			st.End("ok", fmt.Sprintf("Distilled %d new insight(s)", n))
 		}
 	}
 	if written == 0 {
@@ -107,6 +123,26 @@ func ConsolidationRun(ctx context.Context, st *store.Store, lm llm.Client, cfg C
 		tr.End("ok", fmt.Sprintf("Distilled %d new insights", written))
 	}
 	return nil
+}
+
+// scopeUser and scopeProject label a scope's trace. An unreadable name
+// is not worth failing a pass over: the trace is still findable by its
+// steps, it just loses a column.
+func scopeUser(ctx context.Context, st *store.Store, sc anamnesia.Scope) string {
+	if h, err := st.LookupUserHandle(ctx, sc.UserID); err == nil {
+		return h
+	}
+	return ""
+}
+
+func scopeProject(ctx context.Context, st *store.Store, sc anamnesia.Scope) string {
+	if sc.ProjectID == nil {
+		return ""
+	}
+	if slug, err := st.LookupProjectSlug(ctx, *sc.ProjectID); err == nil {
+		return slug
+	}
+	return ""
 }
 
 // scopeDetails labels the scopes a pass covers. Consolidation runs
