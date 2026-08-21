@@ -1,7 +1,9 @@
 # LongMemEval retrieval baseline
 
-Recorded 2026-08-21, on a corpus rebuilt after the two write-path fixes
-(`aabb82f`, `3666b2e`). Machine-readable copy:
+Recorded 2026-08-21, on a corpus ingested with **session segmentation**
+(`--segment-bytes 4000`), the way `cmd/anamnesia/hook.go` cuts a
+checkpoint. Earlier entries posted whole sessions, which is a path
+production never takes. Machine-readable copy:
 [`superpowers/plans/lme-retrieval-baseline-2026-08-21.json`](./superpowers/plans/lme-retrieval-baseline-2026-08-21.json).
 
 This is **not** a LongMemEval score. It measures retrieval alone: whether
@@ -15,21 +17,45 @@ published LongMemEval number.
 30 questions, 56 gold evidence sessions, all scored.
 
 ```
-recall@1  0.540    recall@5  0.880    recall@10  0.943    recall@20  0.943    MRR  0.915
+recall@1  0.540    recall@5  0.956    recall@10  0.956    recall@20  0.956    MRR  0.928
 ```
 
 | evidence status | count | what it means |
 |---|---|---|
-| `retrieved` | 52 (92.9%) | the gold session's rows ranked |
-| `stored_not_retrieved` | 2 (3.6%) | a miss with no capture verdict, or rows carry the answer |
-| `answer_elsewhere` | 0 | captured, but attributed to another source |
-| `answer_missing` | 1 (1.8%) | no row anywhere carries the answer |
-| `not_stored` | 1 (1.8%) | the session produced no rows at all |
+| `retrieved` | 54 (96.4%) | the gold session's rows ranked |
+| `stored_not_retrieved` | 1 (1.8%) | a miss with no capture verdict, or rows carry the answer |
+| `answer_elsewhere` | 1 (1.8%) | captured, but attributed to another source |
+| `answer_missing` | 0 | no row anywhere carries the answer |
+| `not_stored` | 0 | the session produced no rows at all |
 | `not_ingested` | 0 | |
 
-**The previous entry, for comparison** (same 30 questions, corpus built
-before the write-path fixes): recall@1 0.334, recall@5 0.688,
-recall@10/@20 0.871, MRR 0.667, with `answer_elsewhere` at 3.
+**Both write-path failure categories are zero.** Every one of the 56 gold
+evidence sessions was extracted and stored; the two remaining misses are
+ranking, not loss. That is the headline: on this corpus, extraction no
+longer drops content.
+
+| | whole sessions | segmented |
+|---|---|---|
+| recall@5 | 0.880 | **0.956** |
+| recall@10 / @20 | 0.943 | **0.956** |
+| MRR | 0.915 | **0.928** |
+| `answer_missing` | 1 | **0** |
+| `not_stored` | 1 | **0** |
+| extraction failures | 32 | **0** |
+| wall time | ~1h | ~3h45m |
+
+**Do not attribute that delta to segmentation alone.** This is a rebuild,
+so it is not paired: it carries segmentation *and* the extraction retry
+and budget-escalation fixes, and extraction is nondeterministic. What
+*is* directly attributable is the mechanism, verified in the database:
+the gold fact for `58bf7951`, which whole-session extraction lost in 9
+runs out of 10, is now extracted as `user.attended_play.glass_menagerie`
+from segment `answer_355c48bb#0`.
+
+**Earlier entries, same 30 questions.** Before the write-path fixes:
+recall@1 0.334, recall@5 0.688, recall@10/@20 0.871, MRR 0.667,
+`answer_elsewhere` 3. After them, still on whole sessions: recall@1
+0.540, recall@5 0.880, recall@10/@20 0.943, MRR 0.915.
 
 **Do not read that delta as the fixes' doing.** This corpus was rebuilt,
 so the comparison is not paired: extraction is nondeterministic, and this
@@ -45,20 +71,20 @@ facts rather than 56 evidence sessions.
 recall@20 by ability (2 to 8 questions each, indicative only):
 
 ```
-single-session-assistant   n=3   1.000
+knowledge-update           n=5   1.000
 single-session-preference  n=2   1.000
 single-session-user        n=4   1.000
-temporal-reasoning         n=8   0.938
-multi-session              n=8   0.912
-knowledge-update           n=5   0.900
+temporal-reasoning         n=8   1.000
+multi-session              n=8   0.958
+single-session-assistant   n=3   0.667
 ```
 
 Retrieval channels, over 600 hits:
 
 ```
-vector      573  (95.5%)
-lexical       0  ( 0.0%)
-graph        53  ( 8.8%)   of which graph_only 27 (4.5%)
+vector      587  (97.8%)
+lexical       2  ( 0.3%)
+graph        74  (12.3%)   of which graph_only 13 (2.2%)
 reranked    600  (100.0%)
 ```
 
@@ -107,13 +133,19 @@ not at all. The hand-built corpus behind `anamnesia eval` shows the same
 signature one cutoff lower (`recall@5 == recall@10`), so this is a
 property of the pipeline rather than of one corpus.
 
-**The graph contributes.** 27 of its 53 hits were reached by no other
-channel, across 16 of 30 questions. Note this requires `graph.extract` on
+**The graph contributes.** 13 of its 74 hits were reached by no other
+channel, across 21 of 30 questions. The `graph_only` share fell from 27
+of 53: with finer segments the vector channel finds more of what the
+graph used to reach alone, so the graph is confirming more and
+contributing less. Note this requires `graph.extract` on
 **and** the harness posting `claude-session-graph` sources; without the
 second, the graph pass never runs and the channel reports a structural 0.
 
-**The lexical channel is inert, and fixing it does not help.** Zero hits
-in 600, across four runs and every question type.
+**The lexical channel is all but inert.** It managed 2 hits of 600 on the
+segmented corpus, its first non-zero result here and still negligible;
+every earlier run scored zero across every question type. Shorter
+segments make keys and values that occasionally match a question's
+literal wording, which is why it is no longer exactly zero.
 
 Two independent defects caused it. `plainto_tsquery` ANDs every term, so
 "What play did I attend at the local community theater?" becomes
@@ -188,6 +220,7 @@ reproducible and independent of file order.
 python scripts/longmemeval/harness.py \
   --dataset ./data/longmemeval_s_cleaned.json \
   --mode retrieval --retrieve-k 20 \
+  --segment-bytes 4000 \
   --out ./out/lme-retrieval.jsonl
 ```
 
@@ -209,18 +242,28 @@ Recorded with `worker.extract_concurrency=8`, `worker.embed_backfill=2s`,
 `openai/gpt-4o-mini` and `text-embedding-3-small` (1536) via OpenRouter,
 with `cohere/rerank-v3.5`. Schema v9.
 
-Final corpus: 2,872 sources (2,739 done, 101 skipped, 32 failed), 6,293
-facts, 1,156 experiences, 5,804 entities, 2,832 edges. Built at commit
-`912e61d`, after the provenance (`aabb82f`) and re-embed (`3666b2e`)
-fixes.
+Final corpus: 8,560 sources (8,025 done, 535 skipped, **0 failed**),
+13,633 current facts plus 465 superseded ones, 2,776 experiences, 13,666
+entities, 5,964 edges. Built at commit `acfcd74` with
+`--segment-bytes 4000`.
 
-The 32 failures are all `unexpected end of JSON input`, the model
-breaking its own operations schema: 1.2% here, against roughly 14%
-observed early in the session on the same model and prompt. **That
-instability is the single biggest confounder in this document.** Two
-corpora built from identical inputs differ by more than most changes
-being measured, which is why a rebuild can never be a paired comparison
-and why `--skip-ingest` re-scoring exists.
+Segmentation roughly triples the source count (8,560 against 2,872 for
+the same 30 questions) and the wall time with it, ~3h45m against ~1h.
+That is the cost side of the trade.
+
+**Zero extraction failures**, against 32 in the previous corpus and
+roughly 14% earlier in the same day. Those were two faults wearing one
+error: transient garbage, which a retry fixes, and truncation, which
+needs a bigger budget. Both are handled in `internal/llm`, and the
+instability that used to be the biggest confounder in this document is
+no longer visible at this corpus size. A rebuild still is not a paired
+comparison — extraction remains nondeterministic in *what* it selects,
+just no longer in whether it succeeds — which is why `--skip-ingest`
+re-scoring exists.
+
+The 465 superseded facts are fact history (migration 0010) working on a
+real corpus for the first time: values that changed during ingest and
+were versioned rather than overwritten.
 
 Earlier entries were built through an OpenRouter credit outage that
 failed 669 sources across seven questions; those were recovered by
