@@ -14,17 +14,23 @@ published LongMemEval number.
 30 questions, 56 gold evidence sessions, all scored.
 
 ```
-recall@1  0.346    recall@5  0.671    recall@10  0.854    recall@20  0.854    MRR  0.681
+recall@1  0.334    recall@5  0.688    recall@10  0.871    recall@20  0.871    MRR  0.667
 ```
 
 | evidence status | count | what it means |
 |---|---|---|
-| `retrieved` | 48 (85.7%) | the gold session's rows ranked |
-| `answer_elsewhere` | 6 (10.7%) | captured, but attributed to another source |
-| `stored_not_retrieved` | 1 (1.8%) | rows carry the answer and missed the cutoff |
+| `retrieved` | 49 (87.5%) | the gold session's rows ranked |
+| `stored_not_retrieved` | 3 (5.4%) | a miss with no capture verdict, or rows carry the answer |
+| `answer_elsewhere` | 3 (5.4%) | captured, but attributed to another source |
 | `answer_missing` | 1 (1.8%) | no row anywhere carries the answer |
 | `not_stored` | 0 | |
 | `not_ingested` | 0 | |
+
+The recall figures moved slightly from the first cut (0.854 to 0.871)
+because retrying the credit-failed sources added facts to fifteen of the
+questions. That is corpus growth, not the classifier: capture analysis
+cannot affect recall@k, which is computed purely from ranked source ids
+against gold ids.
 
 recall@20 by ability (2 to 8 questions each, indicative only):
 
@@ -40,25 +46,41 @@ single-session-assistant   n=3   0.667
 Retrieval channels, over 600 hits:
 
 ```
-vector      567  (94.5%)
+vector      563  (93.8%)
 lexical       0  ( 0.0%)
-graph        58  ( 9.7%)   of which graph_only 33 (5.5%)
+graph        64  (10.7%)   of which graph_only 37 (6.2%)
 reranked    600  (100.0%)
 ```
 
 ## What it says
 
-**Provenance is the dominant failure, 6:1 over everything else.**
-`answer_elsewhere` accounts for six of the eight misses. The content was
-captured every time; it was filed under a source other than the labelled
-one. The remaining cause is the `ADD_FACT` collision path in
-`UpsertFact`, which moves `source_id` via
-`COALESCE(EXCLUDED.source_id, facts.source_id)`. The no-op `UPDATE_FACT`
-path was fixed on 2026-08-21 and moved the corpus-wide misattribution
-rate from 35.8% to 31.3%.
+**Provenance and ranking are comparable, at 3 misses each.** An earlier
+version of this file claimed provenance dominated 6:1. That was wrong,
+and the story of how is worth keeping. The capture analysis called a miss
+`answer_elsewhere` whenever *any* content word of the gold answer
+appeared anywhere in the store, and gold answers are prose. An abstention
+question matched on "any"/"did"/"not"; a derived answer ("14 days")
+matched on "day"/"days"/"last"; a security answer matched
+"one"/"two"/"time" while missing "biometric", "otp" and "authentication".
+Five of six verdicts were manufactured by the measure. It now requires a
+term that is rare in the question's own corpus, gives no capture verdict
+for abstention questions or answers with no distinctive terms, and says
+`stored_not_retrieved` (a miss, cause unknown) rather than inventing one.
 
-**Ranking is not the problem.** One `stored_not_retrieved` in 56 evidence
-sessions. Retrieval tuning is not where the wins are.
+Of the three surviving `answer_elsewhere` verdicts, two are solid
+(`page`/`turners` both present; `brookside`/`condo`/`kitchen`/`highway`
+present) and one is borderline (matches `factor`/`methods`/`passwords`
+but still misses `biometric`/`otp`/`authentication`).
+
+So the `ADD_FACT` collision path in `UpsertFact`, which moves `source_id`
+via `COALESCE(EXCLUDED.source_id, facts.source_id)`, is still worth
+finishing, but it is not the landslide the first cut suggested. The no-op
+`UPDATE_FACT` path was fixed on 2026-08-21 and moved the corpus-wide
+misattribution rate from 35.8% to 31.3%.
+
+**Ranking is not obviously the problem either.** Three
+`stored_not_retrieved` in 56, and two of those three are questions where
+capture analysis abstained rather than confirmed the rows were present.
 
 **`recall@10` equals `recall@20` exactly.** Nothing arrives between ranks
 11 and 20. With `recall@1` at 0.346, evidence is either found early or
@@ -66,8 +88,8 @@ not at all. The hand-built corpus behind `anamnesia eval` shows the same
 signature one cutoff lower (`recall@5 == recall@10`), so this is a
 property of the pipeline rather than of one corpus.
 
-**The graph contributes.** 33 of its 58 hits were reached by no other
-channel, across 18 of 30 questions. Note this requires `graph.extract` on
+**The graph contributes.** 37 of its 64 hits were reached by no other
+channel, across 19 of 30 questions. Note this requires `graph.extract` on
 **and** the harness posting `claude-session-graph` sources; without the
 second, the graph pass never runs and the channel reports a structural 0.
 

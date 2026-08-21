@@ -206,12 +206,29 @@ status names a different failure, and they call for opposite fixes:
 | `not_stored` | the session produced no rows at all | the surprise gate |
 | `not_ingested` | the session never reached the store | ingest |
 
-The three middle rows need the gold answer text, so they only appear for
-LongMemEval. `bears_answer` decides them by asking whether **any** content
-word of the answer survived into the stored rows. That is deliberately
-lenient, because the extractor paraphrases heavily: it under-reports
-write-path misses and never over-reports them. When it says the answer is
-missing, not one word of it is there.
+The two capture verdicts need the gold answer text, so they only appear
+for LongMemEval, and only when there is something worth searching for.
+
+A gold answer is prose, complete with narrative filler and asides to the
+judge ("15 days is also acceptable"). Matching on any word of it proves
+nothing: the first run of this analysis called six misses
+`answer_elsewhere`, and five were manufactured by matching words like
+"any", "did", "day" and "one". So a term counts as evidence only if
+`distinctive_terms` finds it rare in that question's own corpus
+(document frequency at or below 20%, floored at one row so small corpora
+still work).
+
+No capture verdict is given at all when:
+
+- the question is an **abstention** one, whose gold answer explains why
+  the question cannot be answered, so there is nothing to look for;
+- the answer has **no distinctive terms**, because it is derived rather
+  than stored ("14 days" is computed from dates and never appears
+  verbatim) or is entirely generic.
+
+Those fall back to `stored_not_retrieved`, which here means "a miss,
+cause unknown". That is deliberate: an unknown cause is worth reporting,
+an invented one is not.
 
 `ops_produced > 0` alone cannot make this call, which is why it used to be
 wrong: a session can extract eight operations and keep none of the thing

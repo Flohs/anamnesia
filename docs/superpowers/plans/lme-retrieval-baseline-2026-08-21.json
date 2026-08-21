@@ -1,7 +1,8 @@
 {
-  "at": "2026-08-21T10:20:00Z",
+  "at": "2026-08-21T11:05:00Z",
   "what": "LongMemEval retrieval-only baseline: recall of gold evidence sessions, no answerer and no judge",
   "not_comparable_to": "published LongMemEval accuracy scores; this measures retrieval, not end-to-end QA",
+  "supersedes": "the 2026-08-21T10:20Z figures, whose answer_elsewhere count was inflated by a lexical heuristic that matched on generic words",
   "dataset": {
     "file": "longmemeval_s_cleaned.json",
     "subset": "scripts/longmemeval/subset-30.txt",
@@ -9,7 +10,7 @@
     "gold_evidence_sessions": 56
   },
   "config": {
-    "commit": "4b5463f (+ uncommitted working tree)",
+    "commit": "eabbfe8 + capture-analysis correction",
     "schema": 9,
     "retrieve_k": 20,
     "llm": "openrouter/openai/gpt-4o-mini",
@@ -21,37 +22,37 @@
     "graph.extract": true
   },
   "corpus": {
-    "sources": 2872,
-    "done": 2764,
-    "skipped": 100,
+    "sources": 2892,
+    "done": 2770,
+    "skipped": 114,
     "failed": 8,
-    "facts": 6342,
-    "experiences": 1185,
-    "entities": 5808,
-    "edges": 2812
+    "facts": 6363,
+    "experiences": 1236,
+    "entities": 5812,
+    "edges": 2814
   },
   "aggregate": {
     "questions": 30,
     "recall_at": {
-      "1": 0.3456,
-      "5": 0.6711,
-      "10": 0.8544,
-      "20": 0.8544
+      "1": 0.3344,
+      "5": 0.6878,
+      "10": 0.8711,
+      "20": 0.8711
     },
-    "mrr": 0.6807
+    "mrr": 0.6668
   },
   "evidence": {
     "answer_missing": 1,
-    "retrieved": 48,
-    "answer_elsewhere": 6,
-    "stored_not_retrieved": 1
+    "retrieved": 49,
+    "stored_not_retrieved": 3,
+    "answer_elsewhere": 3
   },
   "channels": {
     "hits": 600,
-    "vector": 567,
+    "vector": 563,
     "lexical": 0,
-    "graph": 58,
-    "graph_only": 33,
+    "graph": 64,
+    "graph_only": 37,
     "reranked": 600
   },
   "recall_at_20_by_type": {
@@ -60,7 +61,7 @@
     "single-session-assistant": 0.6667,
     "single-session-preference": 1.0,
     "single-session-user": 0.75,
-    "temporal-reasoning": 0.8333
+    "temporal-reasoning": 0.8958
   },
   "per_question": [
     {
@@ -178,9 +179,9 @@
       "question_id": "80ec1f4f_abs",
       "question_type": "multi-session",
       "recall_at_20": 0.6666666666666666,
-      "mrr": 1.0,
+      "mrr": 0.3333,
       "evidence": {
-        "answer_990c8992_abs_2": "answer_elsewhere",
+        "answer_990c8992_abs_2": "stored_not_retrieved",
         "answer_990c8992_abs_3": "retrieved",
         "answer_990c8992_abs_1": "retrieved"
       },
@@ -269,7 +270,7 @@
       "evidence": {
         "answer_93e1bd22": "retrieved"
       },
-      "graph_only": 3
+      "graph_only": 2
     },
     {
       "question_id": "58bf7951",
@@ -304,13 +305,13 @@
     {
       "question_id": "2c63a862",
       "question_type": "temporal-reasoning",
-      "recall_at_20": 0.0,
-      "mrr": 0.0,
+      "recall_at_20": 0.5,
+      "mrr": 0.25,
       "evidence": {
-        "answer_d39b7977_1": "answer_elsewhere",
-        "answer_d39b7977_2": "answer_elsewhere"
+        "answer_d39b7977_1": "stored_not_retrieved",
+        "answer_d39b7977_2": "retrieved"
       },
-      "graph_only": 0
+      "graph_only": 6
     },
     {
       "question_id": "bcbe585f",
@@ -387,7 +388,7 @@
         "answer_e28c1f0e_1": "retrieved",
         "answer_e28c1f0e_2": "retrieved"
       },
-      "graph_only": 1
+      "graph_only": 0
     }
   ]
 }

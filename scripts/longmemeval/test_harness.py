@@ -620,20 +620,23 @@ def test_an_answer_stored_under_another_source_is_flagged_as_such():
     the session it came from, so a source-granularity label cannot find
     it. Distinct from extraction having dropped it."""
     idx = harness.index_sources([_src("s", "u1", ops=3)])
+    rows = ["user likes hybrid bikes", "attended the menagerie production",
+            "bought milk", "went running"]
     got = harness.classify_evidence(
         ["s"], idx, set(), terms={"menagerie"},
         source_text={"s": "user likes hybrid bikes"},
-        corpus_text="user likes hybrid bikes | attended the menagerie production",
+        corpus_text=" ".join(rows), rows=rows,
     )
     assert got == {"s": "answer_elsewhere"}
 
 
 def test_an_answer_in_no_row_at_all_is_an_extraction_miss():
     idx = harness.index_sources([_src("s", "u1", ops=8)])
+    rows = ["user likes hybrid bikes", "bought milk", "went running", "read a book"]
     got = harness.classify_evidence(
         ["s"], idx, set(), terms={"menagerie"},
         source_text={"s": "user likes hybrid bikes"},
-        corpus_text="user likes hybrid bikes",
+        corpus_text=" ".join(rows), rows=rows,
     )
     assert got == {"s": "answer_missing"}
 
@@ -656,8 +659,88 @@ def test_a_source_with_no_rows_is_still_not_stored():
     assert got == {"s": "not_stored"}
 
 
+# ---------- only distinctive terms are evidence ------------------------------
+#
+# "any content word matched" is too weak a test to carry a verdict. The
+# 30-question baseline reported 6 answer_elsewhere verdicts, and five were
+# artifacts: an abstention question matched on "any"/"did"/"not", a
+# derived answer ("14 days") matched on "day"/"days"/"last", and a
+# security answer matched "one"/"two"/"time" while missing "biometric",
+# "otp" and "authentication" entirely.
+
+
+def test_distinctive_terms_drop_words_that_are_everywhere():
+    rows = ["a day at work", "another day", "day three", "day four"]
+    assert harness.distinctive_terms({"day", "menagerie"}, rows) == {"menagerie"}
+
+
+def test_distinctive_terms_keep_a_rare_word():
+    rows = ["saw the glass menagerie", "bought milk", "went running", "read a book"]
+    assert "menagerie" in harness.distinctive_terms({"menagerie"}, rows)
+
+
+def test_distinctive_terms_of_an_empty_corpus_are_empty():
+    """No rows means no basis to call anything rare."""
+    assert harness.distinctive_terms({"menagerie"}, []) == set()
+
+
+def test_abstention_questions_get_no_capture_verdict():
+    """Their gold answer explains why the question is unanswerable, so
+    there is nothing to look for in the store."""
+    idx = harness.index_sources([_src("s", "u1", ops=3)])
+    got = harness.classify_evidence(
+        ["s"], idx, set(), terms={"museum", "december"},
+        source_text={"s": "unrelated"}, corpus_text="a museum trip",
+        rows=["a museum trip", "x", "y", "z"], abstention=True,
+    )
+    assert got == {"s": "stored_not_retrieved"}
+
+
+def test_an_answer_whose_every_term_is_ubiquitous_gets_no_capture_verdict():
+    """"14 days" reduces to words that are in every row. There is nothing
+    left to look for, so claiming it was captured elsewhere, or dropped,
+    would both be inventions."""
+    rows = ["it took days", "several days later", "days passed", "many days"]
+    got = harness.classify_evidence(
+        ["s"], harness.index_sources([_src("s", "u1", ops=3)]), set(),
+        terms={"days"}, source_text={"s": "nope"},
+        corpus_text=" ".join(rows), rows=rows,
+    )
+    assert got == {"s": "stored_not_retrieved"}
+
+
+def test_grading_asides_are_not_answer_content():
+    """Gold answers carry instructions to the judge. "15 days is also
+    acceptable" must not contribute searchable terms."""
+    terms = harness.answer_terms("14 days. 15 days (including the last day) is also acceptable.")
+    # "14" and "15" are shorter than the minimum term length, so nothing
+    # searchable survives at all, which is the honest outcome for an
+    # answer that is a computed number.
+    assert terms == set(), terms
+
+
+def test_a_distinctive_term_found_under_another_source_is_still_answer_elsewhere():
+    rows = ["book club page turners", "bought milk", "went running", "read a book"]
+    got = harness.classify_evidence(
+        ["s"], harness.index_sources([_src("s", "u1", ops=3)]), set(),
+        terms={"turners"}, source_text={"s": "bought milk"},
+        corpus_text=" ".join(rows), rows=rows,
+    )
+    assert got == {"s": "answer_elsewhere"}
+
+
+def test_a_distinctive_term_in_no_row_is_still_answer_missing():
+    rows = ["bought milk", "went running", "read a book", "cooked dinner"]
+    got = harness.classify_evidence(
+        ["s"], harness.index_sources([_src("s", "u1", ops=3)]), set(),
+        terms={"menagerie"}, source_text={"s": "bought milk"},
+        corpus_text=" ".join(rows), rows=rows,
+    )
+    assert got == {"s": "answer_missing"}
+
+
 def test_row_text_groups_facts_and_experiences_by_source():
-    by_src, corpus = harness.index_row_text(
+    by_src, corpus, _ = harness.index_row_text(
         [{"key": "user.play", "value": {"v": "Glass Menagerie"}, "source_id": "u1"}],
         [{"title": "Bike ride", "body": "rode a hybrid bike", "source_id": "u2"}],
     )
@@ -669,7 +752,7 @@ def test_row_text_groups_facts_and_experiences_by_source():
 def test_row_text_includes_the_fact_key_not_just_the_value():
     """Keys carry meaning the extractor put nowhere else, e.g.
     user.recent_audition.play."""
-    by_src, _ = harness.index_row_text(
+    by_src, _, _ = harness.index_row_text(
         [{"key": "user.recent_audition.play", "value": {"v": "x"}, "source_id": "u1"}], []
     )
     assert "audition" in by_src["u1"]
@@ -679,7 +762,7 @@ def test_row_text_keeps_rows_with_no_source_in_the_corpus():
     """A row whose provenance was lost still proves the content was
     captured, which is the difference between answer_elsewhere and
     answer_missing."""
-    _, corpus = harness.index_row_text(
+    _, corpus, _ = harness.index_row_text(
         [], [{"title": "t", "body": "orphaned content", "source_id": None}]
     )
     assert "orphaned content" in corpus

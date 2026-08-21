@@ -550,7 +550,7 @@ def score_retrieval(
 
 def index_row_text(
     facts: list[dict[str, Any]], experiences: list[dict[str, Any]]
-) -> tuple[dict[str, str], str]:
+) -> tuple[dict[str, str], str, list[str]]:
     """Group what was stored by the source it is attributed to, and return
     the whole corpus alongside. Rows whose provenance is missing still
     count toward the corpus: they prove the content was captured, which is
@@ -567,13 +567,26 @@ def index_row_text(
         corpus.append(text)
         if sid := e.get("source_id"):
             by_source.setdefault(sid, []).append(text)
-    return {k: " ".join(v) for k, v in by_source.items()}, " ".join(corpus)
+    return {k: " ".join(v) for k, v in by_source.items()}, " ".join(corpus), corpus
 
 
+# Gold answers are prose, and often carry grading asides ("15 days is also
+# acceptable") and narrative filler. Those words are not content, and
+# matching on them is how five of the six answer_elsewhere verdicts in the
+# first baseline were manufactured.
 _TERM_STOPWORDS = {
     "the", "a", "an", "of", "to", "in", "for", "and", "or", "is", "was",
     "were", "be", "with", "on", "at", "his", "her", "their", "they", "that",
-    "this", "it", "as", "by", "from", "you", "your",
+    "this", "it", "as", "by", "from", "you", "your", "my", "me", "i",
+    "not", "any", "did", "do", "does", "also", "including", "included",
+    "last", "first", "one", "two", "three", "four", "five", "before",
+    "after", "make", "making", "made", "need", "needed", "time", "times",
+    "day", "days", "week", "weeks", "month", "months", "year", "years",
+    "mentioned", "mention", "acceptable", "example", "examples", "about",
+    "some", "other", "others", "than", "then", "when", "where", "which",
+    "who", "what", "how", "why", "there", "here", "have", "has", "had",
+    "been", "being", "are", "am", "were", "would", "could", "should",
+    "will", "can", "may", "might", "must", "more", "most", "less", "very",
 }
 
 
@@ -600,6 +613,26 @@ def bears_answer(text: str, terms: set[str]) -> bool:
     return any(t in low for t in terms)
 
 
+def distinctive_terms(
+    terms: set[str], rows: list[str], max_df: float = 0.2
+) -> set[str]:
+    """The answer terms rare enough in this corpus to be evidence.
+
+    A word in most rows says nothing about whether the answer was kept.
+    "14 days" reduces to day/days/last, which appear everywhere, so
+    matching them proved only that the corpus is in English. Document
+    frequency is measured against this question's own rows because what
+    counts as common is corpus-specific."""
+    if not rows:
+        return set()
+    lowered = [r.lower() for r in rows]
+    # A count, not a ratio: with few rows a ratio has no resolution, and
+    # the rarest possible term (one row) would be filtered out along with
+    # the ubiquitous ones.
+    limit = max(1, int(max_df * len(lowered)))
+    return {t for t in terms if sum(1 for r in lowered if t in r) <= limit}
+
+
 def classify_evidence(
     gold_sessions: list[str],
     index: dict[str, dict[str, Any]],
@@ -608,6 +641,8 @@ def classify_evidence(
     terms: set[str] | None = None,
     source_text: dict[str, str] | None = None,
     corpus_text: str = "",
+    rows: list[str] | None = None,
+    abstention: bool = False,
 ) -> dict[str, str]:
     """Why each gold session did or did not reach the answerer.
 
@@ -619,9 +654,20 @@ def classify_evidence(
       answer_elsewhere      rows carry it, but under another source -> provenance
       answer_missing        no row anywhere carries it             -> extraction
 
+    A capture verdict is only given when there is something to look for.
+    Abstention questions have no answer, only an explanation of why the
+    question cannot be answered; derived answers ("14 days") never appear
+    verbatim; and generic wording is not evidence. In all three cases the
+    coarse `stored_not_retrieved` stands, which says "a miss, cause
+    unknown" rather than inventing a cause.
+
     Without `terms` the older, coarser verdicts stand: LoCoMo has no gold
     answer to check, and ops_produced alone cannot tell these apart."""
     source_text = source_text or {}
+    if abstention:
+        terms = None
+    elif terms:
+        terms = distinctive_terms(terms, rows or [])
     out: dict[str, str] = {}
     for s in gold_sessions:
         row = index.get(s)
@@ -988,6 +1034,8 @@ def run_question(
             if now_date:
                 break
 
+    abstention = is_abstention(q["question_id"])
+
     if mode == "retrieval":
         # Score the ranking against the gold evidence sessions and stop.
         # No answerer, no judge: two fewer model calls per question, and
@@ -1005,7 +1053,7 @@ def run_question(
         }
         # What was actually stored, so a miss can be attributed to ranking,
         # to provenance, or to extraction having dropped the answer.
-        by_source, corpus = index_row_text(
+        by_source, corpus, all_rows = index_row_text(
             anam.browse("facts", user=user), anam.browse("experiences", user=user)
         )
         evidence = classify_evidence(
@@ -1017,11 +1065,13 @@ def run_question(
                 s: by_source.get(index[s]["id"], "") for s in gold_sessions if s in index
             },
             corpus_text=corpus,
+            rows=all_rows,
+            abstention=abstention,
         )
         result = {
             "question_id": q["question_id"],
             "question_type": q.get("question_type", "unknown"),
-            "abstention": is_abstention(q["question_id"]),
+            "abstention": abstention,
             "channels": hit_channels(hits),
             "question": q["question"],
             "evidence": evidence,
@@ -1038,7 +1088,6 @@ def run_question(
         hits=hits,
         now_date=now_date,
     )
-    abstention = is_abstention(q["question_id"])
     verdict = judge_answer(
         provider=judge_provider,
         model=judge_model,
