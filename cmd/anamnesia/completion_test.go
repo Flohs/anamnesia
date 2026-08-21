@@ -17,6 +17,10 @@ func completionHome(t *testing.T) string {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 	t.Setenv(homeEnv, filepath.Join(dir, ".anamnesia"))
+	// Fish reads XDG_CONFIG_HOME before falling back to ~/.config, and a
+	// GitHub runner sets it. Without this the fish script lands in the
+	// runner's own config directory and the test looks in the wrong place.
+	t.Setenv("XDG_CONFIG_HOME", "")
 	backedUp = map[string]bool{} // package-level; a stale entry skips the backup
 	return dir
 }

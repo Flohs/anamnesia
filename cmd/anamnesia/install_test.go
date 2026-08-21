@@ -66,7 +66,10 @@ func installInto(t *testing.T, dir string) {
 	t.Helper()
 	// Installing now writes shell completion and sources it from a shell
 	// rc, so without a scratch HOME this would edit the developer's own.
+	// XDG_CONFIG_HOME goes with it: under a fish $SHELL it decides where
+	// the script lands, and HOME alone would not contain it.
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", "")
 	installF = installFlags{scope: "user", configDir: dir}
 	backedUp = map[string]bool{}
 	hc := testHostConfig(t)
