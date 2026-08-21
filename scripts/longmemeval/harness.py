@@ -530,6 +530,33 @@ def hit_source_ids(hits: list[dict[str, Any]]) -> list[str]:
     return out
 
 
+def ranked_sessions(
+    ranked: list[str], index: dict[str, dict[str, Any]]
+) -> list[str]:
+    """Map a ranked list of source ids back to the sessions they came
+    from, best rank first and deduped.
+
+    Recall is over gold evidence *sessions*. Once a session is ingested
+    as several segments, scoring raw source ids quietly changes the
+    question to "what fraction of its segments surfaced", so a session
+    cut in three scores 0.33 when its evidence was found. Collapsing to
+    sessions here keeps the metric comparable to numbers taken before
+    segmentation existed."""
+    owner: dict[str, str] = {}
+    for session, row in index.items():
+        for sid in row["ids"]:
+            owner[sid] = session
+    out: list[str] = []
+    seen = set()
+    for sid in ranked:
+        session = owner.get(sid)
+        if session is None or session in seen:
+            continue
+        seen.add(session)
+        out.append(session)
+    return out
+
+
 def metric_ks(k: int) -> list[int]:
     """Cutoffs to report for a run that asked for k hits. A cutoff above k
     would label a metric computed over a truncated list with a k it never
@@ -1098,12 +1125,12 @@ def run_question(
             )
         index = index_sources(anam.sources(user=user))
         ranked = hit_source_ids(hits)
-        # Every segment of a gold session counts as gold: the evidence is
-        # in the session, and which slice of it surfaced is not what
-        # recall is asking about.
-        gold_ids = {
-            sid for s in gold_sessions if s in index for sid in index[s]["ids"]
-        }
+        # Score over sessions, not source ids. A session ingested as
+        # several segments must not score 1/3 because one segment ranked:
+        # the metric is recall of gold evidence sessions, and it has to
+        # stay comparable to numbers taken before segmentation.
+        ranked_sess = ranked_sessions(ranked, index)
+        gold_ids = {s for s in gold_sessions if s in index}
         # What was actually stored, so a miss can be attributed to ranking,
         # to provenance, or to extraction having dropped the answer.
         by_source, corpus, all_rows = index_row_text(
@@ -1132,7 +1159,7 @@ def run_question(
             "hits": hits,
         }
         if gold_ids:
-            result["score"] = score_retrieval(ranked, gold_ids, metric_ks(retrieve_k))
+            result["score"] = score_retrieval(ranked_sess, gold_ids, metric_ks(retrieve_k))
         return result
 
     predicted = answer_question(

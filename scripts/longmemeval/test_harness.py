@@ -998,3 +998,67 @@ def test_the_graph_source_suffix_does_not_collide_with_a_segment():
     idx = harness.index_sources([_src("s#0", "u1", ops=2), _src("s#0-graph", "u2", ops=4)])
     assert idx["s"]["ids"] == ["u1"]
     assert idx["s"]["ops"] == 2
+
+
+# ---------- recall is over sessions, not segments ------------------------------
+#
+# Once a session is ingested as several sources, counting gold *source
+# ids* silently changes what recall means: a gold session cut into three
+# segments scores 0.33 when one of them ranks, though the evidence was
+# found. The metric is "recall of gold evidence sessions" and has to stay
+# that, or no number compares to one taken before segmentation.
+
+
+def test_ranked_sessions_maps_hits_back_to_their_session():
+    idx = harness.index_sources([_src("s-a#0", "u1"), _src("s-a#1", "u2"), _src("s-b", "u3")])
+    assert harness.ranked_sessions(["u2", "u3"], idx) == ["s-a", "s-b"]
+
+
+def test_ranked_sessions_dedupes_keeping_the_best_rank():
+    """Two segments of one session are one retrieved session, at the rank
+    of whichever surfaced first."""
+    idx = harness.index_sources([_src("s-a#0", "u1"), _src("s-a#1", "u2"), _src("s-b", "u3")])
+    assert harness.ranked_sessions(["u1", "u2", "u3"], idx) == ["s-a", "s-b"]
+
+
+def test_ranked_sessions_drops_hits_from_unknown_sources():
+    idx = harness.index_sources([_src("s-a", "u1")])
+    assert harness.ranked_sessions(["u1", "mystery"], idx) == ["s-a"]
+
+
+def test_one_retrieved_segment_scores_the_whole_session():
+    idx = harness.index_sources([_src("s#0", "u1"), _src("s#1", "u2"), _src("s#2", "u3")])
+    ranked = harness.ranked_sessions(["u2"], idx)
+    got = harness.score_retrieval(ranked, {"s"}, [5])
+    assert got["recall"][5] == 1.0, "a session cut into 3 segments must not score 0.33"
+
+
+def test_an_unretrieved_session_still_scores_zero():
+    idx = harness.index_sources([_src("s#0", "u1"), _src("other", "u9")])
+    ranked = harness.ranked_sessions(["u9"], idx)
+    assert harness.score_retrieval(ranked, {"s"}, [5])["recall"][5] == 0.0
+
+
+def test_retrieval_mode_scores_a_segmented_session_as_one():
+    """End-to-end wiring: the gold session is ingested as three segments
+    and one of them ranks. Before this was fixed the question scored 0.33
+    and the benchmark silently got harder the day segmentation landed."""
+    anam = _FakeAnamnesia(
+        sources=[_src("s-a#0", "u1", ops=2), _src("s-a#1", "u2", ops=2), _src("s-a#2", "u3", ops=2)],
+        hits=[{"fact": {"source_id": "u2"}}],
+        rows={"facts": [{"key": "k", "value": {"v": "x"}, "source_id": "u2"}]},
+    )
+    q = {
+        "question_id": "q1", "question_type": "multi-session",
+        "question": "q?", "answer": "a", "question_date": "2023/05/30 (Tue) 23:40",
+        "haystack_sessions": [], "haystack_dates": [], "haystack_session_ids": [],
+        "answer_session_ids": ["s-a"],
+    }
+    r = harness.run_question(
+        q, anam=anam, user_prefix="lme", ingest_wait=0, retrieve_k=5,
+        multi_query=False, multi_query_total=40, skip_ingest=True,
+        ingest_mode="extract", generate_provider="openai", generate_model="x",
+        judge_provider="openai", judge_model="x", mode="retrieval",
+    )
+    assert r["score"]["recall"][5] == 1.0, r["score"]
+    assert r["evidence"] == {"s-a": "retrieved"}
