@@ -68,7 +68,19 @@ func (s *Store) UpsertFact(ctx context.Context, f *anamnesia.Fact) error {
 			DO UPDATE SET
 				value       = EXCLUDED.value,
 				source      = COALESCE(EXCLUDED.source, facts.source),
-				source_id   = COALESCE(EXCLUDED.source_id, facts.source_id),
+				-- Provenance follows the value: source_id is read as "where
+				-- this content came from" (retrieval eval labels and
+				-- internal/extract's hitSourceID-style lookups depend on
+				-- it), so a source that re-asserts the value already
+				-- stored must not take authorship of it. Only move it when
+				-- the incoming value actually differs from what's stored;
+				-- jsonb equality here is object-key-order-insensitive,
+				-- which is what we want.
+				source_id   = CASE
+					WHEN facts.value IS DISTINCT FROM EXCLUDED.value
+						THEN COALESCE(EXCLUDED.source_id, facts.source_id)
+					ELSE facts.source_id
+				END,
 				trust       = EXCLUDED.trust,
 				pii_tags    = EXCLUDED.pii_tags,
 				embedding   = COALESCE(EXCLUDED.embedding, facts.embedding),
