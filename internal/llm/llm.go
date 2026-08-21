@@ -324,7 +324,7 @@ type oaiChatResp struct {
 	} `json:"error,omitempty"`
 }
 
-func (o *openaiLLM) chat(ctx context.Context, messages []oaiMsg, maxTok int, schema json.RawMessage, schemaName string, wantJSON bool) (string, error) {
+func (o *openaiLLM) chat(ctx context.Context, messages []oaiMsg, maxTok int, schema json.RawMessage, schemaName string, wantJSON bool) (content, finish string, err error) {
 	body := oaiChatReq{
 		Model:     o.model,
 		Messages:  messages,
@@ -359,7 +359,7 @@ func (o *openaiLLM) chat(ctx context.Context, messages []oaiMsg, maxTok int, sch
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	rb, status, err := doRetry(ctx, o.client(), func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, "POST",
@@ -375,27 +375,27 @@ func (o *openaiLLM) chat(ctx context.Context, messages []oaiMsg, maxTok int, sch
 		return req, nil
 	}, 5)
 	if err != nil {
-		return "", fmt.Errorf("openai chat: %w", err)
+		return "", "", fmt.Errorf("openai chat: %w", err)
 	}
 	if status != 200 {
-		return "", fmt.Errorf("openai chat: status %d: %s", status, string(rb))
+		return "", "", fmt.Errorf("openai chat: status %d: %s", status, string(rb))
 	}
 	var parsed oaiChatResp
 	if err := json.Unmarshal(rb, &parsed); err != nil {
-		return "", fmt.Errorf("openai chat: parse %w", err)
+		return "", "", fmt.Errorf("openai chat: parse %w", err)
 	}
 	if parsed.Error != nil {
-		return "", fmt.Errorf("openai chat: %s", parsed.Error.Message)
+		return "", "", fmt.Errorf("openai chat: %s", parsed.Error.Message)
 	}
 	if len(parsed.Choices) == 0 {
-		return "", errors.New("openai chat: no choices returned")
+		return "", "", errors.New("openai chat: no choices returned")
 	}
 	c := parsed.Choices[0]
 	if strings.TrimSpace(c.Message.Content) == "" {
-		return "", fmt.Errorf("openai chat: model returned an empty completion (finish_reason %q)",
-			orUnknown(c.FinishReason))
+		return "", orUnknown(c.FinishReason), fmt.Errorf(
+			"openai chat: model returned an empty completion (finish_reason %q)", orUnknown(c.FinishReason))
 	}
-	return c.Message.Content, nil
+	return c.Message.Content, orUnknown(c.FinishReason), nil
 }
 
 // orUnknown labels a finish_reason a provider omitted, so the error never
@@ -408,34 +408,84 @@ func orUnknown(s string) string {
 }
 
 func (o *openaiLLM) Complete(ctx context.Context, prompt string) (string, error) {
-	return o.chat(ctx, []oaiMsg{{Role: "user", Content: prompt}}, 1024, nil, "", false)
+	content, _, err := o.chat(ctx, []oaiMsg{{Role: "user", Content: prompt}}, 1024, nil, "", false)
+	return content, err
 }
 
 // Distill runs the system + user prompt with JSON-mode forced on. Most
 // OpenAI-compatible endpoints honour response_format={type:json_object};
 // for those that don't, the JSON still parses because the system prompt
 // also instructs the model to emit JSON.
+// parseAttempts is how many times an unusable completion is re-requested
+// before the source is given up on. A model that breaks its own output
+// format does so transiently: re-running the 32 failed sources of a
+// benchmark corpus unchanged made 28 of them succeed. One bad completion
+// treated as permanent is a hole in memory, and is why one run lost 14%
+// of its sources and another 1.2%. Bounded, because retrying forever
+// would park the whole queue behind one poisoned source.
+const parseAttempts = 3
+
+// maxEscalatedTok bounds the budget growth below. One pathological source
+// must not be able to run the bill up indefinitely.
+const maxEscalatedTok = 16384
+
 func (o *openaiLLM) Distill(ctx context.Context, in DistillInput, out any) error {
 	msgs := []oaiMsg{}
 	if in.System != "" {
 		msgs = append(msgs, oaiMsg{Role: "system", Content: in.System})
 	}
 	msgs = append(msgs, oaiMsg{Role: "user", Content: in.User})
-	raw, err := o.chat(ctx, msgs, in.MaxTok, in.Schema, in.SchemaName, true)
-	if err != nil {
-		return err
+
+	// Truncation and garbage both surface as an unparseable body, and
+	// they need opposite handling. Garbage is transient, so re-asking is
+	// enough. Truncation is not: the same source and prompt overflow the
+	// same budget every time, so a retry at the same cap burns another
+	// call for the same result. finish_reason "length" is the model
+	// saying which happened, so only that case buys more room.
+	budget := in.MaxTok
+	var lastErr error
+	for attempt := 0; attempt < parseAttempts; attempt++ {
+		raw, finish, err := o.chat(ctx, msgs, budget, in.Schema, in.SchemaName, true)
+		if finish == "length" && budget < maxEscalatedTok {
+			if budget <= 0 {
+				budget = 1024
+			}
+			budget *= 2
+			if budget > maxEscalatedTok {
+				budget = maxEscalatedTok
+			}
+		}
+		if err != nil {
+			// A transport or provider error has already been retried by
+			// doRetry; an empty completion is worth another attempt.
+			lastErr = err
+			if !strings.Contains(err.Error(), "empty completion") {
+				return err
+			}
+			continue
+		}
+		// Belt-and-braces: strip ``` fences if a non-conforming endpoint
+		// returned a fenced block despite JSON mode.
+		s := strings.TrimSpace(raw)
+		s = strings.TrimPrefix(s, "```json")
+		s = strings.TrimPrefix(s, "```")
+		s = strings.TrimSuffix(s, "```")
+		s = strings.TrimSpace(s)
+		if s == "" {
+			lastErr = fmt.Errorf("openai chat: model returned an empty completion, only a code fence (finish_reason %q)", finish)
+			continue
+		}
+		if err := json.Unmarshal([]byte(s), out); err != nil {
+			// Name the cause, not the symptom: "unexpected end of JSON
+			// input" says nothing about whether the model was cut off at
+			// max_tokens or returned junk. finish_reason and the size do.
+			lastErr = fmt.Errorf("openai chat: could not parse the completion (finish_reason %q, %d bytes): %w",
+				finish, len(s), err)
+			continue
+		}
+		return nil
 	}
-	// Belt-and-braces: strip ``` fences if a non-conforming endpoint
-	// returned a fenced block despite JSON mode.
-	s := strings.TrimSpace(raw)
-	s = strings.TrimPrefix(s, "```json")
-	s = strings.TrimPrefix(s, "```")
-	s = strings.TrimSuffix(s, "```")
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return errors.New("openai chat: model returned an empty completion (only a code fence)")
-	}
-	return json.Unmarshal([]byte(s), out)
+	return lastErr
 }
 
 func (o *openaiLLM) Extract(ctx context.Context, in DistillInput, out any) error {
