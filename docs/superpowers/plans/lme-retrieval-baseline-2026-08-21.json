@@ -395,5 +395,23 @@
       },
       "graph_only": 0
     }
-  ]
+  ],
+  "end_to_end": {
+    "what": "the same corpus and questions run through --mode end-to-end: retrieve, answer from the hits, grade with LongMemEval's own judge prompts",
+    "answerer": "openrouter/openai/gpt-4o",
+    "judge": "openrouter/openai/gpt-4o",
+    "accuracy": 0.4667,
+    "correct": 14,
+    "questions": 30,
+    "by_type": {
+      "knowledge-update": "1/5",
+      "multi-session": "5/8",
+      "single-session-assistant": "1/3",
+      "single-session-preference": "2/2",
+      "single-session-user": "2/4",
+      "temporal-reasoning": "3/8"
+    },
+    "note": "not comparable to published LongMemEval numbers: a 30-question subset with our own answerer, not the full 500. Independent harnesses put established products at 49-59% on the full set.",
+    "reading": "retrieval 0.956 against end-to-end 0.467 says retrieval is close to solved on this corpus and extraction fidelity is not: facts are captured but lose their qualifiers."
+  }
 }

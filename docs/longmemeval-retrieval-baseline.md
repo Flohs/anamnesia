@@ -29,6 +29,30 @@ recall@1  0.540    recall@5  0.956    recall@10  0.956    recall@20  0.956    MR
 | `not_stored` | 0 | the session produced no rows at all |
 | `not_ingested` | 0 | |
 
+**End-to-end accuracy on the same corpus: 14/30 (46.7%)**, answerer and
+judge both `gpt-4o`, using LongMemEval's own judge prompts. The gap
+against 0.956 retrieval is the most useful number in this document:
+retrieval hands over the right memory almost every time and the answer is
+still wrong more often than not.
+
+A worked example. "Where do I currently keep my old sneakers?" Gold: *in
+a shoe rack in my closet*. Anamnesia answered *in a shoe rack*, judged
+wrong. Retrieval was perfect — the gold session ranked third, as
+`user.organizing.shoe_rack → "store old sneakers in a shoe rack"`.
+Extraction had dropped "in my closet", a word that appears in 14 raw
+sources and survives in one unrelated fact.
+
+So retrieval is close to solved here and **extraction fidelity is not**:
+facts are captured but lose their qualifiers. That is a different failure
+from facts being dropped entirely, which segmentation fixed, and neither
+the retrieval metric nor the capture analysis can see it — both check
+whether the right *session* or *some* distinctive term came back, never
+whether the whole answer survived.
+
+By ability: single-session-preference 2/2, multi-session 5/8,
+single-session-user 2/4, temporal-reasoning 3/8,
+single-session-assistant 1/3, knowledge-update 1/5.
+
 **Both write-path failure categories are zero.** Every one of the 56 gold
 evidence sessions was extracted and stored; the two remaining misses are
 ranking, not loss. That is the headline: on this corpus, extraction no

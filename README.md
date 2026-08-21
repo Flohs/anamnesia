@@ -1,5 +1,7 @@
 # Anamnesia
 
+![Anamnesia](docs/assets/hero.jpg)
+
 Long-term memory for Claude Code, running entirely on your own machine.
 
 Anamnesia watches what you work on, keeps the parts that will still matter
@@ -10,6 +12,37 @@ reason you rejected the obvious approach are all still there tomorrow.
 One binary does everything: the CLI, the Claude Code hooks, and the memory
 server. It manages its own Postgres container, so there is no compose file to
 write and no image to build.
+
+Nothing leaves your machine except the model calls you configure.
+
+## What makes it different
+
+**It does not store your conversations.** Most memory layers keep the
+transcript and search it later. Anamnesia runs each checkpoint past a
+surprise gate, asks a model what is worth keeping, and throws the rest
+away. The default answer is "nothing" — `NOOP` — because most of what you
+say to an assistant is noise. Raw content expires after seven days.
+
+**Memory is typed, not a pile of text.** A preference is a `fact` with a
+key you can update. A decision is an `experience` with a timestamp, an
+abstraction level and participants. Relationships live in a bitemporal
+`entities`/`edges` graph. That is what lets retrieval answer "what did we
+decide and why" rather than returning five paragraphs that mention the
+word.
+
+**Facts have history.** Changing a value supersedes the old one instead
+of overwriting it, so "what did I think last month" is answerable. Old
+values stay out of your prompts unless you ask for them
+(`include_history`).
+
+**Failure is visible.** A health check that cannot fail is a green light
+on a broken install, so `/v1/health` verifies the database, schema
+version, embedding width and ANN indexes. Retrieval returns an error when
+its embedder is down rather than an innocent-looking empty result. Hooks
+never break a session, and every run is logged so `doctor` can tell you
+which one has been failing silently for a week.
+
+**It is measured, not asserted.** See below.
 
 ## Requirements
 
@@ -335,8 +368,14 @@ What survives lands in five typed domains:
 - **working memory**, in-session entries that expire
 - **entities and edges**, a bitemporal graph for multi-hop questions
 
-Retrieval fuses pgvector similarity with Postgres full-text search, combines
-the two rankings, and optionally reranks the result. A decay worker recomputes
+Facts are versioned rather than overwritten: a changed value supersedes
+the previous one, which keeps its own text, provenance and embedding.
+
+Retrieval fuses three channels with reciprocal-rank fusion — pgvector
+similarity, Postgres full-text search, and a walk over the entity graph —
+and optionally reranks the result. (On extracted memory the full-text
+channel earns almost nothing; that is measured, and written down in
+`CLAUDE.md` so nobody spends a day rediscovering it.) A decay worker recomputes
 per-experience relevance hourly; a daily consolidation worker clusters similar
 experiences and distills each cluster into one higher-abstraction record, so
 memory gets shorter as it gets older rather than growing without bound.
@@ -344,6 +383,102 @@ memory gets shorter as it gets older rather than growing without bound.
 Claude also gets an MCP tool surface (`anamnesia_search`,
 `anamnesia_facts_upsert`, `anamnesia_experience_record` and more) so it can
 read and write memory deliberately, not only through the hooks.
+
+## Measured
+
+Most memory projects ship a benchmark number and no way to reproduce it.
+Anamnesia ships the harness, the corpus definition and the baseline, so
+you can disagree with the number by re-running it.
+
+`scripts/longmemeval/` runs [LongMemEval](https://github.com/xiaowu0162/longmemeval)
+against a live stack. `--mode retrieval` scores retrieval directly against
+each question's gold evidence sessions, with **no answerer and no judge**,
+so a run costs one search per question and carries none of two models'
+variance.
+
+Two numbers, because they answer different questions
+([full record](docs/longmemeval-retrieval-baseline.md)):
+
+**Did the right memory come back?** 30 questions, 56 gold evidence
+sessions, scored mechanically against gold ids with no model in the loop:
+
+```
+recall@5  0.956    recall@20  0.956    MRR  0.928
+
+retrieved             54  (96.4%)
+stored_not_retrieved   1        ← ranking missed it
+answer_elsewhere       1        ← stored under the wrong source
+answer_missing         0        ← extraction dropped it
+not_stored             0        ← the session produced nothing
+```
+
+**Was the final answer right?** The same corpus, same questions, run
+through `--mode end-to-end`: retrieve, let a model answer from the hits,
+and grade it with LongMemEval's own judge prompts (ported verbatim,
+including the separate one for abstention questions):
+
+```
+overall  14/30  (46.7%)      answerer and judge: gpt-4o
+
+single-session-preference  2/2  100%
+multi-session              5/8   63%
+single-session-user        2/4   50%
+temporal-reasoning         3/8   38%
+single-session-assistant   1/3   33%
+knowledge-update           1/5   20%
+```
+
+**The gap between 95.6% and 46.7% is the interesting part**, and it is
+not a rounding error. Retrieval hands over the right memory almost every
+time; the answer is still wrong more often than not. Here is a real
+failure, in full:
+
+> **Question** Where do I currently keep my old sneakers?
+> **Gold** in a shoe rack in my closet
+> **Anamnesia** in a shoe rack
+> **Judge** No.
+
+Retrieval was perfect: the gold session came back ranked third, as
+`user.organizing.shoe_rack → "store old sneakers in a shoe rack"`.
+Extraction had dropped *"in my closet"*. The word appears in 14 raw
+sources and survives in exactly one unrelated fact.
+
+So on this corpus **retrieval is close to solved and extraction fidelity
+is not.** Facts get captured but lose their qualifiers, and a memory that
+says "in a shoe rack" when you asked *where* something is has lost the
+useful half. That is a different problem from facts being dropped
+entirely, which segmentation fixed.
+
+Neither number is comparable to what memory vendors publish. Those are
+over all 500 LongMemEval questions with their own answerer; this is a
+30-question subset. For rough context, independent harnesses put
+established products in the 49–59% range on the full set. The point here
+is not the score — it is that the measurement says *where* the loss
+happens, and it said extraction when every instinct said retrieval.
+
+The evidence breakdown is what makes this useful. A score alone says a
+question failed; these categories say *which subsystem* failed, and they
+have repeatedly pointed somewhere other than where the guess would have
+gone:
+
+- a benchmark that reported "ranking missed it" when extraction had
+  never stored the answer at all
+- provenance quietly reassigned, so a session about a play owned a fact
+  about a bike
+- an embedder outage that looked exactly like an empty memory
+- a full-text channel returning zero rows for every query, for months
+
+Every one of those was found by the measurement rather than by reading
+the code, and each is fixed with a test that fails without the fix. The
+corpus behind the numbers: 8,560 sources, **zero extraction failures**,
+13,633 facts plus 465 superseded ones.
+
+Re-scoring a stored corpus takes about 25 seconds and no model calls:
+
+```bash
+python scripts/longmemeval/harness.py --dataset ./data/longmemeval_s_cleaned.json \
+  --mode retrieval --skip-ingest --retrieve-k 20 --out ./out/rescore.jsonl
+```
 
 ## What lives where
 

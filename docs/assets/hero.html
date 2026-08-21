@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Anamnesia</title>
+<style>
+  :root{
+    --ink:#0B111C;
+    --ink-2:#111a29;
+    --panel:#141E30;
+    --panel-2:#0F1725;
+    --rule:#243349;
+    --text:#E7ECF5;
+    --muted:#8496B3;
+    --dim:#5D6E8C;
+    --amber:#E9A33C;
+    --amber-soft:rgba(233,163,60,.14);
+    --green:#63C98C;
+    --violet:#8C7BF0;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{background:var(--ink);}
+  body{
+    width:1530px;height:780px;
+    font-family:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
+    color:var(--text);
+    position:relative;overflow:hidden;
+    display:flex;flex-direction:column;align-items:center;
+    padding:26px 0 0;
+  }
+  /* ambient: a slow recall glow behind the terminal */
+  body::before{
+    content:"";position:absolute;inset:-20% 10% 30%;
+    background:radial-gradient(60% 55% at 50% 40%,rgba(140,123,240,.20),transparent 70%),
+               radial-gradient(40% 40% at 78% 30%,rgba(233,163,60,.10),transparent 70%);
+    filter:blur(20px);pointer-events:none;
+  }
+  .wrap{position:relative;z-index:1;width:100%;display:flex;flex-direction:column;align-items:center}
+
+  /* ── wordmark ─────────────────────────────────────────── */
+  .mark{display:flex;align-items:center;gap:16px;margin-bottom:8px}
+  .glyph{width:50px;height:50px;flex:none}
+  h1{
+    font-size:49px;font-weight:680;letter-spacing:-.035em;line-height:1;
+    background:linear-gradient(180deg,#FFFFFF 30%,#B9C6DC);
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+  }
+  .tagline{
+    font-size:25px;font-weight:600;letter-spacing:-.02em;line-height:1.25;
+    text-align:center;margin-bottom:7px;
+  }
+  .tagline em{font-style:normal;color:var(--amber)}
+  .sub{
+    font-size:14.6px;line-height:1.5;color:var(--muted);text-align:center;
+    max-width:620px;margin-bottom:18px;
+  }
+
+  /* ── stage: terminal + side notes ─────────────────────── */
+  .stage{display:grid;grid-template-columns:268px minmax(0,1fr) 268px;gap:30px;align-items:center;width:1450px}
+
+  .note{display:flex;flex-direction:column;gap:8px;width:268px;min-width:0;overflow:hidden}
+  .note.right{text-align:right;align-items:flex-end}
+  .note h3{font-size:17.5px;font-weight:650;letter-spacing:-.01em}
+  .note p{font-size:12.6px;line-height:1.55;color:var(--muted);width:268px;overflow-wrap:break-word}
+  .note .ico{width:36px;height:36px}
+  .note.side-a h3{color:var(--violet)}
+  .note.side-b h3{color:var(--amber)}
+
+  /* ── terminal ─────────────────────────────────────────── */
+  .term{min-width:0;
+    background:var(--panel-2);
+    border:1px solid var(--rule);
+    border-radius:13px;
+    overflow:hidden;
+    box-shadow:0 30px 80px -20px rgba(0,0,0,.75), 0 0 0 1px rgba(255,255,255,.03) inset;
+  }
+  .bar{
+    display:flex;align-items:center;gap:9px;
+    padding:9px 14px;border-bottom:1px solid var(--rule);
+    background:linear-gradient(180deg,#182233,#131C2B);
+  }
+  .dot{width:11px;height:11px;border-radius:50%}
+  .bar .t{
+    margin-left:8px;font-size:12.5px;color:var(--dim);
+    font-family:ui-monospace,"SF Mono","JetBrains Mono",monospace;
+  }
+  .body{
+    padding:15px 20px 16px;
+    font-family:ui-monospace,"SF Mono","JetBrains Mono",monospace;
+    font-size:12.6px;line-height:1.62;
+  }
+  .l{white-space:pre;}
+  .c-dim{color:var(--dim)}
+  .c-mut{color:var(--muted)}
+  .c-amb{color:var(--amber)}
+  .c-grn{color:var(--green)}
+  .c-vio{color:var(--violet)}
+  .c-txt{color:var(--text)}
+  .rule{height:1px;background:var(--rule);margin:10px 0}
+
+  .kept{
+    display:inline-block;padding:1px 7px;border-radius:5px;
+    background:var(--amber-soft);color:var(--amber);
+    font-size:11.5px;letter-spacing:.03em;
+  }
+  .cursor{
+    display:inline-block;width:8px;height:15px;
+    background:var(--amber);vertical-align:-2px;margin-left:3px;
+  }
+
+  /* ── domains ──────────────────────────────────────────── */
+  .domains{margin-top:18px;display:flex;flex-direction:column;align-items:center;gap:13px}
+  .domains .cap{font-size:12.6px;color:var(--dim);letter-spacing:.01em}
+  .chips{display:flex;gap:11px}
+  .chip{
+    display:flex;flex-direction:column;gap:3px;
+    padding:9px 15px;border-radius:9px;
+    background:var(--panel);border:1px solid var(--rule);min-width:124px;
+  }
+  .chip b{font-size:12.8px;font-weight:620;letter-spacing:-.005em}
+  .chip span{font-size:10.9px;color:var(--dim);line-height:1.4}
+  .chip.hl{border-color:rgba(233,163,60,.42);background:linear-gradient(180deg,#1B2334,#141E30)}
+  .chip.hl b{color:var(--amber)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="mark">
+    <svg class="glyph" viewBox="0 0 64 64" fill="none">
+      <circle cx="32" cy="32" r="26" stroke="#8C7BF0" stroke-width="4" stroke-linecap="round"
+              stroke-dasharray="118 45" transform="rotate(-92 32 32)"/>
+      <circle cx="32" cy="32" r="13" stroke="#E9A33C" stroke-width="4" stroke-linecap="round"
+              stroke-dasharray="55 28" transform="rotate(70 32 32)"/>
+      <circle cx="32" cy="32" r="3.4" fill="#E9A33C"/>
+    </svg>
+    <h1>Anamnesia</h1>
+  </div>
+
+  <div class="tagline">Long-term memory for Claude Code that <em>forgets on purpose</em></div>
+  <div class="sub">
+    It doesn't keep your transcripts. Every session is read once, the few things
+    still worth knowing next month are extracted, and the rest is thrown away.
+    One binary, one Postgres container, nothing leaves your machine.
+  </div>
+
+  <div class="stage">
+
+    <div class="note side-a">
+      <svg class="ico" viewBox="0 0 44 44" fill="none">
+        <rect x="6" y="6" width="32" height="32" rx="7" stroke="#8C7BF0" stroke-width="2.6"/>
+        <path d="M15 22h14M22 15v14" stroke="#8C7BF0" stroke-width="2.6" stroke-linecap="round"/>
+      </svg>
+      <h3>One binary</h3>
+      <p>The CLI, the Claude Code hooks and the memory server are the same
+         executable, so they can never end up on different versions. It
+         starts its own Postgres — no compose file, no image to build.</p>
+    </div>
+
+    <div class="term">
+      <div class="bar">
+        <span class="dot" style="background:#E9A33C"></span>
+        <span class="dot" style="background:#5D6E8C"></span>
+        <span class="dot" style="background:#243349"></span>
+        <span class="t">claude — SessionStart</span>
+      </div>
+      <div class="body">
+<div class="l"><span class="c-dim">$</span> <span class="c-txt">claude</span></div>
+<div class="l"><span class="c-grn">✓</span> <span class="c-mut">anamnesia SessionStart · 14ms</span></div>
+<div class="rule"></div>
+<div class="l"><span class="c-amb">## Anamnesia memory</span></div>
+<div class="l"> </div>
+<div class="l"><span class="c-txt">**Facts**</span></div>
+<div class="l"><span class="c-dim">-</span> <span class="c-vio">deploy.rollback</span> <span class="c-mut">"tag the image first, then flip the alias"</span></div>
+<div class="l"><span class="c-dim">-</span> <span class="c-vio">user.review_style</span> <span class="c-mut">"wants the failing test before the fix"</span></div>
+<div class="l"><span class="c-dim">-</span> <span class="c-vio">db.migrations</span> <span class="c-mut">"goose, never edit one in place"</span></div>
+<div class="l"> </div>
+<div class="l"><span class="c-txt">**Recent experiences**</span></div>
+<div class="l"><span class="c-dim">-</span> <span class="c-mut">Rejected the queue rewrite: the bottleneck was the</span></div>
+<div class="l">  <span class="c-mut">serial extract loop, not the queue.</span> <span class="c-dim">· 6 days ago</span></div>
+<div class="rule"></div>
+<div class="l"><span class="c-mut">&gt; why did we not switch to the queue rewrite?</span><span class="cursor"></span></div>
+<div class="l"> </div>
+<div class="l"><span class="c-dim">last checkpoint</span>  <span class="c-txt">47 turns</span> <span class="c-dim">→</span> <span class="kept">3 kept</span> <span class="c-dim">· 44 discarded</span></div>
+      </div>
+    </div>
+
+    <div class="note side-b right">
+      <svg class="ico" viewBox="0 0 44 44" fill="none">
+        <path d="M22 6l14 6v10c0 8.5-5.8 14.6-14 16.6C13.8 36.6 8 30.5 8 22V12l14-6z"
+              stroke="#E9A33C" stroke-width="2.6" stroke-linejoin="round"/>
+        <path d="M16.5 22.5l4 4 7.5-8" stroke="#E9A33C" stroke-width="2.6"
+              stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <h3>Your machine</h3>
+      <p>Memory lives in a Postgres container Anamnesia manages for you.
+         Nothing is uploaded, nothing is shared, and raw conversation
+         expires after seven days. The only thing that leaves is the
+         model call you configured.</p>
+    </div>
+
+  </div>
+
+  <div class="domains">
+    <div class="cap">What survives is typed, not a pile of text</div>
+    <div class="chips">
+      <div class="chip hl"><b>facts</b><span>keyed, versioned</span></div>
+      <div class="chip"><b>experiences</b><span>what happened, when</span></div>
+      <div class="chip"><b>skills</b><span>callable registry</span></div>
+      <div class="chip"><b>working</b><span>this session only</span></div>
+      <div class="chip"><b>graph</b><span>entities &amp; edges</span></div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
