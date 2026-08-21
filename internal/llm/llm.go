@@ -312,6 +312,11 @@ type oaiJSONSchemaFmt struct {
 type oaiChatResp struct {
 	Choices []struct {
 		Message oaiMsg `json:"message"`
+		// FinishReason separates "the model was cut off at max_tokens"
+		// ("length") from "the provider returned nothing" ("stop" with no
+		// content). Discarding it made both surface as the same opaque
+		// JSON parse error.
+		FinishReason string `json:"finish_reason,omitempty"`
 	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
@@ -334,7 +339,18 @@ func (o *openaiLLM) chat(ctx context.Context, messages []oaiMsg, maxTok int, sch
 		body.ResponseFormat = &oaiRespFmt{
 			Type: "json_schema",
 			JSONSchema: &oaiJSONSchemaFmt{
-				Name:   name,
+				Name: name,
+				// Strict is deliberately NOT set. It would make a
+				// non-conforming response impossible instead of merely
+				// unlikely, but OpenAI rejects a strict schema unless
+				// every object carries additionalProperties:false and
+				// every property is listed in required. The operations
+				// schema has a dozen fields that only apply to some ops,
+				// so enabling it means rewriting the schema to demand
+				// nulls for all of them, which changes what the model
+				// emits. Verified against the live API on 2026-08-21:
+				// setting it returns 400 "Invalid schema for
+				// response_format". See TestStructuredOutputIsNotStrict.
 				Schema: schema,
 			},
 		}
@@ -374,7 +390,21 @@ func (o *openaiLLM) chat(ctx context.Context, messages []oaiMsg, maxTok int, sch
 	if len(parsed.Choices) == 0 {
 		return "", errors.New("openai chat: no choices returned")
 	}
-	return parsed.Choices[0].Message.Content, nil
+	c := parsed.Choices[0]
+	if strings.TrimSpace(c.Message.Content) == "" {
+		return "", fmt.Errorf("openai chat: model returned an empty completion (finish_reason %q)",
+			orUnknown(c.FinishReason))
+	}
+	return c.Message.Content, nil
+}
+
+// orUnknown labels a finish_reason a provider omitted, so the error never
+// reads as an empty quoted string.
+func orUnknown(s string) string {
+	if s == "" {
+		return "unknown"
+	}
+	return s
 }
 
 func (o *openaiLLM) Complete(ctx context.Context, prompt string) (string, error) {
@@ -402,6 +432,9 @@ func (o *openaiLLM) Distill(ctx context.Context, in DistillInput, out any) error
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")
 	s = strings.TrimSpace(s)
+	if s == "" {
+		return errors.New("openai chat: model returned an empty completion (only a code fence)")
+	}
 	return json.Unmarshal([]byte(s), out)
 }
 
