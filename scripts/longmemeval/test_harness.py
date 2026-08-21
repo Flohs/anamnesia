@@ -300,7 +300,7 @@ def _src(ext, sid, ops=1, state="done"):
 
 def test_source_index_keys_on_external_ref():
     idx = harness.index_sources([_src("sess-a", "uuid-1")])
-    assert idx["sess-a"]["id"] == "uuid-1"
+    assert idx["sess-a"]["ids"] == ["uuid-1"]
 
 
 def test_source_index_skips_rows_with_no_external_ref():
@@ -414,7 +414,7 @@ def test_a_retrieved_source_counts_as_retrieved_even_with_zero_ops():
 def _fold(*questions):
     acc = {}
     for ranked, gold_sessions, idx in questions:
-        gold_ids = {idx[s]["id"] for s in gold_sessions if s in idx}
+        gold_ids = {sid for s in gold_sessions if s in idx for sid in idx[s]["ids"]}
         score = harness.score_retrieval(ranked, gold_ids or {"__none__"}, [1, 5])
         harness.fold_retrieval(acc, score, harness.classify_evidence(gold_sessions, idx, set(ranked)))
     return acc
@@ -899,3 +899,102 @@ def test_retrieval_summary_stays_quiet_when_everything_scored():
     idx = harness.index_sources([_src("s", "u1")])
     text = "\n".join(harness.format_retrieval_summary(_fold((["u1"], ["s"], idx))))
     assert "unscored" not in text
+
+
+# ---------- segmentation ------------------------------------------------------
+#
+# The hook cuts a checkpoint into segments before posting (hook.go
+# readTranscriptFrom): on a >segment_gap pause between turns, or when the
+# accumulated text passes segment_max_bytes. The harness posted whole
+# sessions, so the benchmark measured a path production does not use.
+#
+# LongMemEval turns carry no per-turn timestamps, so only the size rule
+# can fire — which is what makes this the faithful analogue.
+#
+# It matters because extraction attention degrades over a long input.
+# Measured over 4 sources: a 32768-byte cap captured the gold answer
+# 7/12 times, 8000 -> 9/12, 4000 -> 10/12, 2000 -> 12/12.
+
+
+def test_segments_cut_when_the_text_passes_the_cap():
+    turns = ["user: " + "x" * 400 for _ in range(6)]
+    segs = harness.segment_turns(turns, 1000)
+    assert len(segs) > 1
+    for s in segs:
+        assert isinstance(s, str) and s
+
+
+def test_a_short_session_stays_one_segment():
+    """Cutting a session that already fits changes the corpus for nothing."""
+    turns = ["user: hello", "assistant: hi"]
+    assert harness.segment_turns(turns, 32768) == ["user: hello\nassistant: hi"]
+
+
+def test_a_zero_cap_disables_segmentation():
+    """Mirrors ingest.segment_max_bytes, where 0 means 'do not size-cut'."""
+    turns = ["user: " + "x" * 5000, "assistant: " + "y" * 5000]
+    assert len(harness.segment_turns(turns, 0)) == 1
+
+
+def test_no_turn_is_lost_or_duplicated_by_cutting():
+    turns = [f"user: line {i}" for i in range(20)]
+    segs = harness.segment_turns(turns, 60)
+    rejoined = "\n".join(segs).split("\n")
+    assert rejoined == turns
+
+
+def test_a_single_oversized_turn_is_not_dropped():
+    """A turn larger than the cap cannot be split further; it must still
+    be ingested rather than silently discarded."""
+    turns = ["user: " + "x" * 5000]
+    segs = harness.segment_turns(turns, 1000)
+    assert len(segs) == 1 and len(segs[0]) > 5000
+
+
+# ---------- one session, several sources --------------------------------------
+#
+# Segmenting means a session is ingested as several sources, so the
+# scoring can no longer assume external_ref == session id. Segments are
+# posted as "<session>#<n>", and a gold session counts as retrieved when
+# ANY of its segments ranked: the evidence is in the session, and which
+# slice of it surfaced is not what recall is asking about.
+
+
+def test_source_index_groups_segments_of_one_session():
+    idx = harness.index_sources([
+        _src("sess-a#0", "u1", ops=2),
+        _src("sess-a#1", "u2", ops=3),
+        _src("sess-b#0", "u3", ops=1),
+    ])
+    assert set(idx) == {"sess-a", "sess-b"}
+    assert idx["sess-a"]["ids"] == ["u1", "u2"]
+    assert idx["sess-a"]["ops"] == 5
+
+
+def test_an_unsegmented_session_still_indexes_under_its_own_id():
+    """A corpus ingested before segmentation must still score."""
+    idx = harness.index_sources([_src("sess-a", "u1", ops=2)])
+    assert idx["sess-a"]["ids"] == ["u1"]
+
+
+def test_a_session_counts_as_retrieved_when_any_segment_ranked():
+    idx = harness.index_sources([_src("s#0", "u1"), _src("s#1", "u2")])
+    assert harness.classify_evidence(["s"], idx, {"u2"}) == {"s": "retrieved"}
+
+
+def test_a_session_with_no_segment_ranked_is_still_a_miss():
+    idx = harness.index_sources([_src("s#0", "u1", ops=2), _src("s#1", "u2", ops=2)])
+    assert harness.classify_evidence(["s"], idx, {"other"}) == {"s": "stored_not_retrieved"}
+
+
+def test_a_session_whose_every_segment_produced_nothing_is_not_stored():
+    idx = harness.index_sources([_src("s#0", "u1", ops=0), _src("s#1", "u2", ops=0)])
+    assert harness.classify_evidence(["s"], idx, set()) == {"s": "not_stored"}
+
+
+def test_the_graph_source_suffix_does_not_collide_with_a_segment():
+    """Graph sources are posted as "<ref>-graph"; they must not be folded
+    into the session they describe, or their ops would inflate it."""
+    idx = harness.index_sources([_src("s#0", "u1", ops=2), _src("s#0-graph", "u2", ops=4)])
+    assert idx["s"]["ids"] == ["u1"]
+    assert idx["s"]["ops"] == 2

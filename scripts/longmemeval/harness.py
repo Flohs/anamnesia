@@ -481,20 +481,34 @@ def _date_only(rfc: str | None) -> str | None:
 
 
 def index_sources(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Index /v1/sources rows by the session id they were ingested under.
+    """Index /v1/sources rows by the session they belong to.
+
+    A session is ingested as one source per segment, posted under
+    "<session>#<n>", so several rows fold into one entry: `ids` holds
+    every segment's source id and `ops` their total. An unsegmented
+    corpus, ingested before segmentation existed, still indexes under its
+    own ref.
+
+    Graph sources are posted as "<ref>-graph" and are deliberately NOT
+    folded in. They describe the session rather than carrying its
+    extracted rows, and counting their ops would make a session look
+    stored when the fact/experience pass produced nothing.
+
     Rows with no external_ref were not written by this harness and cannot
     be tied to a session, so they are dropped rather than collapsed under
     an empty key."""
     idx: dict[str, dict[str, Any]] = {}
     for r in rows:
         ext = r.get("external_ref")
-        if not ext:
+        if not ext or ext.endswith("-graph"):
             continue
-        idx[ext] = {
-            "id": r.get("id"),
-            "ops": r.get("ops_produced", 0),
-            "state": r.get("extraction_state", ""),
-        }
+        session = ext.split("#", 1)[0]
+        e = idx.setdefault(session, {"ids": [], "ops": 0, "state": ""})
+        if sid := r.get("id"):
+            e["ids"].append(sid)
+        e["ops"] += r.get("ops_produced", 0) or 0
+        if not e["state"]:
+            e["state"] = r.get("extraction_state", "")
     return idx
 
 
@@ -673,7 +687,7 @@ def classify_evidence(
         row = index.get(s)
         if row is None:
             out[s] = "not_ingested"
-        elif row["id"] in retrieved:
+        elif any(i in retrieved for i in row["ids"]):
             # An actual hit outranks a disagreeing ops_produced: something
             # demonstrably ranked, so it was stored.
             out[s] = "retrieved"
@@ -752,6 +766,36 @@ def format_retrieval_summary(acc: dict[str, Any]) -> list[str]:
 # extra graph source per checkpoint, and this mirrors it per session.
 
 GRAPH_SOURCE_KIND = "claude-session-graph"
+
+
+def segment_turns(turns: list[str], max_bytes: int) -> list[str]:
+    """Cut a session into segments the way the hook cuts a checkpoint.
+
+    Mirrors readTranscriptFrom in cmd/anamnesia/hook.go: the buffer is
+    flushed when it has ALREADY passed the cap, so a segment may exceed
+    max_bytes by up to one turn and a turn is never split. A cap of 0
+    disables the size cut, matching ingest.segment_max_bytes.
+
+    The hook also cuts on a pause longer than ingest.segment_gap, which
+    cannot fire here: LongMemEval turns carry no per-turn timestamps.
+
+    Why this exists: extraction attention degrades over a long input. The
+    harness used to post whole sessions, which is a path production never
+    takes. Measured over 4 gold sources, the fraction of runs whose gold
+    answer survived extraction was 7/12 at a 32768-byte cap, 9/12 at
+    8000, 10/12 at 4000 and 12/12 at 2000."""
+    if max_bytes <= 0:
+        return ["\n".join(turns)] if turns else []
+    segs: list[str] = []
+    cur: list[str] = []
+    for t in turns:
+        if cur and sum(len(x) + 1 for x in cur) > max_bytes:
+            segs.append("\n".join(cur))
+            cur = []
+        cur.append(t)
+    if cur:
+        segs.append("\n".join(cur))
+    return segs
 
 
 def config_flags(items: list[dict[str, Any]]) -> dict[str, str]:
@@ -935,6 +979,32 @@ def session_to_text(session: list[dict[str, Any]]) -> str:
 # ---------- Runner ----------------------------------------------------------
 
 
+def _ingest_one(anam, user, content, occurred_at, external_ref, ingest_mode, graph_source):
+    """Post one segment, plus its graph source when the server wants one."""
+    if ingest_mode == "raw":
+        # Bypass the extractor entirely: the segment lands as one
+        # experience row, embedded inline. RAG baseline.
+        anam.experience(user=user, body=content, occurred_at=occurred_at, title=external_ref)
+        return
+    resp = anam.ingest(
+        user=user, content=content, occurred_at=occurred_at, external_ref=external_ref
+    )
+    if not graph_source:
+        return
+    # Mirrors hook.go's per-checkpoint graph post. segment_source_ids is
+    # what ties the entity mentions to a source a search hit can carry;
+    # without it the graph is populated and unreachable.
+    sid = (resp or {}).get("source_id")
+    anam.ingest(
+        user=user,
+        content=content,
+        kind=GRAPH_SOURCE_KIND,
+        occurred_at=occurred_at,
+        external_ref=f"{external_ref}-graph" if external_ref else None,
+        metadata={"segment_source_ids": [sid] if sid else []},
+    )
+
+
 def run_question(
     q: dict[str, Any],
     *,
@@ -952,6 +1022,7 @@ def run_question(
     judge_model: str,
     mode: str = "end-to-end",
     graph_source: bool = False,
+    segment_bytes: int = 0,
 ) -> dict[str, Any]:
     # `user_id` on the question (LoCoMo path) overrides the per-question
     # user-prefix scheme; LongMemEval still uses lme-<question_id>.
@@ -967,37 +1038,16 @@ def run_question(
                 continue
             occ = to_rfc3339(dates[i] if i < len(dates) else None)
             ext = ids[i] if i < len(ids) else None
-            if ingest_mode == "raw":
-                # Bypass the extractor entirely: each session lands as one
-                # experience row, embedded inline. RAG baseline.
-                anam.experience(
-                    user=user,
-                    body=content,
-                    occurred_at=occ,
-                    title=ext,
-                )
-            else:
-                resp = anam.ingest(
-                    user=user,
-                    content=content,
-                    occurred_at=occ,
-                    external_ref=ext,
-                )
-                if graph_source:
-                    # One graph source per session, mirroring hook.go's
-                    # per-checkpoint post. segment_source_ids is what ties
-                    # the entity mentions to a source a search hit can
-                    # carry; without it the graph is populated and
-                    # unreachable.
-                    sid = (resp or {}).get("source_id")
-                    anam.ingest(
-                        user=user,
-                        content=content,
-                        kind=GRAPH_SOURCE_KIND,
-                        occurred_at=occ,
-                        external_ref=f"{ext}-graph" if ext else None,
-                        metadata={"segment_source_ids": [sid] if sid else []},
-                    )
+            # The hook cuts a checkpoint into segments before posting, so
+            # a harness that posts whole sessions measures a path
+            # production never takes. Extraction attention degrades over
+            # a long input: on 4 gold sources the answer survived 7/12
+            # runs at a 32768-byte cap and 12/12 at 2000.
+            parts = segment_turns(content.split("\n"), segment_bytes)
+            for n, part in enumerate(parts):
+                part_ext = ext if len(parts) == 1 else (f"{ext}#{n}" if ext else None)
+                _ingest_one(anam, user, part, occ, part_ext, ingest_mode, graph_source)
+        # fall through to the drain below
 
         # Queue poll is only meaningful for the async-extract path. Raw
         # mode is fully synchronous — retrieval is warm the moment the
@@ -1048,8 +1098,11 @@ def run_question(
             )
         index = index_sources(anam.sources(user=user))
         ranked = hit_source_ids(hits)
+        # Every segment of a gold session counts as gold: the evidence is
+        # in the session, and which slice of it surfaced is not what
+        # recall is asking about.
         gold_ids = {
-            index[s]["id"] for s in gold_sessions if s in index and index[s]["id"]
+            sid for s in gold_sessions if s in index for sid in index[s]["ids"]
         }
         # What was actually stored, so a miss can be attributed to ranking,
         # to provenance, or to extraction having dropped the answer.
@@ -1062,7 +1115,8 @@ def run_question(
             set(ranked),
             terms=answer_terms(q.get("answer", "")),
             source_text={
-                s: by_source.get(index[s]["id"], "") for s in gold_sessions if s in index
+                s: " ".join(by_source.get(sid, "") for sid in index[s]["ids"])
+                for s in gold_sessions if s in index
             },
             corpus_text=corpus,
             rows=all_rows,
@@ -1255,6 +1309,12 @@ def main(argv: list[str]) -> int:
         help="extract = POST /v1/ingest, run LLM extractor, retrieve facts/experiences (Anamnesia's full pipeline). raw = POST /v1/experience for each session, embed inline, no extractor, no queue poll — gives you a pure RAG baseline for comparison.",
     )
     ap.add_argument(
+        "--segment-bytes",
+        type=int,
+        default=4000,
+        help="cut each session into segments of about this many bytes before ingesting, the way the hook cuts a checkpoint (ingest.segment_max_bytes). 0 posts whole sessions, which is what the harness did before and is a path production never takes. Extraction attention degrades over a long input: on 4 gold sources the answer survived extraction in 7/12 runs at 32768, 9/12 at 8000, 10/12 at 4000 and 12/12 at 2000, at a cost of one model call per segment.",
+    )
+    ap.add_argument(
         "--mode",
         choices=["end-to-end", "retrieval"],
         default="end-to-end",
@@ -1393,6 +1453,7 @@ def main(argv: list[str]) -> int:
                     judge_model=args.judge_model,
                     mode=args.mode,
                     graph_source=graph_source,
+                    segment_bytes=args.segment_bytes,
                 )
                 if not args.skip_ingest:
                     ingested_users.add(q_user)
