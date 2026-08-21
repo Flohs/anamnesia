@@ -285,11 +285,69 @@ func compareVersions(a, b semver) int {
 		return 1
 	case b.pre == "":
 		return -1
-	case a.pre < b.pre:
+	default:
+		return comparePre(a.pre, b.pre)
+	}
+}
+
+// comparePre orders two prerelease strings, comparing runs of digits as
+// numbers so rc10 comes after rc9. Semver would compare "rc10" and "rc9"
+// as opaque alphanumeric identifiers, in ASCII order, which puts rc10
+// first and made every rc past rc9 invisible to the updater. This
+// comparator only ever orders this project's own tags, so it follows
+// what the tags mean rather than the letter of the spec.
+func comparePre(a, b string) int {
+	for a != "" && b != "" {
+		if isASCIIDigit(a[0]) && isASCIIDigit(b[0]) {
+			an, arest := splitDigits(a)
+			bn, brest := splitDigits(b)
+			if c := compareNumeric(an, bn); c != 0 {
+				return c
+			}
+			a, b = arest, brest
+			continue
+		}
+		if a[0] != b[0] {
+			if a[0] < b[0] {
+				return -1
+			}
+			return 1
+		}
+		a, b = a[1:], b[1:]
+	}
+	switch {
+	case a == b:
+		return 0
+	case a == "": // b has more left, so b is the longer identifier
 		return -1
 	default:
 		return 1
 	}
+}
+
+func isASCIIDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+// splitDigits takes the leading run of digits off s.
+func splitDigits(s string) (digits, rest string) {
+	i := 0
+	for i < len(s) && isASCIIDigit(s[i]) {
+		i++
+	}
+	return s[:i], s[i:]
+}
+
+// compareNumeric compares two digit strings as numbers without parsing
+// them, so an absurdly long run cannot overflow.
+func compareNumeric(a, b string) int {
+	a = strings.TrimLeft(a, "0")
+	b = strings.TrimLeft(b, "0")
+	if len(a) != len(b) {
+		if len(a) < len(b) {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(a, b)
 }
 
 // ─── download and verify ─────────────────────────────────────────────

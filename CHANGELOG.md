@@ -7,6 +7,14 @@ were rebuilt around being verifiable.
 
 ### Fixed
 
+- **Every release after rc9 was invisible to `anamnesia update`.** The
+  prerelease part of a version was compared as a plain string, so `"rc10" <
+  "rc9"` because `'1' < '9'`. Tagging rc10 built and published normally, and
+  then every install on rc9 reported "already on the latest release"
+  forever: the release existed and simply could not be reached. `--force`
+  did not help, because the up-to-date branch returns before consulting it.
+  Runs of digits inside a prerelease identifier are now compared as numbers.
+
 - **Consolidation could never run, and said it succeeded.** The clustering
   threshold was hardcoded at a cosine of 0.85, which no real corpus reaches.
   Measured over the 1,402 same-scope experience pairs on a live install: the
