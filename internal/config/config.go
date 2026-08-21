@@ -72,6 +72,9 @@ type Config struct {
 	ExtractEvery     time.Duration // ANAMNESIA_EXTRACT_EVERY (default 15s)
 	EmbedBackfill    time.Duration // ANAMNESIA_EMBED_BACKFILL (default 1m)
 
+	// ExtractConcurrency is how many sources are extracted at once.
+	ExtractConcurrency int // ANAMNESIA_EXTRACT_CONCURRENCY (default 1)
+
 	// ExtractCommitments lets the extractor emit ADD_COMMITMENT ops.
 	ExtractCommitments bool // ANAMNESIA_EXTRACT_COMMITMENTS (default false)
 
@@ -231,6 +234,8 @@ func Load() (*Config, error) {
 		DecayEvery:       dur("ANAMNESIA_DECAY_EVERY", time.Hour),
 		ExtractEvery:     dur("ANAMNESIA_EXTRACT_EVERY", 15*time.Second),
 		EmbedBackfill:    dur("ANAMNESIA_EMBED_BACKFILL", time.Minute),
+
+		ExtractConcurrency: num("ANAMNESIA_EXTRACT_CONCURRENCY", 1),
 
 		ExtractCommitments: boolean("ANAMNESIA_EXTRACT_COMMITMENTS", false),
 

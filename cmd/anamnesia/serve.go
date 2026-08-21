@@ -283,13 +283,14 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		workerErr = make(chan error, 1)
 		worker := &jobs.Worker{
 			Cfg: jobs.Config{
-				EmbedEvery:       cfg.EmbedBackfill,
-				ForgetEvery:      cfg.ForgetEvery,
-				DecayEvery:       cfg.DecayEvery,
-				ConsolidateEvery: cfg.ConsolidateEvery,
-				ExtractEvery:     cfg.ExtractEvery,
-				Extract:          extractConfig(cfg),
-				Decay:            decayConfig(cfg),
+				EmbedEvery:         cfg.EmbedBackfill,
+				ForgetEvery:        cfg.ForgetEvery,
+				DecayEvery:         cfg.DecayEvery,
+				ConsolidateEvery:   cfg.ConsolidateEvery,
+				ExtractEvery:       cfg.ExtractEvery,
+				ExtractConcurrency: cfg.ExtractConcurrency,
+				Extract:            extractConfig(cfg),
+				Decay:              decayConfig(cfg),
 			},
 			Store:     st,
 			Embedder:  emb,

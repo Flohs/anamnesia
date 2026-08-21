@@ -65,6 +65,13 @@ type Query struct {
 	// flows). Leave false for context injection where thematic summaries
 	// are useful.
 	OnlyRaw bool
+	// SkipRerank, when true, returns the fused order as-is instead of
+	// paying a reranker call. Set it when nothing reads the ordering:
+	// the extractor's candidate fetch assembles a merge-candidate list
+	// for a prompt, so it needs recall, not a polished top-5, and it runs
+	// once per ingested source. Leave false for /v1/retrieve, where the
+	// order is what reaches the model.
+	SkipRerank bool
 	// Trace, when set, records the stages of this search: what was
 	// searched for, what each half returned, how fusion ranked it and
 	// what the reranker did to that order.
@@ -344,8 +351,9 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 	// Take a candidate set 4× the requested K into the reranker so the
 	// final ordering has room to reshuffle. If no reranker is wired,
 	// just cap at K.
+	reranking := e.Reranker != nil && !q.SkipRerank
 	candK := q.K
-	if e.Reranker != nil {
+	if reranking {
 		candK = 4 * q.K
 	}
 	if len(out) > candK {
@@ -354,7 +362,7 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 	before := order(out)
 	applied := false
 	var rerankErr error
-	if e.Reranker != nil && strings.TrimSpace(q.Text) != "" {
+	if reranking && strings.TrimSpace(q.Text) != "" {
 		reranked, err := e.Reranker.Rerank(ctx, q.Text, out)
 		if err == nil {
 			out = reranked
@@ -371,6 +379,8 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 		}
 		if e.Reranker == nil {
 			detail["reason"] = "no reranker is configured"
+		} else if q.SkipRerank {
+			detail["reason"] = "the caller asked for the fused order"
 		}
 		if rerankErr != nil {
 			detail["error"] = rerankErr.Error()

@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -617,7 +618,10 @@ func (e *Extractor) candidates(ctx context.Context, scope anamnesia.Scope, text 
 		return nil, nil, nil
 	}
 	hits, err := e.Retrieval.Search(ctx, retrieval.Query{
-		Scope: scope, Text: text, K: k,
+		// SkipRerank: these hits are marshalled into the model's prompt
+		// as merge candidates. Nothing reads their order, so reranking
+		// buys nothing and costs a provider call on every ingest.
+		Scope: scope, Text: text, K: k, SkipRerank: true,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -873,15 +877,29 @@ func (e *Extractor) updateFact(ctx context.Context, src *anamnesia.Source, op Op
 	if err != nil {
 		return applied{}, fmt.Errorf("UPDATE_FACT: %w", err)
 	}
+	// Provenance follows the value. An UPDATE_FACT that carries no value,
+	// or re-asserts the one already stored, changes nothing — and the
+	// model emits both often, echoing a candidate back verbatim. Moving
+	// source_id for those hands the fact to a source that never mentioned
+	// it, which is how a session about a play came to own the user's bike
+	// type. source_id is read as "where this came from", so it may only
+	// move when the content does.
+	changed := false
 	if len(op.Value) > 0 {
-		prev.Value = valueToMap(op.Value)
+		next := valueToMap(op.Value)
+		if !reflect.DeepEqual(prev.Value, next) {
+			prev.Value = next
+			changed = true
+		}
 	}
 	if op.Trust > 0 {
 		prev.Trust = op.Trust
 	}
 	prev.Source = strOr(op.Source, "extracted")
-	sourceID := src.ID
-	prev.SourceID = &sourceID
+	if changed {
+		sourceID := src.ID
+		prev.SourceID = &sourceID
+	}
 	if err := e.Store.UpsertFact(ctx, prev); err != nil {
 		return applied{}, err
 	}

@@ -1,0 +1,33 @@
+# Standing retrieval-eval subset: 30 questions from longmemeval_s_cleaned,
+# stratified proportionally by question_type, ordered by sha256(question_id)
+# so the selection is reproducible and independent of file order.
+00ca467f	multi-session
+06878be2	single-session-preference
+07741c45	knowledge-update
+09ba9854	multi-session
+1d4da289	single-session-assistant
+2c63a862	temporal-reasoning
+36580ce8	single-session-user
+4f54b7c9	multi-session
+54026fce	single-session-preference
+58bf7951	single-session-user
+6071bd76	knowledge-update
+6456829e	multi-session
+70b3e69b	single-session-assistant
+720133ac	multi-session
+80ec1f4f_abs	multi-session
+a08a253f	multi-session
+a2f3aa27	knowledge-update
+ad7109d1	single-session-user
+b6019101	knowledge-update
+bcbe585f	temporal-reasoning
+c4f10528	single-session-assistant
+c6853660	knowledge-update
+c8c3f81d	single-session-user
+gpt4_4edbafa2	temporal-reasoning
+gpt4_6ed717ea	temporal-reasoning
+gpt4_7fce9456	multi-session
+gpt4_93f6379c	temporal-reasoning
+gpt4_cd90e484	temporal-reasoning
+gpt4_d31cdae3	temporal-reasoning
+gpt4_e414231f	temporal-reasoning

@@ -1,0 +1,8 @@
+# Smoke subset: one question per question_type, same sha256(question_id)
+# ordering as subset-30.txt, so these 6 are the first of each stratum.
+07741c45	knowledge-update
+720133ac	multi-session
+c4f10528	single-session-assistant
+54026fce	single-session-preference
+58bf7951	single-session-user
+gpt4_d31cdae3	temporal-reasoning

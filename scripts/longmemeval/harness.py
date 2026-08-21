@@ -97,6 +97,7 @@ class Anamnesia:
         occurred_at: str | None,
         kind: str = "longmemeval-session",
         external_ref: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "user": user,
@@ -107,6 +108,8 @@ class Anamnesia:
             body["occurred_at"] = occurred_at
         if external_ref:
             body["external_ref"] = external_ref
+        if metadata:
+            body["metadata"] = metadata
         r = httpx.post(
             f"{self.base_url}/v1/ingest",
             json=body,
@@ -171,6 +174,59 @@ class Anamnesia:
         )
         r.raise_for_status()
         return r.json().get("hits") or []
+
+    def browse(self, domain: str, *, user: str) -> list[dict[str, Any]]:
+        """Every row of one domain for a user, paged."""
+        out: list[dict[str, Any]] = []
+        cursor = ""
+        while True:
+            params: dict[str, Any] = {"user": user, "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            r = httpx.get(
+                f"{self.base_url}/v1/{domain}",
+                params=params,
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            body = r.json()
+            out.extend(body.get("items") or [])
+            cursor = body.get("next_cursor") or ""
+            if not cursor:
+                return out
+
+    def config(self) -> list[dict[str, Any]]:
+        """The server's effective settings, as /v1/config reports them."""
+        r = httpx.get(
+            f"{self.base_url}/v1/config", headers=self._headers(), timeout=self.timeout
+        )
+        r.raise_for_status()
+        return r.json().get("items") or []
+
+    def sources(self, *, user: str) -> list[dict[str, Any]]:
+        """Every source row for one user, paged. Carries external_ref (the
+        session id the harness ingested under), the assigned source id, and
+        ops_produced, which is what separates a session the extractor
+        dropped from one it stored but retrieval failed to rank."""
+        out: list[dict[str, Any]] = []
+        cursor = ""
+        while True:
+            params = {"user": user, "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            r = httpx.get(
+                f"{self.base_url}/v1/sources",
+                params=params,
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            body = r.json()
+            out.extend(body.get("items") or [])
+            cursor = body.get("next_cursor") or ""
+            if not cursor:
+                return out
 
     def queue_pending(self, *, user: str) -> dict[str, int]:
         """Return current background-work counts for one user:
@@ -245,19 +301,42 @@ def _throttle(estimated_tokens: int) -> None:
         time.sleep(sleep_for)
 
 
-def call_llm(provider: str, model: str, system: str, user: str) -> str:
+def _chat_messages(system: str, user: str) -> list[dict[str, str]]:
+    """An empty `system` means send no system turn at all. The LongMemEval
+    judge prompt is a single user message, and prepending a persona to it
+    grades differently."""
+    msgs = []
+    if system:
+        msgs.append({"role": "system", "content": system})
+    msgs.append({"role": "user", "content": user})
+    return msgs
+
+
+def call_llm(
+    provider: str,
+    model: str,
+    system: str,
+    user: str,
+    *,
+    max_tokens: int = 1024,
+    temperature: float | None = None,
+) -> str:
     estimated = max(500, (len(system) + len(user)) // 4 + 600)
     _throttle(estimated)
     if provider == "anthropic":
         import anthropic
 
         client = anthropic.Anthropic()
-        msg = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": user}],
+        }
+        if system:
+            kwargs["system"] = system
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        msg = client.messages.create(**kwargs)
         parts = [b.text for b in msg.content if getattr(b, "type", "") == "text"]
         return "".join(parts).strip()
     if provider == "openai":
@@ -266,11 +345,9 @@ def call_llm(provider: str, model: str, system: str, user: str) -> str:
         client = OpenAI()
         resp = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            max_tokens=1024,
+            messages=_chat_messages(system, user),
+            max_tokens=max_tokens,
+            **({} if temperature is None else {"temperature": temperature}),
         )
         return (resp.choices[0].message.content or "").strip()
     if provider == "openrouter":
@@ -289,11 +366,9 @@ def call_llm(provider: str, model: str, system: str, user: str) -> str:
         )
         resp = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            max_tokens=1024,
+            messages=_chat_messages(system, user),
+            max_tokens=max_tokens,
+            **({} if temperature is None else {"temperature": temperature}),
         )
         return (resp.choices[0].message.content or "").strip()
     raise ValueError(f"unknown provider: {provider}")
@@ -307,11 +382,24 @@ ANSWER_SYSTEM = (
     "reply exactly: I don't know."
 )
 
-JUDGE_SYSTEM = (
-    "You are a strict grader. Compare a model answer to a gold answer and decide "
-    "if the model answer is semantically correct. Respond with a single JSON "
-    'object: {"correct": true|false, "reason": "..."}. No prose outside the JSON.'
-)
+# Grading prompts copied verbatim from LongMemEval's own
+# src/evaluation/evaluate_qa.py (`get_anscheck_prompt`). A single generic
+# prompt is not comparable to any published LongMemEval number: it marks a
+# correct refusal on an abstention question wrong, grades preference
+# questions against a rubric as though it were a gold answer, and penalises
+# the off-by-one day errors upstream forgives.
+_JUDGE_STANDARD = "I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response is equivalent to the correct answer or contains all the intermediate steps to get the correct answer, you should also answer yes. If the response only contains a subset of the information required by the answer, answer no. \n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only."
+
+_JUDGE_TEMPLATES = {
+    "single-session-user": _JUDGE_STANDARD,
+    "single-session-assistant": _JUDGE_STANDARD,
+    "multi-session": _JUDGE_STANDARD,
+    "temporal-reasoning": "I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response is equivalent to the correct answer or contains all the intermediate steps to get the correct answer, you should also answer yes. If the response only contains a subset of the information required by the answer, answer no. In addition, do not penalize off-by-one errors for the number of days. If the question asks for the number of days/weeks/months, etc., and the model makes off-by-one errors (e.g., predicting 19 days when the answer is 18), the model's response is still correct. \n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only.",
+    "knowledge-update": "I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response contains some previous information along with an updated answer, the response should be considered as correct as long as the updated answer is the required answer.\n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only.",
+    "single-session-preference": "I will give you a question, a rubric for desired personalized response, and a response from a model. Please answer yes if the response satisfies the desired response. Otherwise, answer no. The model does not need to reflect all the points in the rubric. The response is correct as long as it recalls and utilizes the user's personal information correctly.\n\nQuestion: {}\n\nRubric: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only.",
+}
+
+_JUDGE_ABSTENTION = "I will give you an unanswerable question, an explanation, and a response from a model. Please answer yes if the model correctly identifies the question as unanswerable. The model could say that the information is incomplete, or some other information is given but the asked information is not.\n\nQuestion: {}\n\nExplanation: {}\n\nModel Response: {}\n\nDoes the model correctly identify the question as unanswerable? Answer yes or no only."
 
 EXPAND_SYSTEM = (
     "You generate retrieval sub-queries for a memory system. Given a question, "
@@ -381,6 +469,318 @@ def _date_only(rfc: str | None) -> str | None:
         return None
 
 
+# ---------- retrieval-only scoring ------------------------------------------
+#
+# LongMemEval labels every question with the haystack sessions holding its
+# evidence (`answer_session_ids`). The harness ingests one session per
+# /v1/ingest call with external_ref set to that session id, so /v1/sources
+# gives back session id -> source id and a hit's source_id resolves to a
+# session. That makes recall@k and MRR computable against gold with no
+# answerer and no judge, which is both far cheaper and far less noisy than
+# scoring the whole pipeline.
+
+
+def index_sources(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Index /v1/sources rows by the session id they were ingested under.
+    Rows with no external_ref were not written by this harness and cannot
+    be tied to a session, so they are dropped rather than collapsed under
+    an empty key."""
+    idx: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        ext = r.get("external_ref")
+        if not ext:
+            continue
+        idx[ext] = {
+            "id": r.get("id"),
+            "ops": r.get("ops_produced", 0),
+            "state": r.get("extraction_state", ""),
+        }
+    return idx
+
+
+def hit_source_ids(hits: list[dict[str, Any]]) -> list[str]:
+    """The sources behind a ranked hit list, best rank first and deduped.
+    Several facts extracted from one session are one retrieved source, not
+    several, or recall would count the same evidence more than once. Hits
+    with no source (a consolidation summary, say) cannot be scored against
+    source-granularity labels and are skipped."""
+    out: list[str] = []
+    seen = set()
+    for h in hits:
+        payload = h.get("experience") or h.get("fact") or {}
+        sid = payload.get("source_id")
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        out.append(sid)
+    return out
+
+
+def metric_ks(k: int) -> list[int]:
+    """Cutoffs to report for a run that asked for k hits. A cutoff above k
+    would label a metric computed over a truncated list with a k it never
+    got. Mirrors evalMetricKs in cmd/anamnesia/eval.go."""
+    ks = [v for v in (1, 5, 10, 20) if v <= k]
+    if k not in ks:
+        ks.append(k)
+    return sorted(ks)
+
+
+def score_retrieval(
+    ranked: list[str], gold: set[str], ks: list[int]
+) -> dict[str, Any]:
+    """recall@k and MRR for one question. Refuses a question with no gold:
+    scoring it 0.0 would drag the aggregate down with a labelling gap
+    rather than a retrieval failure."""
+    if not gold:
+        raise ValueError("cannot score a question with no gold sources")
+    recall = {k: len(gold & set(ranked[:k])) / len(gold) for k in ks}
+    mrr = 0.0
+    for i, sid in enumerate(ranked, 1):
+        if sid in gold:
+            mrr = 1.0 / i
+            break
+    return {
+        "recall": recall,
+        "mrr": mrr,
+        "found": len(gold & set(ranked)),
+        "gold": len(gold),
+    }
+
+
+def index_row_text(
+    facts: list[dict[str, Any]], experiences: list[dict[str, Any]]
+) -> tuple[dict[str, str], str]:
+    """Group what was stored by the source it is attributed to, and return
+    the whole corpus alongside. Rows whose provenance is missing still
+    count toward the corpus: they prove the content was captured, which is
+    what separates answer_elsewhere from answer_missing."""
+    by_source: dict[str, list[str]] = {}
+    corpus: list[str] = []
+    for f in facts:
+        text = f"{f.get('key', '')} {json.dumps(f.get('value'))}"
+        corpus.append(text)
+        if sid := f.get("source_id"):
+            by_source.setdefault(sid, []).append(text)
+    for e in experiences:
+        text = f"{e.get('title') or ''} {e.get('body') or ''}"
+        corpus.append(text)
+        if sid := e.get("source_id"):
+            by_source.setdefault(sid, []).append(text)
+    return {k: " ".join(v) for k, v in by_source.items()}, " ".join(corpus)
+
+
+_TERM_STOPWORDS = {
+    "the", "a", "an", "of", "to", "in", "for", "and", "or", "is", "was",
+    "were", "be", "with", "on", "at", "his", "her", "their", "they", "that",
+    "this", "it", "as", "by", "from", "you", "your",
+}
+
+
+def answer_terms(answer: str) -> set[str]:
+    """Content words of a gold answer: what has to survive extraction for
+    the answer to be recoverable at all."""
+    # Not every gold answer is a string: counts arrive as ints. A bare "2"
+    # yields no term worth searching for, and an empty set is the right
+    # answer there — classify_evidence falls back to its coarse verdict
+    # rather than blaming the write path for a labelling limitation.
+    words = re.findall(r"[a-z0-9]+", str(answer if answer is not None else "").lower())
+    return {w for w in words if len(w) >= 3 and w not in _TERM_STOPWORDS}
+
+
+def bears_answer(text: str, terms: set[str]) -> bool:
+    """Whether any of the answer's content words survived into this text.
+
+    Deliberately lenient. It backs a claim that the write path dropped
+    something, and the extractor paraphrases heavily, so the bar for
+    "kept" is one surviving content word. That under-reports write-path
+    misses and never over-reports them: if this says the answer is gone,
+    not one word of it is there."""
+    low = (text or "").lower()
+    return any(t in low for t in terms)
+
+
+def classify_evidence(
+    gold_sessions: list[str],
+    index: dict[str, dict[str, Any]],
+    retrieved: set[str],
+    *,
+    terms: set[str] | None = None,
+    source_text: dict[str, str] | None = None,
+    corpus_text: str = "",
+) -> dict[str, str]:
+    """Why each gold session did or did not reach the answerer.
+
+    This is the attribution the end-to-end score cannot give. Pass the
+    gold answer's `terms` plus the text of what was stored to separate the
+    three ways a miss happens, which need opposite fixes:
+
+      stored_not_retrieved  rows carry the answer and did not rank -> ranking
+      answer_elsewhere      rows carry it, but under another source -> provenance
+      answer_missing        no row anywhere carries it             -> extraction
+
+    Without `terms` the older, coarser verdicts stand: LoCoMo has no gold
+    answer to check, and ops_produced alone cannot tell these apart."""
+    source_text = source_text or {}
+    out: dict[str, str] = {}
+    for s in gold_sessions:
+        row = index.get(s)
+        if row is None:
+            out[s] = "not_ingested"
+        elif row["id"] in retrieved:
+            # An actual hit outranks a disagreeing ops_produced: something
+            # demonstrably ranked, so it was stored.
+            out[s] = "retrieved"
+        elif not row["ops"]:
+            out[s] = "not_stored"
+        elif not terms:
+            out[s] = "stored_not_retrieved"
+        elif bears_answer(source_text.get(s, ""), terms):
+            out[s] = "stored_not_retrieved"
+        elif bears_answer(corpus_text, terms):
+            out[s] = "answer_elsewhere"
+        else:
+            out[s] = "answer_missing"
+    return out
+
+
+EVIDENCE_STATUSES = (
+    "retrieved",
+    "stored_not_retrieved",
+    "answer_elsewhere",
+    "answer_missing",
+    "not_stored",
+    "not_ingested",
+)
+
+
+def fold_retrieval(
+    acc: dict[str, Any], score: dict[str, Any], evidence: dict[str, str]
+) -> None:
+    """Accumulate one question's retrieval score and evidence verdicts."""
+    acc["questions"] = acc.get("questions", 0) + 1
+    totals = acc.setdefault("_recall_sum", {})
+    for k, v in score["recall"].items():
+        totals[k] = totals.get(k, 0.0) + v
+    acc["_mrr_sum"] = acc.get("_mrr_sum", 0.0) + score["mrr"]
+    ev = acc.setdefault("evidence", {s: 0 for s in EVIDENCE_STATUSES})
+    for status in evidence.values():
+        ev[status] = ev.get(status, 0) + 1
+    n = acc["questions"]
+    acc["recall"] = {k: v / n for k, v in totals.items()}
+    acc["mrr"] = acc["_mrr_sum"] / n
+
+
+def format_retrieval_summary(acc: dict[str, Any]) -> list[str]:
+    """Render the retrieval score. Empty when nothing was scored."""
+    n = acc.get("questions", 0)
+    if not n:
+        return []
+    lines = ["", f"--- retrieval vs gold evidence ({n} questions) ---"]
+    for k in sorted(acc["recall"]):
+        lines.append(f"  {'recall@' + str(k):30s} {acc['recall'][k]:.3f}")
+    lines.append(f"  {'MRR':30s} {acc['mrr']:.3f}")
+    if acc.get("unscored"):
+        lines.append(
+            f"  {'unscored questions':30s} {acc['unscored']}  "
+            f"(gold evidence absent from the store: an ingest or labelling gap, not a ranking failure)"
+        )
+    ev = acc.get("evidence", {})
+    total = sum(ev.values())
+    if total:
+        lines.append("")
+        lines.append(f"  gold evidence sessions: {total}")
+        for s in EVIDENCE_STATUSES:
+            c = ev.get(s, 0)
+            lines.append(f"  {s:30s} {c}  ({100*c/total:.1f}%)")
+    return lines
+
+
+# ---------- graph sources ----------------------------------------------------
+#
+# Extractor.Run dispatches to the graph pass only for sources of kind
+# "claude-session-graph"; everything else takes the fact/experience path.
+# Ingesting sessions alone therefore leaves entities and edges empty no
+# matter how graph.extract is set, and the channel summary then reports
+# "graph 0%" for a pass that never ran. cmd/anamnesia/hook.go posts an
+# extra graph source per checkpoint, and this mirrors it per session.
+
+GRAPH_SOURCE_KIND = "claude-session-graph"
+
+
+def config_flags(items: list[dict[str, Any]]) -> dict[str, str]:
+    """Flatten /v1/config into key -> value."""
+    return {i["key"]: i.get("value", "") for i in items if "key" in i}
+
+
+def graph_enabled(flags: dict[str, str]) -> bool:
+    """Whether the server runs the graph pass. Read from the server rather
+    than taken as a flag, because a harness that posts graph sources the
+    server ignores (or omits ones it wants) is the exact failure this
+    guards: graph.extract on, zero entities, and nothing saying why."""
+    return str(flags.get("graph.extract", "")).lower() == "true"
+
+
+CHANNEL_KEYS = ("hits", "vector", "lexical", "graph", "graph_only", "reranked")
+
+
+def hit_channels(hits: list[dict[str, Any]]) -> dict[str, int]:
+    """Which retrieval channels surfaced this question's hits.
+
+    /v1/retrieve stamps each hit with a 1-based rank per channel and omits
+    the field when that channel did not reach it, so a missing key is a
+    zero. `graph_only` is the number worth watching: hits neither the
+    vector nor the lexical channel found, which is the only evidence that
+    walking the graph earned its keep rather than re-finding what ANN and
+    tsvector already had."""
+    out = {k: 0 for k in CHANNEL_KEYS}
+    out["hits"] = len(hits)
+    for h in hits:
+        vector = h.get("vector_rank", 0)
+        lexical = h.get("lexical_rank", 0)
+        graph = h.get("graph_rank", 0)
+        if vector:
+            out["vector"] += 1
+        if lexical:
+            out["lexical"] += 1
+        if graph:
+            out["graph"] += 1
+            if not vector and not lexical:
+                out["graph_only"] += 1
+        if h.get("reranker_rank", 0):
+            out["reranked"] += 1
+    return out
+
+
+def fold_channels(acc: dict[str, int], ch: dict[str, int]) -> None:
+    """Accumulate one question's channel counts into a run total."""
+    for k in CHANNEL_KEYS:
+        acc[k] = acc.get(k, 0) + ch.get(k, 0)
+    acc["questions"] = acc.get("questions", 0) + 1
+    acc["questions_with_graph"] = acc.get("questions_with_graph", 0) + (
+        1 if ch.get("graph") else 0
+    )
+
+
+def format_channel_summary(channels: dict[str, int]) -> list[str]:
+    """Render the run's channel totals. Empty when nothing was retrieved,
+    so a run where every question errored prints no table of zeroes."""
+    n = channels.get("hits", 0)
+    if not n:
+        return []
+    lines = ["", "--- retrieval channels ---", f"  {'hits shown to answerer':30s} {n}"]
+    for k in ("vector", "lexical", "graph", "graph_only", "reranked"):
+        v = channels.get(k, 0)
+        lines.append(f"  {k:30s} {v}  ({100*v/n:.1f}% of hits)")
+    qs = channels.get("questions", 0)
+    g = channels.get("questions_with_graph", 0)
+    if qs:
+        lines.append(
+            f"  {'questions with a graph hit':30s} {g}/{qs}  ({100*g/qs:.1f}%)"
+        )
+    return lines
+
+
 def render_hits(hits: list[dict[str, Any]]) -> str:
     if not hits:
         return "(no memory snippets retrieved)"
@@ -432,17 +832,41 @@ def answer_question(
     return call_llm(provider, model, system, user)
 
 
+def is_abstention(question_id: str) -> bool:
+    """LongMemEval suffixes the abstention variant of a question with
+    `_abs`. For those the `answer` field holds an explanation of why the
+    question cannot be answered, not an answer, and the only correct model
+    response is a refusal."""
+    return "_abs" in question_id
+
+
+def get_anscheck_prompt(
+    task: str, question: str, answer: str, response: str, abstention: bool = False
+) -> str:
+    """Upstream raises NotImplementedError on an unrecognised task. This
+    harness also runs LoCoMo, whose categories are not LongMemEval tasks,
+    so an unknown task falls back to the standard recall prompt."""
+    if abstention:
+        return _JUDGE_ABSTENTION.format(question, answer, response)
+    return _JUDGE_TEMPLATES.get(task, _JUDGE_STANDARD).format(question, answer, response)
+
+
 def judge_answer(
-    *, provider: str, model: str, question: str, gold: str, predicted: str
+    *,
+    provider: str,
+    model: str,
+    question: str,
+    gold: str,
+    predicted: str,
+    question_type: str,
+    abstention: bool,
 ) -> dict[str, Any]:
-    user = (
-        f"Question: {question}\n\nGold answer: {gold}\n\nModel answer: {predicted}"
-    )
-    raw = call_llm(provider, model, JUDGE_SYSTEM, user)
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {"correct": False, "reason": f"unparseable judge output: {raw!r}"}
+    prompt = get_anscheck_prompt(question_type, question, gold, predicted, abstention)
+    # max_tokens/temperature match upstream: the verdict is read as
+    # `'yes' in response`, which only holds when the grader cannot write
+    # an explanation for a 'no' that happens to contain the word 'yes'.
+    raw = call_llm(provider, model, "", prompt, max_tokens=10, temperature=0)
+    return {"correct": "yes" in raw.lower(), "reason": raw}
 
 
 # ---------- Dataset loading -------------------------------------------------
@@ -480,6 +904,8 @@ def run_question(
     generate_model: str,
     judge_provider: str,
     judge_model: str,
+    mode: str = "end-to-end",
+    graph_source: bool = False,
 ) -> dict[str, Any]:
     # `user_id` on the question (LoCoMo path) overrides the per-question
     # user-prefix scheme; LongMemEval still uses lme-<question_id>.
@@ -505,12 +931,27 @@ def run_question(
                     title=ext,
                 )
             else:
-                anam.ingest(
+                resp = anam.ingest(
                     user=user,
                     content=content,
                     occurred_at=occ,
                     external_ref=ext,
                 )
+                if graph_source:
+                    # One graph source per session, mirroring hook.go's
+                    # per-checkpoint post. segment_source_ids is what ties
+                    # the entity mentions to a source a search hit can
+                    # carry; without it the graph is populated and
+                    # unreachable.
+                    sid = (resp or {}).get("source_id")
+                    anam.ingest(
+                        user=user,
+                        content=content,
+                        kind=GRAPH_SOURCE_KIND,
+                        occurred_at=occ,
+                        external_ref=f"{ext}-graph" if ext else None,
+                        metadata={"segment_source_ids": [sid] if sid else []},
+                    )
 
         # Queue poll is only meaningful for the async-extract path. Raw
         # mode is fully synchronous — retrieval is warm the moment the
@@ -546,6 +987,50 @@ def run_question(
             now_date = _date_only(to_rfc3339(d))
             if now_date:
                 break
+
+    if mode == "retrieval":
+        # Score the ranking against the gold evidence sessions and stop.
+        # No answerer, no judge: two fewer model calls per question, and
+        # two fewer sources of variance between runs.
+        gold_sessions = q.get("answer_session_ids") or []
+        if not gold_sessions:
+            raise ValueError(
+                f"{q['question_id']}: no answer_session_ids, so retrieval "
+                f"cannot be scored (is this a LongMemEval dataset?)"
+            )
+        index = index_sources(anam.sources(user=user))
+        ranked = hit_source_ids(hits)
+        gold_ids = {
+            index[s]["id"] for s in gold_sessions if s in index and index[s]["id"]
+        }
+        # What was actually stored, so a miss can be attributed to ranking,
+        # to provenance, or to extraction having dropped the answer.
+        by_source, corpus = index_row_text(
+            anam.browse("facts", user=user), anam.browse("experiences", user=user)
+        )
+        evidence = classify_evidence(
+            gold_sessions,
+            index,
+            set(ranked),
+            terms=answer_terms(q.get("answer", "")),
+            source_text={
+                s: by_source.get(index[s]["id"], "") for s in gold_sessions if s in index
+            },
+            corpus_text=corpus,
+        )
+        result = {
+            "question_id": q["question_id"],
+            "question_type": q.get("question_type", "unknown"),
+            "abstention": is_abstention(q["question_id"]),
+            "channels": hit_channels(hits),
+            "question": q["question"],
+            "evidence": evidence,
+            "hits": hits,
+        }
+        if gold_ids:
+            result["score"] = score_retrieval(ranked, gold_ids, metric_ks(retrieve_k))
+        return result
+
     predicted = answer_question(
         provider=generate_provider,
         model=generate_model,
@@ -553,16 +1038,21 @@ def run_question(
         hits=hits,
         now_date=now_date,
     )
+    abstention = is_abstention(q["question_id"])
     verdict = judge_answer(
         provider=judge_provider,
         model=judge_model,
         question=q["question"],
         gold=q["answer"],
         predicted=predicted,
+        question_type=q.get("question_type", "unknown"),
+        abstention=abstention,
     )
     return {
         "question_id": q["question_id"],
         "question_type": q.get("question_type", "unknown"),
+        "abstention": abstention,
+        "channels": hit_channels(hits),
         "question": q["question"],
         "gold": q["answer"],
         "predicted": predicted,
@@ -716,6 +1206,12 @@ def main(argv: list[str]) -> int:
         help="extract = POST /v1/ingest, run LLM extractor, retrieve facts/experiences (Anamnesia's full pipeline). raw = POST /v1/experience for each session, embed inline, no extractor, no queue poll — gives you a pure RAG baseline for comparison.",
     )
     ap.add_argument(
+        "--mode",
+        choices=["end-to-end", "retrieval"],
+        default="end-to-end",
+        help="end-to-end = retrieve, answer, judge (the benchmark score). retrieval = score the ranking directly against each question's answer_session_ids and stop, with no answerer and no judge. Far cheaper and far less noisy, and it separates a session the extractor never stored from one retrieval failed to rank. LongMemEval datasets only.",
+    )
+    ap.add_argument(
         "--dataset-format",
         choices=["longmemeval", "locomo"],
         default="longmemeval",
@@ -739,7 +1235,11 @@ def main(argv: list[str]) -> int:
         choices=["anthropic", "openai", "openrouter"],
         default="openai",
     )
-    ap.add_argument("--judge-model", default="gpt-4o-mini")
+    ap.add_argument(
+        "--judge-model",
+        default="gpt-4o",
+        help="published LongMemEval numbers are graded with gpt-4o; changing this makes a run incomparable to them, so disclose it alongside the score",
+    )
     ap.add_argument(
         "--out", type=Path, required=True, help="JSONL output path for per-question results"
     )
@@ -751,6 +1251,24 @@ def main(argv: list[str]) -> int:
     anam = Anamnesia(base_url=args.base_url.rstrip("/"), token=args.token)
     anam.health()
 
+    # Mirror the server's graph setting rather than taking it as a flag.
+    # graph.extract on with no graph sources posted is a silent zero: the
+    # pass never runs, and the channel summary reports "graph 0%" as
+    # though the graph had been measured and found wanting.
+    graph_source = graph_enabled(config_flags(anam.config()))
+    print(
+        f"graph.extract is {'on' if graph_source else 'off'} on the server: "
+        f"{'posting' if graph_source else 'not posting'} a {GRAPH_SOURCE_KIND} "
+        f"source per session",
+        file=sys.stderr,
+    )
+    if graph_source and args.ingest_mode == "raw":
+        print(
+            "  note: --ingest-mode raw bypasses the extractor entirely, so no "
+            "graph pass runs regardless",
+            file=sys.stderr,
+        )
+
     dataset = load_dataset(args.dataset)
     print(
         f"loaded {len(dataset)} {args.dataset_format} entries from {args.dataset}",
@@ -760,6 +1278,17 @@ def main(argv: list[str]) -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     correct_by_type: dict[str, int] = defaultdict(int)
     total_by_type: dict[str, int] = defaultdict(int)
+    # Abstention questions keep their parent question_type in the buckets
+    # above, matching upstream. These two track them as their own ability,
+    # which is the only way to see whether the answerer refuses or invents.
+    correct_abs = 0
+    total_abs = 0
+    # Which retrieval channels actually fed the answerer, summed over
+    # every question that got as far as retrieving.
+    channels: dict[str, int] = {}
+    # --mode retrieval: recall/MRR against gold evidence, and why each gold
+    # session did or did not reach the answerer.
+    retrieval: dict[str, Any] = {}
 
     if args.dataset_format == "locomo":
         questions = list(iter_questions_locomo(dataset, args.limit, args.types, args.user_prefix))
@@ -813,6 +1342,8 @@ def main(argv: list[str]) -> int:
                     generate_model=args.generate_model,
                     judge_provider=args.judge_provider,
                     judge_model=args.judge_model,
+                    mode=args.mode,
+                    graph_source=graph_source,
                 )
                 if not args.skip_ingest:
                     ingested_users.add(q_user)
@@ -820,40 +1351,84 @@ def main(argv: list[str]) -> int:
                 result = {
                     "question_id": q.get("question_id"),
                     "question_type": q.get("question_type"),
+                    "abstention": is_abstention(q.get("question_id") or ""),
                     "error": repr(e),
                     "correct": False,
                 }
             out.write(json.dumps(result) + "\n")
             out.flush()
             t = result.get("question_type") or "unknown"
-            total_by_type[t] += 1
-            if result.get("correct"):
-                correct_by_type[t] += 1
-            running_correct = sum(correct_by_type.values())
-            running_total = sum(total_by_type.values())
-            running_acc = 100.0 * running_correct / running_total if running_total else 0.0
+            if result.get("channels"):
+                fold_channels(channels, result["channels"])
             q_secs = time.monotonic() - q_started
-            mark = "✓" if result.get("correct") else "✗"
             err_tag = " ERROR" if result.get("error") else ""
-            print(
-                f"[{idx}/{total_questions}] {mark} {result.get('question_id')} [{t}] "
-                f"took={fmt_secs(q_secs)} acc={running_acc:.1f}% "
-                f"({running_correct}/{running_total}){err_tag}",
-                file=sys.stderr,
-                flush=True,
-            )
+
+            if args.mode == "retrieval":
+                # No judge ran, so there is no ✓/✗ to show: report the
+                # question's own recall and the running mean instead.
+                if result.get("score"):
+                    fold_retrieval(
+                        retrieval, result["score"], result.get("evidence") or {}
+                    )
+                elif not result.get("error"):
+                    retrieval["unscored"] = retrieval.get("unscored", 0) + 1
+                top = max(retrieval.get("recall") or {0: 0}) or 0
+                here = (result.get("score") or {}).get("recall", {}).get(top)
+                running = (retrieval.get("recall") or {}).get(top)
+                print(
+                    f"[{idx}/{total_questions}] {result.get('question_id')} [{t}] "
+                    f"took={fmt_secs(q_secs)} "
+                    f"r@{top}={'--' if here is None else f'{here:.2f}'} "
+                    f"mean={'--' if running is None else f'{running:.3f}'}{err_tag}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                total_by_type[t] += 1
+                if result.get("correct"):
+                    correct_by_type[t] += 1
+                if result.get("abstention"):
+                    total_abs += 1
+                    if result.get("correct"):
+                        correct_abs += 1
+                running_correct = sum(correct_by_type.values())
+                running_total = sum(total_by_type.values())
+                running_acc = (
+                    100.0 * running_correct / running_total if running_total else 0.0
+                )
+                mark = "✓" if result.get("correct") else "✗"
+                print(
+                    f"[{idx}/{total_questions}] {mark} {result.get('question_id')} [{t}] "
+                    f"took={fmt_secs(q_secs)} acc={running_acc:.1f}% "
+                    f"({running_correct}/{running_total}){err_tag}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    for line in format_retrieval_summary(retrieval):
+        print(line, file=sys.stderr)
 
     total = sum(total_by_type.values())
     correct = sum(correct_by_type.values())
-    print("\n--- accuracy by question_type ---", file=sys.stderr)
+    if total:
+        print("\n--- accuracy by question_type ---", file=sys.stderr)
     for t in sorted(total_by_type):
         c, n = correct_by_type[t], total_by_type[t]
         print(f"  {t:30s} {c}/{n}  ({100*c/n:.1f}%)", file=sys.stderr)
+    if total_abs:
+        print(
+            f"  {'(abstention, also above)':30s} {correct_abs}/{total_abs}  "
+            f"({100*correct_abs/total_abs:.1f}%)",
+            file=sys.stderr,
+        )
     if total:
         print(
             f"  {'OVERALL':30s} {correct}/{total}  ({100*correct/total:.1f}%)",
             file=sys.stderr,
         )
+
+    for line in format_channel_summary(channels):
+        print(line, file=sys.stderr)
     return 0
 
 

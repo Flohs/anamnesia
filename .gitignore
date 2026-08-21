@@ -12,6 +12,7 @@
 
 # Benchmark inputs (downloadable, longmemeval_s.json is ~278MB)
 /data/
+/scripts/longmemeval/*.json
 
 # Benchmark run artifacts
 /out/

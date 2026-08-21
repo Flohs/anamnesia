@@ -170,6 +170,8 @@ var settings = []setting{
 		Doc: "How often experience relevance is recomputed."},
 	{Key: "worker.consolidate_every", Kind: kDuration, Def: "24h", Env: "ANAMNESIA_CONSOLIDATE_EVERY",
 		Doc: "How often similar experiences are clustered and distilled."},
+	{Key: "worker.extract_concurrency", Kind: kInt, Def: "1", Env: "ANAMNESIA_EXTRACT_CONCURRENCY",
+		Doc: "How many sources the extractor works on at once. Extraction is mostly waiting on the model, so raising this is close to a linear speedup and does not cost more tokens. It does change what is extracted: sources handled together stop seeing each other's facts as merge candidates, so a bulk backfill of related sessions can produce duplicates a serial drain would have merged. Raise it for benchmarks and backfills; leave it at 1 for a live install where dedup matters more than throughput."},
 	{Key: "worker.extract_commitments", Kind: kBool, Def: "false", Env: "ANAMNESIA_EXTRACT_COMMITMENTS",
 		Doc: "Also record open obligations (\"I'll send X by Friday\") in the commitments ledger."},
 

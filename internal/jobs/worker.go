@@ -19,6 +19,7 @@ import (
 	"github.com/flohs/anamnesia/internal/llm"
 	"github.com/flohs/anamnesia/internal/retrieval"
 	"github.com/flohs/anamnesia/internal/store"
+	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
 // Config governs the worker loop cadence.
@@ -29,10 +30,17 @@ type Config struct {
 	ConsolidateEvery time.Duration
 	ExtractEvery     time.Duration
 	ExtractBatch     int
-	EmbedBatch       int
-	Consolidate      ConsolidateConfig
-	Decay            decay.Config
-	Extract          extract.Config
+	// ExtractConcurrency is how many sources in a batch are extracted at
+	// once. Extraction is mostly network wait, so this is close to a
+	// linear speedup. It is not free of meaning: sources in one batch
+	// stop seeing each other's facts as merge candidates, so a bulk
+	// backfill of related sessions can produce duplicates a serial drain
+	// would have merged. Default 1, which is what it did before.
+	ExtractConcurrency int
+	EmbedBatch         int
+	Consolidate        ConsolidateConfig
+	Decay              decay.Config
+	Extract            extract.Config
 }
 
 // Worker holds the dependencies for the background loops.
@@ -253,25 +261,38 @@ func (w *Worker) tickExtract(ctx context.Context) (string, error) {
 		Log:       w.Log,
 		Activity:  w.Activity,
 	}
-	operations, failed := 0, 0
-	for _, src := range pending {
+	// Per-source outcomes land in a preallocated slice by index, so the
+	// aggregation below needs no lock however many workers ran.
+	type outcome struct {
+		ops    int
+		failed bool
+	}
+	outcomes := make([]outcome, len(pending))
+	forEachLimited(ctx, pending, w.Cfg.ExtractConcurrency, func(ctx context.Context, i int, src *anamnesia.Source) {
 		ops, err := ex.Run(ctx, src)
 		if err != nil {
-			failed++
+			outcomes[i] = outcome{failed: true}
 			if w.Log != nil {
 				w.Log.Warn("extract failed", "source", src.ID, "err", err)
 			}
 			_ = w.Store.MarkFailed(ctx, src.ID, err.Error())
-			continue
+			return
 		}
 		if ops == 0 {
 			_ = w.Store.MarkSkipped(ctx, src.ID)
 		} else {
 			_ = w.Store.MarkExtracted(ctx, src.ID, ops)
 		}
-		operations += ops
+		outcomes[i] = outcome{ops: ops}
 		if w.Log != nil && ops > 0 {
 			w.Log.Info("extracted", "source", src.ID, "kind", src.Kind, "ops", ops)
+		}
+	})
+	operations, failed := 0, 0
+	for _, o := range outcomes {
+		operations += o.ops
+		if o.failed {
+			failed++
 		}
 	}
 	w.publishQueues(ctx)
