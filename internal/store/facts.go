@@ -83,8 +83,25 @@ func (s *Store) UpsertFact(ctx context.Context, f *anamnesia.Fact) error {
 				END,
 				trust       = EXCLUDED.trust,
 				pii_tags    = EXCLUDED.pii_tags,
-				embedding   = COALESCE(EXCLUDED.embedding, facts.embedding),
-				embed_model = COALESCE(EXCLUDED.embed_model, facts.embed_model),
+				-- A changed value invalidates the old vector. Keeping it
+				-- leaves a row whose text says one thing and whose
+				-- embedding says another, and nothing ever repairs that:
+				-- the extractor never supplies an embedding, and the
+				-- backfill worker only looks for rows WHERE embedding IS
+				-- NULL. So the row would stay findable by vector search
+				-- only under wording it no longer has. Clearing it hands
+				-- the row to that worker. When the caller does bring a
+				-- vector for the new value, that one is used.
+				embedding   = CASE
+					WHEN facts.value IS DISTINCT FROM EXCLUDED.value
+						THEN EXCLUDED.embedding
+					ELSE COALESCE(EXCLUDED.embedding, facts.embedding)
+				END,
+				embed_model = CASE
+					WHEN facts.value IS DISTINCT FROM EXCLUDED.value
+						THEN EXCLUDED.embed_model
+					ELSE COALESCE(EXCLUDED.embed_model, facts.embed_model)
+				END,
 				ingested_at = EXCLUDED.ingested_at
 			RETURNING id`,
 			f.Scope.UserID, f.Scope.ProjectID, f.SourceID, string(f.FactKind), f.Key, string(valueJSON),
