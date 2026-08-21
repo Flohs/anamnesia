@@ -87,7 +87,7 @@ func TestANoOpUpdateDoesNotStealProvenance(t *testing.T) {
 // the correct owner. Without this, the fix above could be "never move
 // provenance", which would be just as wrong in the opposite direction.
 func TestAnUpdateThatChangesTheValueTakesProvenance(t *testing.T) {
-	st, _, _, srcB, factID := provenanceFixture(t)
+	st, scope, _, srcB, factID := provenanceFixture(t)
 	ctx := context.Background()
 	ex := &Extractor{Store: st}
 
@@ -96,16 +96,23 @@ func TestAnUpdateThatChangesTheValueTakesProvenance(t *testing.T) {
 		t.Fatalf("updateFact: %v", err)
 	}
 
-	got, err := st.GetFact(ctx, factID)
-	if err != nil {
-		t.Fatalf("get fact: %v", err)
+	// Since migration 0010 a changed value becomes a new row, so the
+	// assertion is about the current one; factID now names the superseded
+	// version, which keeps the value and source that authored it.
+	var gotSrc uuid.UUID
+	var gotVal string
+	if err := st.Pool.QueryRow(ctx, `
+		SELECT source_id, value->>'v' FROM facts
+		WHERE user_id = $1 AND key = 'user.bike_type'
+		  AND deleted_at IS NULL AND superseded_by IS NULL`,
+		scope.UserID).Scan(&gotSrc, &gotVal); err != nil {
+		t.Fatalf("read current row: %v", err)
 	}
-	if got.SourceID == nil || *got.SourceID != srcB.ID {
-		t.Errorf("source_id = %v, want source B (%v): the new value came from B",
-			got.SourceID, srcB.ID)
+	if gotSrc != srcB.ID {
+		t.Errorf("current source_id = %v, want source B (%v): the new value came from B", gotSrc, srcB.ID)
 	}
-	if v, _ := got.Value["v"].(string); v != "road bike" {
-		t.Errorf("value = %q, want the updated value", v)
+	if gotVal != "road bike" {
+		t.Errorf("current value = %q, want the updated value", gotVal)
 	}
 }
 

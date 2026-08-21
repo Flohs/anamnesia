@@ -87,7 +87,7 @@ func (s *Store) Stats(ctx context.Context, scope anamnesia.Scope) (*StatsResult,
 		live  string
 		into  *int
 	}{
-		{"facts", "deleted_at IS NULL", &out.Facts},
+		{"facts", "deleted_at IS NULL AND superseded_by IS NULL", &out.Facts},
 		{"experiences", "deleted_at IS NULL", &out.Experiences},
 		{"skills", "deleted_at IS NULL", &out.Skills},
 		{"working_memory", "", &out.WorkingMemory},

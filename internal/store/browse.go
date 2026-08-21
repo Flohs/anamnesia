@@ -156,6 +156,9 @@ func (s *Store) BrowseFacts(ctx context.Context, b Browse) ([]*anamnesia.Fact, s
 	where := q.scoped(b.Scope, "")
 	if !b.IncludeDeleted {
 		where = append(where, "deleted_at IS NULL")
+		// Superseded values are history, not memory. They are reachable
+		// through retrieval with include_history.
+		where = append(where, "superseded_by IS NULL")
 	}
 	if b.FactScope != "" {
 		where = append(where, "fact_scope = "+q.ph(b.FactScope))

@@ -72,6 +72,13 @@ type Query struct {
 	// once per ingested source. Leave false for /v1/retrieve, where the
 	// order is what reaches the model.
 	SkipRerank bool
+	// IncludeHistory, when true, lets superseded fact values into the
+	// candidate set alongside current ones. Off by default, and the
+	// hooks that inject memory into every prompt leave it off: an agent
+	// shown "cycles to work" and "takes the tram" in one context has to
+	// work out which is true. Set it when the question is about the past
+	// ("what did I use to..."), where the old value IS the answer.
+	IncludeHistory bool
 	// Trace, when set, records the stages of this search: what was
 	// searched for, what each half returned, how fusion ranked it and
 	// what the reranker did to that order.
@@ -196,13 +203,13 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 		switch d {
 		case anamnesia.DomainFact:
 			if qvec != nil {
-				hits, err := e.vectorFacts(ctx, q.Scope, qvec, q.VectorK)
+				hits, err := e.vectorFacts(ctx, q.Scope, qvec, q.VectorK, q.IncludeHistory)
 				if err != nil {
 					return nil, fmt.Errorf("vector facts: %w", err)
 				}
 				add(d, hits, true)
 			}
-			hits, err := e.lexicalFacts(ctx, q.Scope, q.Text, q.LexicalK)
+			hits, err := e.lexicalFacts(ctx, q.Scope, q.Text, q.LexicalK, q.IncludeHistory)
 			if err != nil {
 				return nil, fmt.Errorf("lex facts: %w", err)
 			}
@@ -407,9 +414,12 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 	return out, nil
 }
 
-func (e *Engine) vectorFacts(ctx context.Context, scope anamnesia.Scope, qvec []float32, k int) ([]anamnesia.SearchHit, error) {
+func (e *Engine) vectorFacts(ctx context.Context, scope anamnesia.Scope, qvec []float32, k int, includeHistory bool) ([]anamnesia.SearchHit, error) {
 	args := []any{scope.UserID, pgvector.NewVector(qvec)}
 	where := []string{"user_id = $1", "deleted_at IS NULL", "embedding IS NOT NULL"}
+	if !includeHistory {
+		where = append(where, "superseded_by IS NULL")
+	}
 	if scope.ProjectID != nil {
 		args = append(args, *scope.ProjectID)
 		where = append(where, fmt.Sprintf("(project_id = $%d OR project_id IS NULL)", len(args)))
@@ -425,12 +435,15 @@ func (e *Engine) vectorFacts(ctx context.Context, scope anamnesia.Scope, qvec []
 	return e.scanFactHits(ctx, q, args)
 }
 
-func (e *Engine) lexicalFacts(ctx context.Context, scope anamnesia.Scope, text string, k int) ([]anamnesia.SearchHit, error) {
+func (e *Engine) lexicalFacts(ctx context.Context, scope anamnesia.Scope, text string, k int, includeHistory bool) ([]anamnesia.SearchHit, error) {
 	if strings.TrimSpace(text) == "" {
 		return nil, nil
 	}
 	args := []any{scope.UserID, text}
 	where := []string{"user_id = $1", "deleted_at IS NULL", "tsv @@ plainto_tsquery('english', $2)"}
+	if !includeHistory {
+		where = append(where, "superseded_by IS NULL")
+	}
 	if scope.ProjectID != nil {
 		args = append(args, *scope.ProjectID)
 		where = append(where, fmt.Sprintf("(project_id = $%d OR project_id IS NULL)", len(args)))

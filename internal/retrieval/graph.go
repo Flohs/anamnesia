@@ -229,7 +229,7 @@ func (e *Engine) hitsForSources(ctx context.Context, scope anamnesia.Scope, sour
 	var out []anamnesia.SearchHit
 	if wantFacts {
 		args := []any{sourceIDs, scope.UserID}
-		where := []string{"source_id = ANY($1)", "user_id = $2", "deleted_at IS NULL"}
+		where := []string{"source_id = ANY($1)", "user_id = $2", "deleted_at IS NULL", "superseded_by IS NULL"}
 		if scope.ProjectID != nil {
 			args = append(args, *scope.ProjectID)
 			where = append(where, fmt.Sprintf("(project_id = $%d OR project_id IS NULL)", len(args)))

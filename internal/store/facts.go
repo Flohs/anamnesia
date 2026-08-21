@@ -54,63 +54,87 @@ func (s *Store) UpsertFact(ctx context.Context, f *anamnesia.Fact) error {
 	}
 
 	return s.Tx(ctx, func(tx pgx.Tx) error {
-		// Identity = (user_id, project_id-or-zero, fact_scope, key).
-		// On conflict, merge: bump valid_from + ingested_at, replace value, etc.
-		var id uuid.UUID
+		// Identity = (user_id, project_id-or-zero, fact_scope, key), and
+		// only among *current* rows: superseded ones are exempt from
+		// facts_identity (see migration 0010), which is what lets a key
+		// keep its previous values.
+		//
+		// This is not an upsert. A changed value has to become a second
+		// row while the old one survives, and ON CONFLICT DO UPDATE can
+		// only ever mutate the row it collided with. FOR UPDATE serialises
+		// concurrent writers of one key, which matters because extraction
+		// runs several sources at once; the partial unique index is the
+		// backstop if one still loses the race.
+		var (
+			curID    uuid.UUID
+			sameVal  bool
+			curFound = true
+		)
 		err := tx.QueryRow(ctx, `
-			INSERT INTO facts
-				(user_id, project_id, source_id, fact_scope, key, value, source, trust, pii_tags,
-				 embedding, embed_model, valid_from, ingested_at)
-			VALUES
-				($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13)
-			ON CONFLICT (user_id, coalesce(project_id, '00000000-0000-0000-0000-000000000000'::uuid), fact_scope, key)
-				WHERE deleted_at IS NULL
-			DO UPDATE SET
-				value       = EXCLUDED.value,
-				source      = COALESCE(EXCLUDED.source, facts.source),
-				-- Provenance follows the value: source_id is read as "where
-				-- this content came from" (retrieval eval labels and
-				-- internal/extract's hitSourceID-style lookups depend on
-				-- it), so a source that re-asserts the value already
-				-- stored must not take authorship of it. Only move it when
-				-- the incoming value actually differs from what's stored;
-				-- jsonb equality here is object-key-order-insensitive,
-				-- which is what we want.
-				source_id   = CASE
-					WHEN facts.value IS DISTINCT FROM EXCLUDED.value
-						THEN COALESCE(EXCLUDED.source_id, facts.source_id)
-					ELSE facts.source_id
-				END,
-				trust       = EXCLUDED.trust,
-				pii_tags    = EXCLUDED.pii_tags,
-				-- A changed value invalidates the old vector. Keeping it
-				-- leaves a row whose text says one thing and whose
-				-- embedding says another, and nothing ever repairs that:
-				-- the extractor never supplies an embedding, and the
-				-- backfill worker only looks for rows WHERE embedding IS
-				-- NULL. So the row would stay findable by vector search
-				-- only under wording it no longer has. Clearing it hands
-				-- the row to that worker. When the caller does bring a
-				-- vector for the new value, that one is used.
-				embedding   = CASE
-					WHEN facts.value IS DISTINCT FROM EXCLUDED.value
-						THEN EXCLUDED.embedding
-					ELSE COALESCE(EXCLUDED.embedding, facts.embedding)
-				END,
-				embed_model = CASE
-					WHEN facts.value IS DISTINCT FROM EXCLUDED.value
-						THEN EXCLUDED.embed_model
-					ELSE COALESCE(EXCLUDED.embed_model, facts.embed_model)
-				END,
-				ingested_at = EXCLUDED.ingested_at
-			RETURNING id`,
-			f.Scope.UserID, f.Scope.ProjectID, f.SourceID, string(f.FactKind), f.Key, string(valueJSON),
-			f.Source, f.Trust, piiTags, emb, f.EmbedModel, f.ValidFrom, f.IngestedAt,
-		).Scan(&id)
-		if err != nil {
+			SELECT id, value = $5::jsonb
+			  FROM facts
+			 WHERE user_id = $1
+			   AND coalesce(project_id, '00000000-0000-0000-0000-000000000000'::uuid)
+			     = coalesce($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+			   AND fact_scope = $3 AND key = $4
+			   AND deleted_at IS NULL AND superseded_by IS NULL
+			   FOR UPDATE`,
+			f.Scope.UserID, f.Scope.ProjectID, string(f.FactKind), f.Key, string(valueJSON),
+		).Scan(&curID, &sameVal)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			curFound = false
+		case err != nil:
 			return err
 		}
-		f.ID = id
+
+		// Re-asserting the value already stored is not a change, and the
+		// extractor re-asserts constantly. Updating in place keeps a
+		// version per mention out of the history, and keeps provenance and
+		// the embedding with the source that actually authored the value.
+		if curFound && sameVal {
+			if _, err := tx.Exec(ctx, `
+				UPDATE facts SET
+					source      = COALESCE($2, source),
+					trust       = $3,
+					pii_tags    = $4,
+					embedding   = COALESCE($5, embedding),
+					embed_model = COALESCE($6, embed_model),
+					ingested_at = $7
+				WHERE id = $1`,
+				curID, f.Source, f.Trust, piiTags, emb, f.EmbedModel, f.IngestedAt,
+			); err != nil {
+				return err
+			}
+			f.ID = curID
+			return nil
+		}
+
+		// The new row's id is generated here so the old row can point at
+		// it before it exists. superseded_by carries no foreign key, and
+		// the order matters: stamping the old row first takes it out of
+		// facts_identity, which is what makes room for the insert.
+		newID := uuid.New()
+		if curFound {
+			if _, err := tx.Exec(ctx, `
+				UPDATE facts
+				   SET superseded_by = $2, valid_to = now(), invalidated_at = now()
+				 WHERE id = $1`, curID, newID); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO facts
+				(id, user_id, project_id, source_id, fact_scope, key, value, source, trust, pii_tags,
+				 embedding, embed_model, valid_from, ingested_at)
+			VALUES
+				($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14)`,
+			newID, f.Scope.UserID, f.Scope.ProjectID, f.SourceID, string(f.FactKind), f.Key,
+			string(valueJSON), f.Source, f.Trust, piiTags, emb, f.EmbedModel, f.ValidFrom, f.IngestedAt,
+		); err != nil {
+			return err
+		}
+		f.ID = newID
 		return nil
 	})
 }
@@ -133,7 +157,7 @@ func (s *Store) ListFacts(ctx context.Context, scope anamnesia.Scope, factKind a
 	}
 	var args []any
 	args = append(args, scope.UserID)
-	where := []string{"user_id = $1", "deleted_at IS NULL"}
+	where := []string{"user_id = $1", "deleted_at IS NULL", "superseded_by IS NULL"}
 	if scope.ProjectID != nil {
 		args = append(args, *scope.ProjectID)
 		where = append(where, fmt.Sprintf("project_id = $%d", len(args)))

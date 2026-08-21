@@ -79,16 +79,31 @@ func TestUpsertFactChangedValueMovesProvenanceToNewSource(t *testing.T) {
 		t.Fatalf("upsert fact: %v", err)
 	}
 
-	got, err := st.GetFact(ctx, factID)
+	// Since migration 0010 a changed value becomes a new row and the old
+	// one is superseded, so the assertion is about the *current* row.
+	// factID now names the superseded version, which correctly still
+	// holds the old value and the source that authored it.
+	var gotSrc uuid.UUID
+	var gotVal string
+	if err := st.Pool.QueryRow(ctx, `
+		SELECT source_id, value->>'v' FROM facts
+		WHERE user_id = $1 AND key = 'user.bike_type'
+		  AND deleted_at IS NULL AND superseded_by IS NULL`,
+		scope.UserID).Scan(&gotSrc, &gotVal); err != nil {
+		t.Fatalf("read current row: %v", err)
+	}
+	if gotSrc != srcBID {
+		t.Errorf("current source_id = %v, want source B (%v): the new value came from B", gotSrc, srcBID)
+	}
+	if gotVal != "road bike" {
+		t.Errorf("current value = %q, want the updated value", gotVal)
+	}
+	old, err := st.GetFact(ctx, factID)
 	if err != nil {
-		t.Fatalf("get fact: %v", err)
+		t.Fatalf("get superseded fact: %v", err)
 	}
-	if got.SourceID == nil || *got.SourceID != srcBID {
-		t.Errorf("source_id = %v, want source B (%v): the new value came from B",
-			got.SourceID, srcBID)
-	}
-	if v, _ := got.Value["v"].(string); v != "road bike" {
-		t.Errorf("value = %q, want the updated value", v)
+	if v, _ := old.Value["v"].(string); v != "hybrid bike" {
+		t.Errorf("superseded value = %q, want the value it held", v)
 	}
 }
 

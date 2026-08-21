@@ -216,12 +216,17 @@ func TestExecuteOps(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("expected 1 op, got %d", n)
 	}
-	updated, err := st.GetFact(ctx, factID)
-	if err != nil {
-		t.Fatalf("get fact: %v", err)
+	// UPDATE_FACT versions the fact since migration 0010: factID is now
+	// the superseded row, and the updated value lives on the current one.
+	var cmd string
+	if err := st.Pool.QueryRow(ctx, `
+		SELECT value->>'cmd' FROM facts
+		WHERE user_id = $1 AND key = $2 AND deleted_at IS NULL AND superseded_by IS NULL`,
+		scope.UserID, "test_command").Scan(&cmd); err != nil {
+		t.Fatalf("read current fact: %v", err)
 	}
-	if cmd, _ := updated.Value["cmd"].(string); cmd != "bun test" {
-		t.Errorf("UPDATE_FACT did not stick, got value=%v", updated.Value)
+	if cmd != "bun test" {
+		t.Errorf("UPDATE_FACT did not stick, current value cmd=%q", cmd)
 	}
 
 	// DELETE_FACT

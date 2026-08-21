@@ -20,6 +20,21 @@ func embeddingIsNull(t *testing.T, st *Store, id uuid.UUID) bool {
 	return isNull
 }
 
+// currentEmbedding reports the live row's embedding state for a key.
+// Since migration 0010 a changed value creates a new row, so "did the
+// stale embedding survive" is a question about the current row, not the
+// one the first write returned.
+func currentEmbedding(t *testing.T, st *Store, scope anamnesia.Scope, key string) (isNull bool, model *string) {
+	t.Helper()
+	if err := st.Pool.QueryRow(context.Background(), `
+		SELECT embedding IS NULL, embed_model FROM facts
+		WHERE user_id = $1 AND key = $2 AND deleted_at IS NULL AND superseded_by IS NULL`,
+		scope.UserID, key).Scan(&isNull, &model); err != nil {
+		t.Fatalf("read current embedding: %v", err)
+	}
+	return isNull, model
+}
+
 func vec(dims int) []float32 {
 	v := make([]float32, dims)
 	v[0] = 1
@@ -56,8 +71,11 @@ func TestChangingAValueClearsItsStaleEmbedding(t *testing.T) {
 	if err := st.UpsertFact(ctx, changed); err != nil {
 		t.Fatalf("second upsert: %v", err)
 	}
-	if !embeddingIsNull(t, st, f.ID) {
-		t.Error("the value changed but the old embedding survived: the row is now findable only by wording it no longer has, and the backfill worker only looks for NULL")
+	if isNull, _ := currentEmbedding(t, st, scope, "user.commute"); !isNull {
+		t.Error("the value changed but the current row carries an embedding: it would be findable only by wording it no longer has, and the backfill worker only looks for NULL")
+	}
+	if embeddingIsNull(t, st, f.ID) {
+		t.Error("the superseded row lost its embedding: it describes its own value and is what makes history searchable")
 	}
 }
 
@@ -110,15 +128,12 @@ func TestAValueChangeThatBringsItsOwnEmbeddingKeepsIt(t *testing.T) {
 	if err := st.UpsertFact(ctx, changed); err != nil {
 		t.Fatalf("second upsert: %v", err)
 	}
-	if embeddingIsNull(t, st, f.ID) {
+	isNull, model := currentEmbedding(t, st, scope, "user.commute")
+	if isNull {
 		t.Error("an embedding supplied with the new value was discarded")
 	}
-	var model string
-	if err := st.Pool.QueryRow(ctx, `SELECT embed_model FROM facts WHERE id = $1`, f.ID).Scan(&model); err != nil {
-		t.Fatalf("read embed_model: %v", err)
-	}
-	if model != "new-model" {
-		t.Errorf("embed_model = %q, want the model that produced the stored vector", model)
+	if model == nil || *model != "new-model" {
+		t.Errorf("embed_model = %v, want the model that produced the stored vector", model)
 	}
 }
 
@@ -144,10 +159,7 @@ func TestAClearedEmbeddingAlsoClearsItsModelLabel(t *testing.T) {
 	if err := st.UpsertFact(ctx, changed); err != nil {
 		t.Fatalf("second upsert: %v", err)
 	}
-	var model *string
-	if err := st.Pool.QueryRow(ctx, `SELECT embed_model FROM facts WHERE id = $1`, f.ID).Scan(&model); err != nil {
-		t.Fatalf("read embed_model: %v", err)
-	}
+	_, model := currentEmbedding(t, st, scope, "user.commute")
 	if model != nil && *model != "" {
 		t.Errorf("embed_model = %q with a NULL embedding: it names a model for a vector that does not exist", *model)
 	}

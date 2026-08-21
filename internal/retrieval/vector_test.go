@@ -91,7 +91,7 @@ func TestVectorFactsRanksTheNearestEmbeddingFirst(t *testing.T) {
 	factWithVector(t, st, emb, scope, "c.numbat", "the numbat forages")
 
 	qv, _ := emb.Embed(ctx, []string{"quokka"})
-	hits, err := eng.vectorFacts(ctx, scope, qv[0], 10)
+	hits, err := eng.vectorFacts(ctx, scope, qv[0], 10, false)
 	if err != nil {
 		t.Fatalf("vectorFacts: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestVectorFactsSkipsRowsWithNoEmbedding(t *testing.T) {
 	factWithVector(t, st, emb, scope, "a.quokka", "the quokka naps")
 
 	qv, _ := emb.Embed(ctx, []string{"quokka"})
-	hits, err := eng.vectorFacts(ctx, scope, qv[0], 10)
+	hits, err := eng.vectorFacts(ctx, scope, qv[0], 10, false)
 	if err != nil {
 		t.Fatalf("vectorFacts: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestVectorFactsStaysInsideItsScope(t *testing.T) {
 	factWithVector(t, st, emb, scope, "b.wombat", "the wombat digs")
 
 	qv, _ := emb.Embed(ctx, []string{"quokka"})
-	hits, err := eng.vectorFacts(ctx, scope, qv[0], 10)
+	hits, err := eng.vectorFacts(ctx, scope, qv[0], 10, false)
 	if err != nil {
 		t.Fatalf("vectorFacts: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestVectorFactsHonoursItsLimit(t *testing.T) {
 		factWithVector(t, st, emb, scope, c+".fact", "the "+c+" exists")
 	}
 	qv, _ := emb.Embed(ctx, []string{"quokka"})
-	hits, err := eng.vectorFacts(ctx, scope, qv[0], 2)
+	hits, err := eng.vectorFacts(ctx, scope, qv[0], 2, false)
 	if err != nil {
 		t.Fatalf("vectorFacts: %v", err)
 	}

@@ -312,6 +312,12 @@ type HookEvent struct {
 	// (verbatim sources). Set by benchmarks / citation flows; leave
 	// false for context injection where summaries are useful.
 	OnlyRaw bool `json:"only_raw,omitempty"`
+	// IncludeHistory on /v1/retrieve lets superseded fact values into the
+	// results alongside current ones. Off by default, and the hooks that
+	// inject memory into every prompt leave it off: the point of keeping
+	// history is answering "what did I use to...", not showing an agent
+	// two contradictory values and asking it to choose.
+	IncludeHistory bool `json:"include_history,omitempty"`
 }
 
 // userName and projectName are the display names a trace carries. They
@@ -504,7 +510,8 @@ func (d Deps) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 	// rather than of the search.
 	tr := d.Activity.Begin("retrieve", d.userName(ev.User), d.projectName(ev.Project))
 	hits, err := d.Retrieval.Search(r.Context(), retrieval.Query{
-		Scope: scope, Text: ev.Prompt, K: k, OnlyRaw: ev.OnlyRaw, Trace: tr,
+		Scope: scope, Text: ev.Prompt, K: k, OnlyRaw: ev.OnlyRaw,
+		IncludeHistory: ev.IncludeHistory, Trace: tr,
 	})
 	if err != nil {
 		tr.Fail("search", err)

@@ -47,7 +47,7 @@ type UserSummary struct {
 // countsFor builds the five count subqueries against one owning column.
 func countsFor(column string) string {
 	return `
-	  (SELECT count(*) FROM facts       x WHERE x.` + column + ` = o.id AND x.deleted_at IS NULL),
+	  (SELECT count(*) FROM facts       x WHERE x.` + column + ` = o.id AND x.deleted_at IS NULL AND x.superseded_by IS NULL),
 	  (SELECT count(*) FROM experiences x WHERE x.` + column + ` = o.id AND x.deleted_at IS NULL),
 	  (SELECT count(*) FROM skills      x WHERE x.` + column + ` = o.id AND x.deleted_at IS NULL),
 	  (SELECT count(*) FROM entities    x WHERE x.` + column + ` = o.id),

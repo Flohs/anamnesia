@@ -25,6 +25,7 @@ func (s *Store) GetIdentity(ctx context.Context, scope anamnesia.Scope) (anamnes
 		FROM facts
 		WHERE user_id = $1
 		  AND deleted_at IS NULL
+		  AND superseded_by IS NULL
 		  AND (key LIKE 'user.persona.%' OR key LIKE 'user.profile.%')
 		ORDER BY ingested_at DESC`, scope.UserID)
 	if err != nil {
