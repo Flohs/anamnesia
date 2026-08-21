@@ -72,6 +72,30 @@ decay-aware scoring on experiences (`relevance` recomputed hourly).
 - **`/v1/health` must be able to fail.** It checks the database, schema
   version, embedding width and ANN indexes. A health check that cannot fail
   turns a broken install into a green light.
+- **Retrieval must be able to fail, for the same reason.** A configured
+  embedder that errors returns an error from `Search`, not an empty
+  result set. A credit outage once had `/v1/retrieve` answer `200` with
+  no hits for a user holding hundreds of fully-embedded facts, which is
+  indistinguishable from "you have no such memory". Having *no* embedder
+  stays legitimate: that is the lexical-only local setup.
+- **The lexical channel earns nothing on extracted memory, and that is
+  measured, not assumed.** Do not "fix" or expand it without new
+  evidence, and do not delete it either. Measured 2026-08-21 over a
+  30-question LongMemEval corpus (see
+  [docs/longmemeval-retrieval-baseline.md](docs/longmemeval-retrieval-baseline.md)):
+  `plainto_tsquery` ANDs every term, so a natural-language question
+  matched **0 of 600** hits. Making it OR its terms and indexing the
+  words inside dotted keys lifted it to 236 of 600 hits and changed
+  recall by nothing at all, while costing `recall@5` (0.688 → 0.671) and
+  crowding the graph channel out of the fused top-20 (`graph_only`
+  37 → 16). No `LexicalK` from 5 to 40 made it a net win. Exact rare-token
+  recall was **0.947 with it and 0.947 without**, so it does not earn its
+  keep on identifier lookup either.
+  It stays because deleting it is not free: `DomainSkill` has **no vector
+  channel at all** and is served only by `lexicalSkills`, and every test
+  in `internal/retrieval` runs without an embedder, so lexical is the
+  only channel those tests can produce hits with. Removing it would take
+  skills retrieval with it and require rewriting the graph tests.
 
 ## Verifying a change
 

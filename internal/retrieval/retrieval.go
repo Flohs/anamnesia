@@ -140,6 +140,20 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 			qvec = v[0]
 		}
 	}
+	// A configured embedder that fails is a fault, not a mode. Carrying on
+	// without the vector channel returns an empty-looking success, and a
+	// caller cannot tell that from "you have no such memory": an
+	// OpenRouter credit outage had /v1/retrieve answer 200 with no hits
+	// for a user holding hundreds of fully-embedded facts. Same reasoning
+	// as the invariant that /v1/health must be able to fail. Having no
+	// embedder at all stays legitimate — that is the lexical-only local
+	// setup, a configuration rather than a breakage.
+	if embedErr != nil {
+		if q.Trace != nil {
+			q.Trace.Fail("vector", embedErr)
+		}
+		return nil, fmt.Errorf("embed query: %w", embedErr)
+	}
 
 	type ranked struct {
 		hit anamnesia.SearchHit
@@ -219,7 +233,7 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 		if qvec == nil {
 			q.Trace.Step("vector", "No vector search ran", map[string]any{
 				"skipped": true,
-				"reason":  noVectorReason(e.Embedder != nil, q.Text, embedErr),
+				"reason":  noVectorReason(e.Embedder != nil, q.Text),
 			})
 		} else {
 			q.Trace.Step("vector", fmt.Sprintf("%d vector hits", len(vectorHits)),
@@ -539,10 +553,12 @@ func scopeDetail(scope anamnesia.Scope) map[string]any {
 	return d
 }
 
-func noVectorReason(hasEmbedder bool, text string, err error) string {
+// noVectorReason explains a search that ran without the vector channel.
+// A failed embedding is not among the cases: Search returns an error for
+// that rather than reaching here, so every reason below is a legitimate
+// one.
+func noVectorReason(hasEmbedder bool, text string) string {
 	switch {
-	case err != nil:
-		return "embedding the query failed: " + err.Error()
 	case !hasEmbedder:
 		return "no embedder is configured, so nothing is embedded and vector search cannot run"
 	case strings.TrimSpace(text) == "":

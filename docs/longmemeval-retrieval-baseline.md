@@ -93,12 +93,70 @@ channel, across 19 of 30 questions. Note this requires `graph.extract` on
 **and** the harness posting `claude-session-graph` sources; without the
 second, the graph pass never runs and the channel reports a structural 0.
 
-**The lexical channel is inert.** Zero hits in 600, across four runs and
-every question type. The channel works on literal terms, but extraction
-rewrites prose into keys like `user.recent_audition.play` and JSON
-values, so `plainto_tsquery` has nothing to match a natural-language
-question against. RRF is effectively vector-plus-graph on extracted
-memory.
+**The lexical channel is inert, and fixing it does not help.** Zero hits
+in 600, across four runs and every question type.
+
+Two independent defects caused it. `plainto_tsquery` ANDs every term, so
+"What play did I attend at the local community theater?" becomes
+`play & attend & local & community & theater` and asks one short
+extracted fact to contain all of it: it returned *zero rows*, not zero
+relevant rows, for all 30 questions. (`websearch_to_tsquery` is not a
+fix; it ANDs identically.) And 99.6% of fact keys are dotted, which the
+text-search parser reads as a single `host` token, so every term living
+only in the key was unreachable.
+
+Both were fixed on a branch and measured against this same stored corpus,
+deterministically (two runs, byte-identical):
+
+| | lexical dead | lexical fixed |
+|---|---|---|
+| lexical hits | 0 (0.0%) | 236 (39.3%) |
+| recall@10 / @20 | 0.871 | 0.871 |
+| recall@5 | 0.688 | 0.671 |
+| MRR | 0.667 | 0.662 |
+| graph hits / `graph_only` | 64 / 37 | 42 / 16 |
+| evidence verdicts | 49/3/3/1 | 49/3/3/1 |
+
+The channel went from dead to firing on 30/30 questions and found **no
+gold evidence the vector channel was not already finding** — not one
+evidence verdict changed. The whole `recall@5` loss is a single question
+where a gold row slipped from the top 5 to the top 20.
+
+Sweeping `LexicalK` did not rescue it, and falsified the obvious
+hypothesis that throttling it would reduce displacement:
+
+```
+variant                   r@1    r@5   r@10   r@20    MRR   lex   vec   gph  gonly
+lexical OFF (pre-fix)   0.334  0.688  0.871  0.871  0.667     0   563    64     37
+LexicalK=5              0.334  0.671  0.854  0.854  0.660   121   575    50     22
+LexicalK=10             0.334  0.671  0.854  0.854  0.659   180   576    40     16
+LexicalK=20             0.334  0.671  0.854  0.854  0.658   219   572    42     16
+LexicalK=40             0.334  0.671  0.871  0.871  0.662   236   571    42     16
+```
+
+Lower K is *worse*, not better: only the full K=40 recovers recall@10/@20.
+
+A separate probe tested the one thing this benchmark cannot see, exact
+rare-token lookup, on a fixed set of 75 single-token queries each naming
+a term unique to one stored fact:
+
+```
+                     exact-term recall@20
+lexical in fusion            0.947 (71/75)
+lexical removed entirely     0.947 (71/75)
+```
+
+Identical. The vector channel finds all of them alone, so the "lexical is
+for exact identifiers" argument does not survive measurement either. Note
+that a *single-token* query produces no conjunction, so the AND defect
+never affected this case: exact lookup was working the whole time.
+
+The fix was therefore **not merged**. The channel is left dead, and
+`CLAUDE.md` records why, along with the two reasons it cannot simply be
+deleted: `DomainSkill` has no vector channel and is served only by
+`lexicalSkills`, and the entire `internal/retrieval` test suite runs
+without an embedder, so lexical is the only channel those tests can
+produce hits with.
 
 ## Reproducing and comparing
 
