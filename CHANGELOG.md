@@ -201,6 +201,23 @@ were rebuilt around being verifiable.
 
 ### Added
 
+- **`anamnesia project prune`, for the project entries that hold nothing.**
+  Projects used to be created by reading, so opening a directory filed it
+  whether or not anything was ever stored there. That is fixed at the
+  source, but the entries it already made remain. This lists projects with
+  no rows in any table that names them and, with `--apply`, deletes those
+  entries.
+
+  It is a command rather than a worker on purpose. The only cost of an empty
+  project is a line in a list, and a background process that deletes rows on
+  its own to tidy a display is a poor trade against the risk. It would also
+  be futile: an entry reappears the moment that directory stores something.
+
+  Emptiness is re-checked inside the delete transaction, not trusted from
+  the listing. The list a user approves is a snapshot, and a session can
+  checkpoint into one of those projects in between; deleting on the strength
+  of the earlier read would take real memory with it.
+
 - **`anamnesia project move <to>`, for one product built in several
   repositories.** A project slug defaults to the repository directory name,
   so a SaaS split across an API, a core service and a docs repo becomes

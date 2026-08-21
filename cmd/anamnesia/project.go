@@ -26,8 +26,9 @@ import (
 )
 
 var (
-	projectMoveFrom  string
-	projectMoveApply bool
+	projectMoveFrom   string
+	projectMoveApply  bool
+	projectPruneApply bool
 )
 
 var projectCmd = func() *cobra.Command {
@@ -36,6 +37,7 @@ var projectCmd = func() *cobra.Command {
 		Short: "Inspect and reorganise project scopes",
 	}
 	c.AddCommand(projectMoveCmd())
+	c.AddCommand(projectPruneCmd())
 	return c
 }()
 
@@ -173,4 +175,75 @@ func refileProjectConfig(dir, to string) (string, error) {
 		return path, setConfigValue(path, "identity.project", to)
 	}
 	return path, writeFileAtomic(path, renderProjectConfig(to))
+}
+
+func projectPruneCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "prune",
+		Short: "Remove project entries that hold no memories",
+		Long: "List the projects holding nothing at all — no sources, facts,\n" +
+			"experiences, entities, skills, working memory or commitments — and,\n" +
+			"with --apply, delete those entries.\n\n" +
+			"Deleting one removes no memory, because there is none to remove. A\n" +
+			"project reappears if a session there stores something later.",
+		Args: cobra.NoArgs,
+		RunE: runProjectPrune,
+	}
+	c.Flags().BoolVar(&projectPruneApply, "apply", false, "delete the entries instead of only listing them")
+	return c
+}
+
+func runProjectPrune(cmd *cobra.Command, _ []string) error {
+	hc, err := loadHostConfig()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, hc.DatabaseURL())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	out := cmd.OutOrStdout()
+	userID, found, err := st.LookupUser(ctx, hc.User())
+	if err != nil {
+		return err
+	}
+	if !found {
+		fmt.Fprintf(out, "%q has no memories yet; nothing to prune\n", hc.User())
+		return nil
+	}
+	empty, err := st.PrunableProjects(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if len(empty) == 0 {
+		fmt.Fprintf(out, "every project holds something; nothing to prune\n")
+		return nil
+	}
+	// The project this directory resolves to is listed like any other, but
+	// flagged: pruning it is harmless, and it will come back the moment
+	// this repository stores anything.
+	here := hc.Project()
+	fmt.Fprintf(out, "%d project(s) hold nothing:\n", len(empty))
+	slugs := make([]string, 0, len(empty))
+	for _, p := range empty {
+		note := ""
+		if p.Slug == here {
+			note = "   (this directory)"
+		}
+		fmt.Fprintf(out, "  %s%s\n", p.Slug, note)
+		slugs = append(slugs, p.Slug)
+	}
+	if !projectPruneApply {
+		fmt.Fprintf(out, "\nNothing was changed. Run again with --apply to delete these entries.\n")
+		return nil
+	}
+	n, err := st.PruneProjects(ctx, userID, slugs)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "\n✦ removed %d empty project entr%s\n", n, map[bool]string{true: "y", false: "ies"}[n == 1])
+	return nil
 }
