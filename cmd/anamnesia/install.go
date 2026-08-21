@@ -50,6 +50,7 @@ type hookSpec struct {
 //	UserPromptSubmit retrieve for this prompt (no ingest)
 //	PreCompact       checkpoint the transcript before context is compacted
 //	SessionEnd       checkpoint the transcript when the session finishes
+//	SubagentStop     record what a subagent concluded
 //
 // SessionEnd rather than Stop is deliberate. Stop fires every time the
 // agent finishes a response, so checkpointing there re-sent the entire
@@ -61,6 +62,10 @@ var anamnesiaHooks = []hookSpec{
 	{event: "UserPromptSubmit", verb: "retrieve", timeout: 10},
 	{event: "PreCompact", verb: "pre-compact", timeout: 30},
 	{event: "SessionEnd", verb: "session-end", timeout: 30},
+	// A subagent runs in its own transcript that no other hook reads, so
+	// without this everything an agent worked out is invisible to memory.
+	// Only its final message is taken: see subagentPayload.
+	{event: "SubagentStop", verb: "subagent-stop", timeout: 15},
 }
 
 type installFlags struct {

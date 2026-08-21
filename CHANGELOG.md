@@ -219,6 +219,20 @@ were rebuilt around being verifiable.
 
 ### Added
 
+- **Subagent results reach memory.** A subagent runs in a transcript of its
+  own that no hook ever read, so everything it worked out was invisible: one
+  session here spawned 43 of them, implementing features, reviewing branches
+  and finding defects, and none of that reasoning produced a single fact. A
+  `SubagentStop` hook now records what each one concluded.
+
+  Only the final message is taken. A subagent's transcript is as long as a
+  session's, so capturing all of it would mean a checkpoint per agent and a
+  fan-out of forty would be forty extractions. The conclusion is the dense
+  part — the verdict, the finding, the decision — and everything leading to
+  it is reasoning the main session already saw summarised. Every agent is
+  sent regardless of type: the surprise gate is a cheaper judge of what is
+  worth keeping than a list of agent types that has to be maintained.
+
 - **`anamnesia recover`, for transcripts no checkpoint ever claimed.** A
   checkpoint fires on PreCompact and SessionEnd; a session that crashes or is
   killed fires neither, so its last stretch of work is never ingested. It is

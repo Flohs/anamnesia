@@ -64,7 +64,13 @@ type claudeHookInput struct {
 	TranscriptPath string `json:"transcript_path"`
 	HookEventName  string `json:"hook_event_name"`
 	Source         string `json:"source"`
-	Trigger        string `json:"trigger"`
+	// SubagentStop only. A subagent runs in a transcript of its own that
+	// no hook reads; this is its conclusion, which is the part worth
+	// keeping.
+	AgentID          string `json:"agent_id"`
+	AgentType        string `json:"agent_type"`
+	LastAssistantMsg string `json:"last_assistant_message"`
+	Trigger          string `json:"trigger"`
 }
 
 // errServerUnreachable is logged when a hook found no server to talk to.
@@ -77,6 +83,9 @@ var hookTimeouts = map[string]time.Duration{
 	"retrieve":      2500 * time.Millisecond,
 	"session-end":   20 * time.Second,
 	"pre-compact":   20 * time.Second,
+	// One small post, no transcript to read, but it fires while the main
+	// agent waits to continue, so it stays tight.
+	"subagent-stop": 8 * time.Second,
 }
 
 func runHook(cmd *cobra.Command, args []string) error {
@@ -84,9 +93,9 @@ func runHook(cmd *cobra.Command, args []string) error {
 	started := time.Now()
 
 	switch verb {
-	case "session-start", "retrieve", "session-end", "pre-compact":
+	case "session-start", "retrieve", "session-end", "pre-compact", "subagent-stop":
 	default:
-		return fmt.Errorf("unknown hook verb %q (want session-start|retrieve|session-end|pre-compact)", verb)
+		return fmt.Errorf("unknown hook verb %q (want session-start|retrieve|session-end|pre-compact|subagent-stop)", verb)
 	}
 
 	hc, err := loadHostConfig()
@@ -131,6 +140,8 @@ func runHook(cmd *cobra.Command, args []string) error {
 		note, err = doCheckpoint(ctx, hc, input, "claude-session", checkpointScope{})
 	case "pre-compact":
 		note, err = doCheckpoint(ctx, hc, input, "claude-precompact", checkpointScope{})
+	case "subagent-stop":
+		note, err = doSubagentStop(ctx, hc, input)
 	}
 	logHook(verb, started, err, note)
 	return nil
@@ -910,4 +921,58 @@ func trimLine(s string, n int) string {
 		return string(runes[:n]) + "…"
 	}
 	return s
+}
+
+// subagentPayload turns a finished subagent into one source, or reports
+// that there is nothing worth storing.
+//
+// Only the final message. A subagent's transcript is as long as a
+// session's and lives in a file no hook reads, so capturing all of it
+// would mean a checkpoint per agent — a fan-out of forty would be forty
+// checkpoints and forty extractions. The conclusion is the dense part:
+// the verdict, the finding, the decision. Everything that reached it was
+// reasoning the main session already saw summarised.
+//
+// Every agent is sent, whatever it is. The surprise gate already exists
+// to throw away what is not worth keeping, and it is a cheaper judge of
+// that than a list of agent types that has to be maintained.
+func subagentPayload(input claudeHookInput) (ingestPayload, bool) {
+	body := strings.TrimSpace(input.LastAssistantMsg)
+	if body == "" {
+		// A cancelled or failed agent has nothing to say, and an empty
+		// source still costs a gate call to discover that.
+		return ingestPayload{}, false
+	}
+	agentType := strings.TrimSpace(input.AgentType)
+	if agentType == "" {
+		agentType = "subagent"
+	}
+	return ingestPayload{
+		Kind:  "claude-subagent",
+		Title: fmt.Sprintf("%s result", agentType),
+		// Keyed on the agent, not the session: several agents finish in
+		// one session, and a hook that fires twice must not store the
+		// same result twice.
+		ExternalRef: fmt.Sprintf("%s#agent-%s", input.SessionID, input.AgentID),
+		Content:     body,
+		Metadata: map[string]any{
+			"agent_type": agentType,
+			"agent_id":   input.AgentID,
+			"session_id": input.SessionID,
+		},
+	}, true
+}
+
+func doSubagentStop(ctx context.Context, hc *hostConfig, input claudeHookInput) (string, error) {
+	payload, ok := subagentPayload(input)
+	if !ok {
+		return "subagent reported nothing", nil
+	}
+	payload.User = hc.User()
+	payload.Project = hc.Project()
+	var resp ingestResponse
+	if err := httpPost(ctx, hc, "/v1/ingest", payload, &resp); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ingested %s result", payload.Metadata["agent_type"]), nil
 }
