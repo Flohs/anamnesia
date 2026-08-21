@@ -128,9 +128,9 @@ func runHook(cmd *cobra.Command, args []string) error {
 	case "retrieve":
 		note, err = doRetrieve(ctx, cmd.OutOrStdout(), hc, ev)
 	case "session-end":
-		note, err = doCheckpoint(ctx, hc, input, "claude-session")
+		note, err = doCheckpoint(ctx, hc, input, "claude-session", checkpointScope{})
 	case "pre-compact":
-		note, err = doCheckpoint(ctx, hc, input, "claude-precompact")
+		note, err = doCheckpoint(ctx, hc, input, "claude-precompact", checkpointScope{})
 	}
 	logHook(verb, started, err, note)
 	return nil
@@ -228,6 +228,11 @@ type experienceMin struct {
 }
 
 func doSessionStart(ctx context.Context, w io.Writer, hc *hostConfig, ev hookEvent) (string, error) {
+	// A session that crashed left its last stretch of work unread. This
+	// is the moment to collect it: it costs a stat() per offset file
+	// when there is nothing to do, and detaches when there is.
+	spawnRecover(hc)
+
 	ev.MaxFacts = 50
 	ev.MaxExperiences = 10
 	var resp sessionStartResp
@@ -373,7 +378,32 @@ const minSegmentBytes = 40
 // The offset is what keeps this linear. Re-reading the whole transcript at
 // every checkpoint means a long session is ingested over and over, and the
 // extractor pays for the same content each time.
-func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, kind string) (string, error) {
+// checkpointScope overrides the identity a checkpoint files under.
+//
+// A hook resolves the user and project from the directory it runs in,
+// which is right for the session that triggered it. `recover` reads
+// another session's transcript, so it has to say which project that
+// session belonged to; an empty field keeps the resolved one.
+type checkpointScope struct {
+	User    string
+	Project string
+}
+
+func (c checkpointScope) userOr(hc *hostConfig) string {
+	if c.User != "" {
+		return c.User
+	}
+	return hc.User()
+}
+
+func (c checkpointScope) projectOr(hc *hostConfig) string {
+	if c.Project != "" {
+		return c.Project
+	}
+	return hc.Project()
+}
+
+func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, kind string, sc checkpointScope) (string, error) {
 	if input.TranscriptPath == "" {
 		return "no transcript path", nil
 	}
@@ -410,8 +440,8 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 			Title:       title,
 			ExternalRef: fmt.Sprintf("%s#%d", input.SessionID, segStart),
 			Content:     seg.Content,
-			User:        hc.User(),
-			Project:     hc.Project(),
+			User:        sc.userOr(hc),
+			Project:     sc.projectOr(hc),
 			Metadata: map[string]any{
 				"session_id":  input.SessionID,
 				"cwd":         input.CWD,
@@ -469,8 +499,8 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 			Title:       title,
 			ExternalRef: fmt.Sprintf("%s#%d-graph", input.SessionID, offset),
 			Content:     strings.Join(contents, "\n"),
-			User:        hc.User(),
-			Project:     hc.Project(),
+			User:        sc.userOr(hc),
+			Project:     sc.projectOr(hc),
 			Metadata: map[string]any{
 				"segment_source_ids": segmentSourceIDs,
 			},

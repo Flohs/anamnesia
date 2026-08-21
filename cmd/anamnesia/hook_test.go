@@ -644,7 +644,7 @@ func TestCheckpointPostsOneSourcePerSegment(t *testing.T) {
 		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
 	)
 	if _, err := doCheckpoint(context.Background(), hc,
-		claudeHookInput{TranscriptPath: path, SessionID: "s1"}, "claude-session"); err != nil {
+		claudeHookInput{TranscriptPath: path, SessionID: "s1"}, "claude-session", checkpointScope{}); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	if len(*got) != 2 {
@@ -697,7 +697,7 @@ func TestCheckpointAdvancesTheOffsetOnlyWhenEverySegmentLands(t *testing.T) {
 	}
 
 	if _, err := doCheckpoint(context.Background(), hc,
-		claudeHookInput{TranscriptPath: path, SessionID: "s2"}, "claude-session"); err == nil {
+		claudeHookInput{TranscriptPath: path, SessionID: "s2"}, "claude-session", checkpointScope{}); err == nil {
 		t.Fatal("checkpoint reported success despite a failed segment")
 	}
 	off := readOffset("s2", path)
@@ -735,7 +735,7 @@ func TestCheckpointOffsetStaysPutWhenTheFirstSegmentFails(t *testing.T) {
 		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
 	)
 	if _, err := doCheckpoint(context.Background(), hc,
-		claudeHookInput{TranscriptPath: path, SessionID: "s5"}, "claude-session"); err == nil {
+		claudeHookInput{TranscriptPath: path, SessionID: "s5"}, "claude-session", checkpointScope{}); err == nil {
 		t.Fatal("checkpoint reported success despite a failed segment")
 	}
 	if off := readOffset("s5", path); off != 0 {
@@ -759,7 +759,7 @@ func TestSegmentWithNoTimestampOmitsOccurredAt(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := doCheckpoint(context.Background(), hc,
-		claudeHookInput{TranscriptPath: path, SessionID: "s3"}, "claude-session"); err != nil {
+		claudeHookInput{TranscriptPath: path, SessionID: "s3"}, "claude-session", checkpointScope{}); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	if len(*got) != 1 {
@@ -789,7 +789,7 @@ func TestCheckpointByteRangesAreContiguousPerSegment(t *testing.T) {
 	}
 
 	if _, err := doCheckpoint(context.Background(), hc,
-		claudeHookInput{TranscriptPath: path, SessionID: "s6"}, "claude-session"); err != nil {
+		claudeHookInput{TranscriptPath: path, SessionID: "s6"}, "claude-session", checkpointScope{}); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	if len(*got) != 2 {
@@ -824,7 +824,7 @@ func TestCheckpointExternalRefsDoNotCollideAcrossCheckpoints(t *testing.T) {
 		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
 	)
 	if _, err := doCheckpoint(context.Background(), hc,
-		claudeHookInput{TranscriptPath: path, SessionID: "s7"}, "claude-session"); err != nil {
+		claudeHookInput{TranscriptPath: path, SessionID: "s7"}, "claude-session", checkpointScope{}); err != nil {
 		t.Fatalf("first checkpoint: %v", err)
 	}
 	if len(*got) != 2 {
@@ -835,7 +835,7 @@ func TestCheckpointExternalRefsDoNotCollideAcrossCheckpoints(t *testing.T) {
 		[3]string{"2026-03-02T10:30:00Z", "user", "a third subject, raised well after the first checkpoint"},
 	)
 	if _, err := doCheckpoint(context.Background(), hc,
-		claudeHookInput{TranscriptPath: path, SessionID: "s7"}, "claude-session"); err != nil {
+		claudeHookInput{TranscriptPath: path, SessionID: "s7"}, "claude-session", checkpointScope{}); err != nil {
 		t.Fatalf("second checkpoint: %v", err)
 	}
 	if len(*got) != 3 {
@@ -865,7 +865,7 @@ func TestCheckpointByteRangeStartsAtResumeOffsetNotZero(t *testing.T) {
 		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
 	)
 	if _, err := doCheckpoint(context.Background(), hc,
-		claudeHookInput{TranscriptPath: path, SessionID: "s8"}, "claude-session"); err != nil {
+		claudeHookInput{TranscriptPath: path, SessionID: "s8"}, "claude-session", checkpointScope{}); err != nil {
 		t.Fatalf("first checkpoint: %v", err)
 	}
 	resumeOffset := readOffset("s8", path)
@@ -878,7 +878,7 @@ func TestCheckpointByteRangeStartsAtResumeOffsetNotZero(t *testing.T) {
 		[3]string{"2026-03-02T10:30:00Z", "user", "a third subject, raised well after the first checkpoint"},
 	)
 	if _, err := doCheckpoint(context.Background(), hc,
-		claudeHookInput{TranscriptPath: path, SessionID: "s8"}, "claude-session"); err != nil {
+		claudeHookInput{TranscriptPath: path, SessionID: "s8"}, "claude-session", checkpointScope{}); err != nil {
 		t.Fatalf("second checkpoint: %v", err)
 	}
 	if len(*got) != 1 {
@@ -899,7 +899,7 @@ func TestGraphSourceIsPostedAfterTheSegments(t *testing.T) {
 		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
 	)
 	if _, err := doCheckpoint(context.Background(), hc,
-		claudeHookInput{TranscriptPath: path, SessionID: "g1"}, "claude-session"); err != nil {
+		claudeHookInput{TranscriptPath: path, SessionID: "g1"}, "claude-session", checkpointScope{}); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	if len(*got) != 3 {
@@ -929,7 +929,7 @@ func TestGraphSourceMetadataCarriesSegmentSourceIDs(t *testing.T) {
 		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
 	)
 	if _, err := doCheckpoint(context.Background(), hc,
-		claudeHookInput{TranscriptPath: path, SessionID: "g4"}, "claude-session"); err != nil {
+		claudeHookInput{TranscriptPath: path, SessionID: "g4"}, "claude-session", checkpointScope{}); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	if len(*got) != 3 {
@@ -955,7 +955,7 @@ func TestNoGraphSourceWhenTheFlagIsOff(t *testing.T) {
 		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
 	)
 	if _, err := doCheckpoint(context.Background(), hc,
-		claudeHookInput{TranscriptPath: path, SessionID: "g2"}, "claude-session"); err != nil {
+		claudeHookInput{TranscriptPath: path, SessionID: "g2"}, "claude-session", checkpointScope{}); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	if len(*got) != 2 {
@@ -986,7 +986,7 @@ func TestAFailedGraphSourceDoesNotFailTheCheckpoint(t *testing.T) {
 		[3]string{"2026-03-02T09:41:00Z", "user", "an entirely separate subject, also discussed at length"},
 	)
 	if _, err := doCheckpoint(context.Background(), hc,
-		claudeHookInput{TranscriptPath: path, SessionID: "g3"}, "claude-session"); err != nil {
+		claudeHookInput{TranscriptPath: path, SessionID: "g3"}, "claude-session", checkpointScope{}); err != nil {
 		t.Errorf("a failed graph source failed the whole checkpoint: %v", err)
 	}
 	if off := readOffset("g3", path); off == 0 {

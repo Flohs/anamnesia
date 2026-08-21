@@ -180,6 +180,10 @@ var settings = []setting{
 		Doc: "Also record open obligations (\"I'll send X by Friday\") in the commitments ledger."},
 
 	// ─── ingest ──────────────────────────────────────────────────────
+	{Key: "ingest.recover_stranded", Kind: kBool, Def: "true", Env: "",
+		Doc: "Ingest transcript tails from sessions that ended without a checkpoint. A checkpoint fires on PreCompact and SessionEnd, so a session that crashes or is killed never sends its last stretch of work. The transcript is still on disk and the offset file records how far it was read, so `anamnesia recover` reads the rest; session start runs it in the background. Turn it off to leave abandoned tails alone."},
+	{Key: "ingest.recover_idle", Kind: kDuration, Def: "15m", Env: "",
+		Doc: "How long a transcript must go unwritten before recovery treats its session as over. This is the only judgement recovery makes, and it cuts both ways: too short and it ingests a live session's tail, racing that session's own checkpoint and paying to extract content that is about to be sent again; too long and a crashed session's work sits uncollected for longer. Nothing is lost either way, since the transcript stays on disk until recovery reads it."},
 	{Key: "ingest.segment_gap", Kind: kDuration, Def: "20m", Env: "", Zeroable: true,
 		Doc: "A pause longer than this starts a new segment when a checkpoint is cut up, so the surprise gate judges one subject at a time rather than a whole session. Set to 0 to send each checkpoint as a single source, which is what earlier versions did."},
 	{Key: "ingest.segment_max_bytes", Kind: kInt, Def: "4000", Env: "", Zeroable: true,

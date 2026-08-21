@@ -97,6 +97,7 @@ func init() {
 	root.AddCommand(migrateCmd)
 	root.AddCommand(evalCmd)
 	root.AddCommand(projectCmd)
+	root.AddCommand(recoverCmd)
 	root.AddCommand(installCmd)
 	root.AddCommand(uninstallCmd)
 
