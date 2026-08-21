@@ -67,10 +67,18 @@ type Config struct {
 
 	// Worker cadences
 	ConsolidateEvery time.Duration // ANAMNESIA_CONSOLIDATE_EVERY (default 24h)
-	ForgetEvery      time.Duration // ANAMNESIA_FORGET_EVERY (default 1h)
-	DecayEvery       time.Duration // ANAMNESIA_DECAY_EVERY (default 1h)
-	ExtractEvery     time.Duration // ANAMNESIA_EXTRACT_EVERY (default 15s)
-	EmbedBackfill    time.Duration // ANAMNESIA_EMBED_BACKFILL (default 1m)
+	// ConsolidateSimilarity is the cosine two experiences must reach to
+	// be folded into one insight. Range 0 to 1, which is fraction()'s
+	// bound and the same bound settings.go enforces on the way in. A
+	// value above 1 is unreachable by any cosine and would switch
+	// consolidation off while still reporting healthy passes, which is
+	// the failure this setting exists to make visible.
+	ConsolidateSimilarity float64       // ANAMNESIA_CONSOLIDATE_SIMILARITY (default 0.65)
+	ConsolidateMaxCluster int           // ANAMNESIA_CONSOLIDATE_MAX_CLUSTER (default 8)
+	ForgetEvery           time.Duration // ANAMNESIA_FORGET_EVERY (default 1h)
+	DecayEvery            time.Duration // ANAMNESIA_DECAY_EVERY (default 1h)
+	ExtractEvery          time.Duration // ANAMNESIA_EXTRACT_EVERY (default 15s)
+	EmbedBackfill         time.Duration // ANAMNESIA_EMBED_BACKFILL (default 1m)
 
 	// ExtractConcurrency is how many sources are extracted at once.
 	ExtractConcurrency int // ANAMNESIA_EXTRACT_CONCURRENCY (default 1)
@@ -230,10 +238,14 @@ func Load() (*Config, error) {
 		PIIMode:          str("ANAMNESIA_PII_MODE", "tag"),
 		PresidioURL:      os.Getenv("ANAMNESIA_PRESIDIO_URL"),
 		ConsolidateEvery: dur("ANAMNESIA_CONSOLIDATE_EVERY", 24*time.Hour),
-		ForgetEvery:      dur("ANAMNESIA_FORGET_EVERY", time.Hour),
-		DecayEvery:       dur("ANAMNESIA_DECAY_EVERY", time.Hour),
-		ExtractEvery:     dur("ANAMNESIA_EXTRACT_EVERY", 15*time.Second),
-		EmbedBackfill:    dur("ANAMNESIA_EMBED_BACKFILL", time.Minute),
+		// Defaults repeated from jobs.DefaultConsolidate*; the agreement
+		// is held by TestConsolidateDefaultsAgreeWithTheClusterer.
+		ConsolidateSimilarity: fraction("ANAMNESIA_CONSOLIDATE_SIMILARITY", 0.65),
+		ConsolidateMaxCluster: num("ANAMNESIA_CONSOLIDATE_MAX_CLUSTER", 8),
+		ForgetEvery:           dur("ANAMNESIA_FORGET_EVERY", time.Hour),
+		DecayEvery:            dur("ANAMNESIA_DECAY_EVERY", time.Hour),
+		ExtractEvery:          dur("ANAMNESIA_EXTRACT_EVERY", 15*time.Second),
+		EmbedBackfill:         dur("ANAMNESIA_EMBED_BACKFILL", time.Minute),
 
 		ExtractConcurrency: num("ANAMNESIA_EXTRACT_CONCURRENCY", 1),
 

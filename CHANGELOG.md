@@ -7,6 +7,48 @@ were rebuilt around being verifiable.
 
 ### Fixed
 
+- **Consolidation could never run, and said it succeeded.** The clustering
+  threshold was hardcoded at a cosine of 0.85, which no real corpus reaches.
+  Measured over the 1,402 same-scope experience pairs on a live install: the
+  mean similarity was 0.289 and the single most similar pair scored 0.754, so
+  not one pair cleared the bar. No cluster of two ever formed, the LLM was
+  never called, and every pass finished in about 42ms reporting
+  "consolidation pass complete". The only output it had ever produced came
+  from the `doctor` health check, whose rows are byte-identical and score
+  1.000 — so the feature looked exercised while being inert for real memory.
+
+  The threshold is now `worker.consolidate_similarity`, defaulting to 0.65.
+  That number was chosen by replaying the same greedy clusterer over that
+  corpus at each candidate value and reading what it actually merged, not by
+  picking a rounder one: it forms clean topical pairs. `worker.consolidate_max_cluster`
+  exposes the per-cluster cap alongside it. A threshold above 1 is now
+  rejected where it is typed, because it is unreachable by any cosine and
+  would reintroduce exactly this failure.
+
+- **A single project-less experience made consolidation merge every
+  project.** `activeScopes` groups by `(user_id, project_id)`, so one row
+  with no project makes `(user, nil)` an active scope. The candidate query
+  then omitted the project filter for that scope instead of matching
+  `project_id IS NULL`, so the pass pulled in every experience the user
+  owned, across every project, and clustered them together. The summary was
+  written under the scope it ran as — `project_id` NULL — which the read
+  path treats as user-level and returns in *every* project, because it
+  matches `project_id = $n OR project_id IS NULL`. So one summary blending
+  two unrelated projects leaked into all of them, and the experiences it
+  covered were consolidated a second time despite already being folded
+  inside their own project.
+
+- **Every consolidation pass re-distilled clusters it had already
+  distilled.** Consolidation is deliberately additive: it does not supersede
+  its sources, because doing that once invalidated every source row and
+  silently broke fact-grounded retrieval. But nothing replaced that guard, so
+  the sources stayed eligible forever. On the same install, 8 identical rows
+  had become 13 summaries across 63 source links and were still growing, one
+  LLM call at a time, on every restart. A pass now skips any cluster whose
+  exact membership already backs an existing summary, and reports the count it
+  skipped so a pass that folds nothing still says whether it found nothing or
+  had already done the work.
+
 - **One install could take over another's database and lock it out.** The
   Postgres container's name, volume and port all live inside a config file, and
   which config file is used depends on `ANAMNESIA_HOME`. So a second install

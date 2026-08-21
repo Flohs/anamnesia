@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,11 +28,34 @@ import (
 	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
+// Defaults for the clustering pass. SimThreshold is the one that
+// matters, and it shipped at 0.85, which no real corpus reaches.
+//
+// Measured on a live install on 2026-08-21, over the 1,402 same-scope
+// pairs of experiences one user owned: the mean cosine was 0.289, the
+// single most similar pair scored 0.754, and NOTHING cleared 0.85. So no
+// cluster of two ever formed, the LLM was never called, and every pass
+// finished in ~42ms reporting success while folding nothing. The only
+// output it had ever produced came from the `doctor` health check, whose
+// rows are byte-identical and score 1.000.
+//
+// 0.65 was picked by replaying this same greedy algorithm over that
+// corpus at each candidate threshold and reading what it merged. It
+// forms 5 clusters, all clean topical pairs ("Managed app deletion
+// finalization" with "Managed App Deletion Design"). 0.60 also merges
+// well but fills a cluster to MaxCluster, and an over-merged summary is
+// worse than a missing one: it competes in retrieval with the sources it
+// blurred, while a cluster left unmerged is simply picked up later.
+const (
+	DefaultConsolidateSimilarity = 0.65
+	DefaultConsolidateMaxCluster = 8
+)
+
 // ConsolidateConfig tunes the clustering + distillation pass.
 type ConsolidateConfig struct {
 	Window       time.Duration // lookback for "recent experiences" (default 7d)
-	SimThreshold float64       // cosine threshold for cluster merge (default 0.85)
-	MaxCluster   int           // cap cluster size (default 8)
+	SimThreshold float64       // cosine threshold for cluster merge (default DefaultConsolidateSimilarity)
+	MaxCluster   int           // cap cluster size (default DefaultConsolidateMaxCluster)
 	MinCluster   int           // gates which clusters bother the LLM (default 2)
 	BatchLimit   int           // max experiences to fetch per scope per tick (default 200)
 }
@@ -142,10 +167,18 @@ func consolidateScope(ctx context.Context, st *store.Store, lm llm.Client, cfg C
 		return 0, nil
 	}
 	clusters := buildClusters(cands, cfg.SimThreshold, cfg.MaxCluster)
-	eligible := 0
+	done, err := distilledMemberSets(ctx, st, scope)
+	if err != nil {
+		return 0, err
+	}
+	eligible, skipped := 0, 0
 	for _, cl := range clusters {
-		if len(cl.members) >= cfg.MinCluster {
-			eligible++
+		if len(cl.members) < cfg.MinCluster {
+			continue
+		}
+		eligible++
+		if done[clusterKey(cl.members)] {
+			skipped++
 		}
 	}
 	tr.Step("cluster", fmt.Sprintf("Formed %d clusters from %d experiences", eligible, len(cands)),
@@ -153,15 +186,23 @@ func consolidateScope(ctx context.Context, st *store.Store, lm llm.Client, cfg C
 			"candidates": len(cands),
 			"threshold":  cfg.SimThreshold,
 			"clusters":   clusterDetails(clusters, cfg.MinCluster),
+			// Skipping is the ordinary steady state once a scope has
+			// been consolidated, so a pass that folds nothing has to say
+			// whether it found nothing or had already done the work.
+			"already_distilled": skipped,
 		})
 	written := 0
 	for i, cl := range clusters {
 		if len(cl.members) < cfg.MinCluster {
 			continue
 		}
+		if done[clusterKey(cl.members)] {
+			continue
+		}
 		if err := distilCluster(ctx, st, lm, scope, cl, log, tr, i); err != nil {
 			return written, err
 		}
+		done[clusterKey(cl.members)] = true
 		written++
 	}
 	return written, nil
@@ -201,6 +242,14 @@ func candidatesForConsolidation(ctx context.Context, st *store.Store, scope anam
 	if scope.ProjectID != nil {
 		args = append(args, *scope.ProjectID)
 		where = append(where, fmt.Sprintf("project_id = $%d", len(args)))
+	} else {
+		// activeScopes groups by (user_id, project_id), so a nil project
+		// is the scope of the user's project-less rows — not "any
+		// project". Omitting the filter here made a single project-less
+		// experience pull in every project the user had, cluster them
+		// together, and write the summary at project_id NULL, which
+		// retrieval returns in every project.
+		where = append(where, "project_id IS NULL")
 	}
 	args = append(args, window.String())
 	where = append(where,
@@ -231,6 +280,74 @@ func candidatesForConsolidation(ctx context.Context, st *store.Store, scope anam
 		}
 		e.Embedding = vec
 		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// clusterKey canonicalises a cluster's membership as its sorted member
+// ids. Two passes over the same rows produce the same key whatever order
+// the candidates came back in.
+func clusterKey(members []*anamnesia.Experience) string {
+	ids := make([]string, len(members))
+	for i, m := range members {
+		ids[i] = m.ID.String()
+	}
+	sort.Strings(ids)
+	return strings.Join(ids, ",")
+}
+
+// distilledMemberSets returns the membership of every cluster this scope
+// has already distilled, keyed by clusterKey.
+//
+// Consolidation deliberately does NOT supersede its sources: doing that
+// once invalidated every source row and silently broke fact-grounded
+// retrieval (see distilCluster). But nothing replaced that guard, so the
+// sources stayed eligible forever and every pass distilled the same
+// cluster again — on a live install, 8 rows had become 13 summaries
+// across 63 source links and were still growing. This is the
+// replacement: additive like the rest of the pass, and keyed on what a
+// summary was built from rather than on the source rows themselves, so
+// nothing is mutated to record that the work was done.
+//
+// The scope filter mirrors candidatesForConsolidation, including its
+// treatment of a nil ProjectID, so the two halves always consider the
+// same rows.
+func distilledMemberSets(ctx context.Context, st *store.Store, scope anamnesia.Scope) (map[string]bool, error) {
+	args := []any{scope.UserID}
+	where := []string{"user_id = $1"}
+	if scope.ProjectID != nil {
+		args = append(args, *scope.ProjectID)
+		where = append(where, fmt.Sprintf("project_id = $%d", len(args)))
+	} else {
+		where = append(where, "project_id IS NULL")
+	}
+	where = append(where,
+		"abstraction > 0",
+		"deleted_at IS NULL",
+		// -> yields NULL for a missing key and for a NULL meta, which
+		// avoids the jsonb ? operator entirely.
+		"meta->'consolidated_from' IS NOT NULL")
+	rows, err := st.Pool.Query(ctx,
+		`SELECT meta->'consolidated_from' FROM experiences WHERE `+joinAnd(where), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var ids []string
+		if err := json.Unmarshal(raw, &ids); err != nil {
+			// A summary whose lineage we cannot read cannot vouch for a
+			// cluster. Skipping it risks one duplicate; failing the pass
+			// would stop consolidation for the whole scope.
+			continue
+		}
+		sort.Strings(ids)
+		out[strings.Join(ids, ",")] = true
 	}
 	return out, rows.Err()
 }
@@ -527,10 +644,10 @@ func applyConsolidateDefaults(c ConsolidateConfig) ConsolidateConfig {
 		c.Window = 7 * 24 * time.Hour
 	}
 	if c.SimThreshold == 0 {
-		c.SimThreshold = 0.85
+		c.SimThreshold = DefaultConsolidateSimilarity
 	}
 	if c.MaxCluster == 0 {
-		c.MaxCluster = 8
+		c.MaxCluster = DefaultConsolidateMaxCluster
 	}
 	if c.MinCluster == 0 {
 		c.MinCluster = 2
