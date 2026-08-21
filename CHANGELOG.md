@@ -135,6 +135,48 @@ were rebuilt around being verifiable.
 
 ### Added
 
+- **Facts keep their history instead of being overwritten.** `UpsertFact` was
+  `INSERT … ON CONFLICT DO UPDATE`, so there was one row per key forever and a
+  changed value destroyed the previous one. The table has carried `valid_to`,
+  `invalidated_at` and `superseded_by` since `0001` and nothing ever wrote them.
+  Migration `0010` narrows the identity index to *current* rows, which is what
+  lets versions accumulate while still guaranteeing exactly one live row per
+  key. A changed value now inserts a new row and marks the old one superseded,
+  keeping its own value, provenance and embedding; re-asserting the same value
+  still updates in place, so the extractor mentioning a fact repeatedly does not
+  create a version per mention. Old values stay out of your prompts unless a
+  caller asks for them with `include_history` on `/v1/retrieve` — an agent shown
+  "cycles to work" and "takes the tram" in one context has to work out which is
+  true, so the hooks leave it off.
+
+- **An entity graph, as a third retrieval channel.** Entities and edges are
+  extracted from a whole checkpoint (opt-in, `graph.extract`), linked to the
+  memory rows they came from through `entity_mentions`, and walked at query time
+  to reach sources the vector and lexical channels did not. Entity resolution
+  merges nodes whose names mean the same thing, judged by a batched model call
+  rather than a distance threshold, so the graph stops forking a node per
+  spelling across sessions. On a 30-question benchmark the graph supplied 74 of
+  600 hits, 13 of which no other channel reached.
+
+- **`worker.extract_concurrency`**, how many sources the extractor works on at
+  once. Extraction is roughly 85% idle network wait, so raising this is close to
+  a linear speedup at identical token cost: 9.2s per source to 0.9s at eight.
+  It defaults to **1**, because it is not free of meaning — sources handled
+  together stop seeing each other's facts as merge candidates, so a bulk
+  backfill of related sessions can produce duplicates a serial drain would have
+  merged. Raise it for benchmarks and backfills.
+
+- **A LongMemEval harness with a retrieval-only mode.**
+  `scripts/longmemeval/harness.py --mode retrieval` scores retrieval directly
+  against each question's gold evidence sessions, with no answerer and no judge,
+  so a run costs one search per question and carries none of two models'
+  variance. Re-scoring a stored corpus takes about 25 seconds and no model
+  calls. `--mode end-to-end` grades answers with LongMemEval's own judge
+  prompts, ported verbatim including the separate one for abstention questions.
+  The corpus definition and baseline are committed, so the numbers can be
+  disagreed with by re-running them.
+
+
 - **A session checkpoint is cut into segments instead of sent as one blob.** The
   extractor gets one LLM call per source with a fixed output budget — 1024
   completion tokens, capped at eight operations — so a long session had one
@@ -357,6 +399,39 @@ were rebuilt around being verifiable.
   verifies a real stack.
 
 ### Changed
+
+- **Retrieval fails instead of returning nothing.** A configured embedder that
+  errored was captured, used for a trace message, and then ignored, so `Search`
+  carried on without its main channel and the caller got an ordinary empty
+  result. During a credit outage `/v1/retrieve` answered `200` with no hits for
+  a user holding hundreds of fully-embedded facts, which is indistinguishable
+  from "you have no such memory". Same reasoning as the invariant that
+  `/v1/health` must be able to fail. Having *no* embedder stays legitimate:
+  that is the lexical-only local setup.
+
+- **An unusable model completion is retried, and a truncated one gets more
+  room.** Two faults wore one error. Most are transient: re-running 32 failed
+  sources unchanged made 28 succeed, and `doRetry` covered 429s and 5xx but
+  never a `200` carrying a body that would not parse, so one hiccup became a
+  permanent hole in memory. The rest are truncation, where retrying at the same
+  budget spends another call for the same result. `finish_reason`, parsed
+  nowhere before, says which happened, so only `"length"` doubles the budget.
+  Errors now name the cause rather than the symptom. On a benchmark corpus this
+  took extraction failures from 32 to 0.
+
+- **Provenance follows the value.** `source_id` is read as "where this content
+  came from", but both the `UPDATE_FACT` path and the upsert moved it to the
+  new writer on every write, including one that re-asserted the value already
+  stored. A session about a play ended up owning the user's bike type. It now
+  moves only when the incoming value actually differs. Corpus-wide
+  misattribution fell from 35.8% to 20.5%.
+
+- **A changed value gets a fresh embedding.** The upsert kept the old vector,
+  the extractor never supplies one, and the backfill worker only looks for rows
+  `WHERE embedding IS NULL` — so a fact whose value changed kept the embedding
+  of its previous value permanently, findable by vector search only under
+  wording it no longer had. Nothing in the system could repair it.
+
 
 - **`config list` no longer claims every setting came from the environment.**
   `anamnesia start` hands the server its own configuration as environment
