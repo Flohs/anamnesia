@@ -86,6 +86,9 @@ var hookTimeouts = map[string]time.Duration{
 	// One small post, no transcript to read, but it fires while the main
 	// agent waits to continue, so it stays tight.
 	"subagent-stop": 8 * time.Second,
+	// Fires after every assistant turn and almost always decides not to
+	// flush, so the budget only has to cover the checkpoint it does run.
+	"flush": 20 * time.Second,
 }
 
 func runHook(cmd *cobra.Command, args []string) error {
@@ -93,9 +96,9 @@ func runHook(cmd *cobra.Command, args []string) error {
 	started := time.Now()
 
 	switch verb {
-	case "session-start", "retrieve", "session-end", "pre-compact", "subagent-stop":
+	case "session-start", "retrieve", "session-end", "pre-compact", "subagent-stop", "flush":
 	default:
-		return fmt.Errorf("unknown hook verb %q (want session-start|retrieve|session-end|pre-compact|subagent-stop)", verb)
+		return fmt.Errorf("unknown hook verb %q (want session-start|retrieve|session-end|pre-compact|subagent-stop|flush)", verb)
 	}
 
 	hc, err := loadHostConfig()
@@ -142,6 +145,8 @@ func runHook(cmd *cobra.Command, args []string) error {
 		note, err = doCheckpoint(ctx, hc, input, "claude-precompact", checkpointScope{})
 	case "subagent-stop":
 		note, err = doSubagentStop(ctx, hc, input)
+	case "flush":
+		note, err = doFlush(ctx, hc, input)
 	}
 	logHook(verb, started, err, note)
 	return nil
@@ -757,6 +762,28 @@ func offsetFile(sessionID string) (string, error) {
 	return filepath.Join(dir, name+".json"), nil
 }
 
+// readOffsetRecord returns the whole record, not only the position.
+// readOffset discards Updated, which is what the flush gate measures
+// elapsed time against.
+func readOffsetRecord(sessionID, transcriptPath string) (offsetRecord, bool) {
+	path, err := offsetFile(sessionID)
+	if err != nil {
+		return offsetRecord{}, false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return offsetRecord{}, false
+	}
+	var rec offsetRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return offsetRecord{}, false
+	}
+	if rec.Path != transcriptPath {
+		return offsetRecord{}, false
+	}
+	return rec, true
+}
+
 func readOffset(sessionID, transcriptPath string) int64 {
 	path, err := offsetFile(sessionID)
 	if err != nil {
@@ -975,4 +1002,62 @@ func doSubagentStop(ctx context.Context, hc *hostConfig, input claudeHookInput) 
 		return "", err
 	}
 	return fmt.Sprintf("ingested %s result", payload.Metadata["agent_type"]), nil
+}
+
+// shouldFlush decides whether a turn has produced enough to checkpoint.
+//
+// Either gate alone is enough, and either can be switched off with zero.
+// Bytes is the primary one because it is the one that lines up with
+// segments: reaching it means there is a segment's worth of new material
+// to cut, so the flush produces whole segments rather than slivers. Time
+// is the backstop for a slow conversation that never accumulates bytes
+// quickly but should still not sit uncheckpointed for hours.
+func shouldFlush(unread int64, since time.Duration, bytes int64, after time.Duration) bool {
+	if unread <= 0 {
+		return false
+	}
+	if bytes > 0 && unread >= bytes {
+		return true
+	}
+	return after > 0 && since >= after
+}
+
+// doFlush checkpoints mid-session when enough has accumulated.
+//
+// Stop fires after every assistant turn. It was removed as a checkpoint
+// hook because it re-sent the whole transcript each time, so ingest grew
+// with the square of the session length and the same content was
+// extracted repeatedly. Checkpoints have been incremental since: each one
+// sends only what is new, so ten flushes across a session send the same
+// bytes as one flush at the end, cut the same way. The only overhead is a
+// trailing partial segment per flush, which on a long session is a
+// fraction of a percent.
+//
+// What it buys is that work stops waiting for the session to end. The
+// gate is what keeps it from becoming the old Stop hook: without it,
+// every turn would cut a segment at a turn boundary instead of a topic
+// boundary, and pay a model call for each one.
+func doFlush(ctx context.Context, hc *hostConfig, input claudeHookInput) (string, error) {
+	if input.TranscriptPath == "" {
+		return "no transcript path", nil
+	}
+	bytesGate := int64(hc.Int("ingest.flush_bytes"))
+	afterGate := hc.Dur("ingest.flush_after")
+	if bytesGate <= 0 && afterGate <= 0 {
+		return "flushing is off", nil
+	}
+	info, err := os.Stat(input.TranscriptPath)
+	if err != nil {
+		return "transcript unreadable", nil
+	}
+	rec, ok := readOffsetRecord(input.SessionID, input.TranscriptPath)
+	since := time.Duration(0)
+	if ok && !rec.Updated.IsZero() {
+		since = time.Since(rec.Updated)
+	}
+	unread := info.Size() - rec.Offset
+	if !shouldFlush(unread, since, bytesGate, afterGate) {
+		return "", nil
+	}
+	return doCheckpoint(ctx, hc, input, "claude-flush", checkpointScope{})
 }

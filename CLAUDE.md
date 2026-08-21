@@ -28,13 +28,28 @@ image.
 
 ## What it does
 
-Four hooks: `SessionStart` loads memory into the session,
-`UserPromptSubmit` retrieves for the prompt, and `PreCompact` and
-`SessionEnd` checkpoint the conversation. Checkpoints are **incremental**:
-a per-session byte offset in `~/.anamnesia/offsets/` means each one sends
-only what was added since the last. (`Stop` must not be used for this: it
-fires after every assistant turn, which made ingest quadratic in session
-length.)
+Six hooks: `SessionStart` loads memory into the session,
+`UserPromptSubmit` retrieves for the prompt, `PreCompact` and
+`SessionEnd` checkpoint the conversation, `Stop` flushes mid-session once
+enough has accumulated, and `SubagentStop` records what a subagent
+concluded. Checkpoints are **incremental**: a per-session byte offset in
+`~/.anamnesia/offsets/` means each one sends only what was added since
+the last.
+
+`Stop` was removed once and is back gated, which is worth understanding
+before touching it. It fires after every assistant turn, and it was
+retired because it re-sent the whole transcript each time, so ingest grew
+with the square of the session length. The offset fixed that: each flush
+now sends only what is new, so ten flushes across a session send the same
+bytes as one at the end, cut the same way, plus one trailing partial
+segment each. What still must not happen is flushing *every* turn —
+`ingest.flush_bytes` and `ingest.flush_after` are what stop that, and
+setting both to 0 returns to checkpointing only at the end.
+
+A session that crashes fires neither `PreCompact` nor `SessionEnd`, so
+its last stretch is never checkpointed. It is not lost: the transcript is
+on disk and the offset says how far we read. `anamnesia recover` collects
+those tails, and `SessionStart` spawns it detached.
 
 A checkpoint, `POST /v1/ingest`, or the `anamnesia_ingest` MCP tool lands as
 a `sources` row. A background extractor reads pending sources, runs a

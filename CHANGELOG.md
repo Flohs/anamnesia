@@ -219,6 +219,21 @@ were rebuilt around being verifiable.
 
 ### Added
 
+- **Mid-session flushing, on a gated `Stop` hook.** Work no longer waits for
+  a session to end: once `ingest.flush_bytes` (default 16384) of new
+  transcript accumulates, or `ingest.flush_after` (default 20m) passes, the
+  turn is checkpointed.
+
+  `Stop` was retired once because it re-sent the whole transcript every turn,
+  making ingest quadratic in session length. Checkpoints have been
+  incremental since, so each flush sends only what is new: ten flushes across
+  a session send the same bytes as one at the end, cut the same way, plus one
+  trailing partial segment each — a fraction of a percent on a long session.
+  The gate is what keeps it from becoming the old hook, since flushing every
+  turn would cut segments at turn boundaries rather than topic boundaries.
+  Setting both thresholds to 0 restores checkpointing only at PreCompact and
+  SessionEnd.
+
 - **Subagent results reach memory.** A subagent runs in a transcript of its
   own that no hook ever read, so everything it worked out was invisible: one
   session here spawned 43 of them, implementing features, reviewing branches

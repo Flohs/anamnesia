@@ -180,6 +180,10 @@ var settings = []setting{
 		Doc: "Also record open obligations (\"I'll send X by Friday\") in the commitments ledger."},
 
 	// ─── ingest ──────────────────────────────────────────────────────
+	{Key: "ingest.flush_bytes", Kind: kInt, Def: "16384", Env: "", Zeroable: true,
+		Doc: "Checkpoint mid-session once this many new bytes of transcript have accumulated. Stop fires after every assistant turn; this decides when that turn is worth a checkpoint. Bytes rather than turns because it is what lines up with segments: reaching it means there is a segment's worth of new material to cut, so a flush produces whole segments instead of slivers. Because checkpoints are incremental, flushing often costs about the same as flushing once at the end — the same bytes, cut the same way — it just stops the work waiting for the session to finish. Set to 0 to use only the time gate."},
+	{Key: "ingest.flush_after", Kind: kDuration, Def: "20m", Env: "", Zeroable: true,
+		Doc: "Checkpoint mid-session once this long has passed since the last one, however little has accumulated. The backstop for a slow conversation that never reaches ingest.flush_bytes quickly but should still not sit uncheckpointed for hours. Set to 0 to use only the byte gate; set both to 0 to checkpoint only at PreCompact and SessionEnd, which is what earlier versions did."},
 	{Key: "ingest.recover_stranded", Kind: kBool, Def: "true", Env: "",
 		Doc: "Ingest transcript tails from sessions that ended without a checkpoint. A checkpoint fires on PreCompact and SessionEnd, so a session that crashes or is killed never sends its last stretch of work. The transcript is still on disk and the offset file records how far it was read, so `anamnesia recover` reads the rest; session start runs it in the background. Turn it off to leave abandoned tails alone."},
 	{Key: "ingest.recover_idle", Kind: kDuration, Def: "15m", Env: "",

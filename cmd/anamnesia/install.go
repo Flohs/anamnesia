@@ -51,6 +51,7 @@ type hookSpec struct {
 //	PreCompact       checkpoint the transcript before context is compacted
 //	SessionEnd       checkpoint the transcript when the session finishes
 //	SubagentStop     record what a subagent concluded
+//	Stop             checkpoint mid-session once enough has accumulated
 //
 // SessionEnd rather than Stop is deliberate. Stop fires every time the
 // agent finishes a response, so checkpointing there re-sent the entire
@@ -66,6 +67,12 @@ var anamnesiaHooks = []hookSpec{
 	// without this everything an agent worked out is invisible to memory.
 	// Only its final message is taken: see subagentPayload.
 	{event: "SubagentStop", verb: "subagent-stop", timeout: 15},
+	// Stop is back, gated. It was removed because it re-sent the whole
+	// transcript every turn; checkpoints have been incremental since, so
+	// each flush sends only what is new. ingest.flush_bytes and
+	// ingest.flush_after decide when it does anything at all, and setting
+	// both to zero returns to checkpointing only at the end.
+	{event: "Stop", verb: "flush", timeout: 30},
 }
 
 type installFlags struct {

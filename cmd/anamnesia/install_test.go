@@ -141,10 +141,13 @@ func TestInstallReplacesUnmarkedHooks(t *testing.T) {
 	}
 }
 
-// TestInstallRemovesRetiredEvents checks that hooks on events this version
-// no longer uses are swept, not left firing forever. Stop was replaced by
-// SessionEnd precisely because it fired on every turn.
-func TestInstallRemovesRetiredEvents(t *testing.T) {
+// TestInstallReplacesALegacyStopHook. Stop once ran the checkpoint, was
+// retired when SessionEnd replaced it, and is now back running the gated
+// flush. An upgrading install must end with exactly one Stop entry, the
+// current one: leaving the old one alongside it would checkpoint the
+// whole transcript on every turn again, which is the behaviour retiring
+// it was meant to stop.
+func TestInstallReplacesALegacyStopHook(t *testing.T) {
 	dir := t.TempDir()
 	settings := filepath.Join(dir, "settings.json")
 	writeJSONFile(t, settings, map[string]any{
@@ -160,11 +163,47 @@ func TestInstallRemovesRetiredEvents(t *testing.T) {
 	installInto(t, dir)
 	obj := readSettings(t, settings)
 
-	if entries := hookEntries(t, obj, "Stop"); len(entries) != 0 {
-		t.Errorf("Stop still has %d entries; retired events must be removed", len(entries))
+	entries := hookEntries(t, obj, "Stop")
+	if len(entries) != 1 {
+		t.Fatalf("Stop has %d entries, want exactly 1", len(entries))
+	}
+	blob, _ := json.Marshal(entries)
+	if strings.Contains(string(blob), "hook session-end") {
+		t.Errorf("the legacy Stop hook survived: %s", blob)
+	}
+	if !strings.Contains(string(blob), "hook flush") {
+		t.Errorf("Stop does not run the flush verb: %s", blob)
 	}
 	if entries := hookEntries(t, obj, "SessionEnd"); len(entries) != 1 {
 		t.Errorf("SessionEnd has %d entries, want 1", len(entries))
+	}
+}
+
+// TestInstallRemovesRetiredEvents checks that hooks on events this
+// version no longer uses are swept, not left firing forever. PostToolUse
+// stands in for any event dropped from the layout: it fires constantly,
+// so one left behind would be both useless and expensive.
+func TestInstallRemovesRetiredEvents(t *testing.T) {
+	dir := t.TempDir()
+	settings := filepath.Join(dir, "settings.json")
+	writeJSONFile(t, settings, map[string]any{
+		"hooks": map[string]any{
+			"PostToolUse": []any{map[string]any{
+				managedKey: true,
+				"matcher":  "",
+				"hooks":    []any{map[string]any{"type": "command", "command": "anamnesia hook retrieve"}},
+			}},
+		},
+	})
+
+	installInto(t, dir)
+	obj := readSettings(t, settings)
+
+	if entries := hookEntries(t, obj, "PostToolUse"); len(entries) != 0 {
+		t.Errorf("PostToolUse still has %d entries; retired events must be removed", len(entries))
+	}
+	if entries := hookEntries(t, obj, "UserPromptSubmit"); len(entries) != 1 {
+		t.Errorf("UserPromptSubmit has %d entries, want 1", len(entries))
 	}
 }
 
