@@ -126,6 +126,17 @@ func configSnapshot(hc *hostConfig) []httpapi.ConfigItem {
 // Until these became settings the worker fell back to its own defaults,
 // so nothing here was configurable and /v1/config could not report what
 // the running server was actually forgetting by.
+// consolidateConfig turns the resolved configuration into the clustering
+// pass's own. Before this existed, jobs.Config.Consolidate was left at
+// its zero value, so the threshold could only ever be the compiled-in
+// default — and that default was one no real corpus reached.
+func consolidateConfig(cfg *config.Config) jobs.ConsolidateConfig {
+	return jobs.ConsolidateConfig{
+		SimThreshold: cfg.ConsolidateSimilarity,
+		MaxCluster:   cfg.ConsolidateMaxCluster,
+	}
+}
+
 func decayConfig(cfg *config.Config) decay.Config {
 	return decay.Config{
 		HalfLives: map[anamnesia.ExperienceKind]time.Duration{
@@ -291,6 +302,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 				ExtractConcurrency: cfg.ExtractConcurrency,
 				Extract:            extractConfig(cfg),
 				Decay:              decayConfig(cfg),
+				Consolidate:        consolidateConfig(cfg),
 			},
 			Store:     st,
 			Embedder:  emb,
