@@ -358,12 +358,52 @@ func (d Deps) resolveScope(ctx context.Context, ev *HookEvent) (anamnesia.Scope,
 		proj = d.DefaultProject
 	}
 	if proj != "" {
-		pid, err := d.Store.EnsureProject(ctx, uid, proj)
+		pid, found, err := d.Store.LookupProject(ctx, uid, proj)
 		if err != nil {
-			return anamnesia.Scope{}, fmt.Errorf("ensure project: %w", err)
+			return anamnesia.Scope{}, fmt.Errorf("look up project: %w", err)
+		}
+		if !found {
+			// Deliberately the nil uuid rather than a nil pointer.
+			// retrieval.Search drops the project filter entirely when
+			// ProjectID is nil, which means "every project", not "no
+			// project" — the first prompt in a new repository would read
+			// across everything the user has ever stored. The nil uuid
+			// matches no project row, so the read returns user-level
+			// memories and nothing else, which is what "nothing here
+			// yet" means.
+			pid = uuid.Nil
 		}
 		scope.ProjectID = &pid
 	}
+	return scope, nil
+}
+
+// resolveWriteScope is resolveScope for the handlers that persist
+// something, and is the only path that brings a project into existence.
+//
+// resolveScope used to create the project itself, and eleven endpoints
+// used it, most of them reads. SessionStart and UserPromptSubmit fire in
+// every directory Claude Code is opened in, so opening a repository
+// created a project row before anything was written to it: one real
+// install carried 10 projects with no sources, no facts and no
+// experiences. A project now appears when it first holds something.
+func (d Deps) resolveWriteScope(ctx context.Context, ev *HookEvent) (anamnesia.Scope, error) {
+	scope, err := d.resolveScope(ctx, ev)
+	if err != nil {
+		return scope, err
+	}
+	if scope.ProjectID == nil || *scope.ProjectID != uuid.Nil {
+		return scope, nil
+	}
+	proj := ev.Project
+	if proj == "" {
+		proj = d.DefaultProject
+	}
+	pid, err := d.Store.EnsureProject(ctx, scope.UserID, proj)
+	if err != nil {
+		return anamnesia.Scope{}, fmt.Errorf("ensure project: %w", err)
+	}
+	scope.ProjectID = &pid
 	return scope, nil
 }
 
@@ -679,7 +719,7 @@ func (d Deps) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ev := HookEvent{User: req.User, Project: req.Project}
-	scope, err := d.resolveScope(r.Context(), &ev)
+	scope, err := d.resolveWriteScope(r.Context(), &ev)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -814,7 +854,7 @@ func (d Deps) handleExperience(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "body required", http.StatusBadRequest)
 		return
 	}
-	scope, err := d.resolveScope(r.Context(), &HookEvent{User: req.User, Project: req.Project})
+	scope, err := d.resolveWriteScope(r.Context(), &HookEvent{User: req.User, Project: req.Project})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -941,7 +981,7 @@ func (d Deps) handleCommitments(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "body required", http.StatusBadRequest)
 			return
 		}
-		scope, err := d.resolveScope(r.Context(), &HookEvent{User: req.User, Project: req.Project})
+		scope, err := d.resolveWriteScope(r.Context(), &HookEvent{User: req.User, Project: req.Project})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

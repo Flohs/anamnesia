@@ -329,12 +329,43 @@ func (d Deps) resolveScope(ctx context.Context, args map[string]any) (anamnesia.
 		proj = d.DefaultProject
 	}
 	if proj != "" {
-		pid, err := d.Store.EnsureProject(ctx, uid, proj)
+		pid, found, err := d.Store.LookupProject(ctx, uid, proj)
 		if err != nil {
 			return anamnesia.Scope{}, err
 		}
+		if !found {
+			// The nil uuid, not a nil pointer: retrieval drops the
+			// project filter entirely for a nil ProjectID, which reads
+			// every project rather than none. See the same note in
+			// internal/httpapi.
+			pid = uuid.Nil
+		}
 		scope.ProjectID = &pid
 	}
+	return scope, nil
+}
+
+// resolveWriteScope is resolveScope for the tools that persist
+// something, and is the only path here that creates a project. Reading
+// used to create one, so asking a question about a repository was enough
+// to file it as a project that then held nothing.
+func (d Deps) resolveWriteScope(ctx context.Context, args map[string]any) (anamnesia.Scope, error) {
+	scope, err := d.resolveScope(ctx, args)
+	if err != nil {
+		return scope, err
+	}
+	if scope.ProjectID == nil || *scope.ProjectID != uuid.Nil {
+		return scope, nil
+	}
+	proj, _ := args["project"].(string)
+	if proj == "" {
+		proj = d.DefaultProject
+	}
+	pid, err := d.Store.EnsureProject(ctx, scope.UserID, proj)
+	if err != nil {
+		return anamnesia.Scope{}, err
+	}
+	scope.ProjectID = &pid
 	return scope, nil
 }
 
@@ -409,7 +440,7 @@ func (d Deps) factsUpsert(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 	if key == "" {
 		return bad(errors.New("key required"))
 	}
-	scope, err := d.resolveScope(ctx, args)
+	scope, err := d.resolveWriteScope(ctx, args)
 	if err != nil {
 		return bad(err)
 	}
@@ -468,7 +499,7 @@ func (d Deps) experienceRecord(ctx context.Context, req mcp.CallToolRequest) (*m
 	if body == "" {
 		return bad(errors.New("body required"))
 	}
-	scope, err := d.resolveScope(ctx, args)
+	scope, err := d.resolveWriteScope(ctx, args)
 	if err != nil {
 		return bad(err)
 	}
@@ -542,7 +573,7 @@ func (d Deps) identity(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 
 func (d Deps) commitmentRecord(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := argsFromRequest(req)
-	scope, err := d.resolveScope(ctx, args)
+	scope, err := d.resolveWriteScope(ctx, args)
 	if err != nil {
 		return bad(err)
 	}
@@ -697,7 +728,7 @@ func (d Deps) skillsRegister(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	if name == "" {
 		return bad(errors.New("name required"))
 	}
-	scope, err := d.resolveScope(ctx, args)
+	scope, err := d.resolveWriteScope(ctx, args)
 	if err != nil {
 		return bad(err)
 	}
@@ -743,7 +774,7 @@ func (d Deps) workingAppend(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if body == "" {
 		return bad(errors.New("body required"))
 	}
-	scope, err := d.resolveScope(ctx, args)
+	scope, err := d.resolveWriteScope(ctx, args)
 	if err != nil {
 		return bad(err)
 	}
@@ -831,7 +862,7 @@ func (d Deps) graphEntity(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 	if kind == "" || name == "" {
 		return bad(errors.New("kind and name must each contain at least one letter or digit"))
 	}
-	scope, err := d.resolveScope(ctx, args)
+	scope, err := d.resolveWriteScope(ctx, args)
 	if err != nil {
 		return bad(err)
 	}
@@ -916,7 +947,7 @@ func (d Deps) ingest(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToo
 	if content == "" {
 		return bad(errors.New("content required"))
 	}
-	scope, err := d.resolveScope(ctx, args)
+	scope, err := d.resolveWriteScope(ctx, args)
 	if err != nil {
 		return bad(err)
 	}

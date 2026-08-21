@@ -7,6 +7,22 @@ were rebuilt around being verifiable.
 
 ### Fixed
 
+- **Opening a directory created a project, before anything was stored in
+  it.** `resolveScope` called `EnsureProject`, and eleven HTTP endpoints and
+  seventeen MCP tools used it, most of them reads. `SessionStart` and
+  `UserPromptSubmit` fire in every directory Claude Code is opened in, so
+  merely starting a session filed that directory as a project. One real
+  install carried 10 projects holding no sources, no facts and no
+  experiences. A project is now created only by something that persists:
+  ingest, a fact upsert, an experience or commitment record, a skill
+  registration, a working-memory append, or a graph entity.
+
+  An unknown project resolves to the nil uuid rather than a nil id. That
+  distinction matters: `retrieval.Search` omits the project filter entirely
+  when the id is nil, which means "every project", so the first prompt in a
+  new repository would otherwise have read across everything the user had
+  ever stored.
+
 - **Every release after rc9 was invisible to `anamnesia update`.** The
   prerelease part of a version was compared as a plain string, so `"rc10" <
   "rc9"` because `'1' < '9'`. Tagging rc10 built and published normally, and
