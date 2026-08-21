@@ -4,4 +4,4 @@
 # Written by hand, or with: anamnesia config --project set <key> <value>
 
 [identity]
-project = "anamnesia-open-source"
+project = "anamnesia"
