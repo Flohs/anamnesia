@@ -168,6 +168,51 @@ type Skill struct {
 	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
 }
 
+// Artifact is a page Claude Code published, kept as a pointer rather than
+// a copy. Identity is (Scope.UserID, ArtifactUUID): republishing a file
+// redeploys to the same URL, so it updates this row instead of adding one.
+//
+// Body is the readable text of the page at publish time, and is what gets
+// embedded. It is empty for an artifact recovered from a transcript after
+// its source file was cleaned up, which is the usual case for anything
+// older than the current session; the pointer is still worth having, and
+// a later republish fills the body in.
+type Artifact struct {
+	ID    uuid.UUID `json:"id"`
+	Scope Scope     `json:"scope"`
+
+	ArtifactUUID uuid.UUID `json:"artifact_uuid"`
+	URL          string    `json:"url"`
+	Title        string    `json:"title,omitempty"`
+	Description  string    `json:"description,omitempty"`
+	FilePath     string    `json:"file_path,omitempty"`
+	Body         string    `json:"body,omitempty"`
+
+	Meta map[string]any `json:"meta,omitempty"`
+
+	// Project is the slug the artifact was published under, filled in by
+	// listings so a reader sees a name rather than a uuid. Not stored:
+	// project_id is the record.
+	Project string `json:"project,omitempty"`
+
+	Embedding  []float32 `json:"-"`
+	EmbedModel string    `json:"embed_model,omitempty"`
+
+	OccurredAt time.Time  `json:"occurred_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
+}
+
+// Label is the best short name for an artifact: its title if it declared
+// one, otherwise the description it was published with.
+func (a *Artifact) Label() string {
+	if a.Title != "" {
+		return a.Title
+	}
+	return a.Description
+}
+
 // WorkingRole tags an entry in a working-memory session.
 type WorkingRole string
 
@@ -210,23 +255,25 @@ const (
 	DomainExperience Domain = "experience"
 	DomainSkill      Domain = "skill"
 	DomainWorking    Domain = "working"
+	DomainArtifact   Domain = "artifact"
 )
 
 func (d Domain) Valid() bool {
 	switch d {
-	case DomainFact, DomainExperience, DomainSkill, DomainWorking:
+	case DomainFact, DomainExperience, DomainSkill, DomainWorking, DomainArtifact:
 		return true
 	}
 	return false
 }
 
 // SearchHit is a scored result from cross-domain retrieval. Exactly one
-// of Fact / Experience / Skill is populated; Domain says which.
+// of Fact / Experience / Skill / Artifact is populated; Domain says which.
 type SearchHit struct {
 	Domain     Domain      `json:"domain"`
 	Fact       *Fact       `json:"fact,omitempty"`
 	Experience *Experience `json:"experience,omitempty"`
 	Skill      *Skill      `json:"skill,omitempty"`
+	Artifact   *Artifact   `json:"artifact,omitempty"`
 
 	Score        float64 `json:"score"`
 	VectorRank   int     `json:"vector_rank,omitempty"`
@@ -249,6 +296,10 @@ func (h SearchHit) ID() uuid.UUID {
 		if h.Skill != nil {
 			return h.Skill.ID
 		}
+	case DomainArtifact:
+		if h.Artifact != nil {
+			return h.Artifact.ID
+		}
 	}
 	return uuid.Nil
 }
@@ -269,6 +320,10 @@ func (h SearchHit) Body() string {
 	case DomainSkill:
 		if h.Skill != nil {
 			return h.Skill.Name + "\n\n" + h.Skill.Description
+		}
+	case DomainArtifact:
+		if h.Artifact != nil {
+			return h.Artifact.Label() + "\n\n" + h.Artifact.Body
 		}
 	}
 	return ""

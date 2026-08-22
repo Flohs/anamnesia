@@ -72,6 +72,11 @@ type claudeHookInput struct {
 	AgentType        string `json:"agent_type"`
 	LastAssistantMsg string `json:"last_assistant_message"`
 	Trigger          string `json:"trigger"`
+	// PostToolUse only. ToolResponse carries the tool's own output,
+	// which for the Artifact tool is the line naming the published URL.
+	ToolName     string          `json:"tool_name"`
+	ToolInput    json.RawMessage `json:"tool_input"`
+	ToolResponse json.RawMessage `json:"tool_response"`
 }
 
 // errServerUnreachable is logged when a hook found no server to talk to.
@@ -90,6 +95,9 @@ var hookTimeouts = map[string]time.Duration{
 	// Fires after every assistant turn and almost always decides not to
 	// flush, so the budget only has to cover the checkpoint it does run.
 	"flush": 20 * time.Second,
+	// Reads one file and posts one row, with no model in the path. It
+	// fires while the agent waits to continue, so it stays tight.
+	"artifact": 8 * time.Second,
 }
 
 func runHook(cmd *cobra.Command, args []string) error {
@@ -97,9 +105,9 @@ func runHook(cmd *cobra.Command, args []string) error {
 	started := time.Now()
 
 	switch verb {
-	case "session-start", "retrieve", "session-end", "pre-compact", "subagent-stop", "flush":
+	case "session-start", "retrieve", "session-end", "pre-compact", "subagent-stop", "flush", "artifact":
 	default:
-		return fmt.Errorf("unknown hook verb %q (want session-start|retrieve|session-end|pre-compact|subagent-stop|flush)", verb)
+		return fmt.Errorf("unknown hook verb %q (want session-start|retrieve|session-end|pre-compact|subagent-stop|flush|artifact)", verb)
 	}
 
 	hc, err := loadHostConfig()
@@ -148,6 +156,8 @@ func runHook(cmd *cobra.Command, args []string) error {
 		note, err = doSubagentStop(ctx, hc, input)
 	case "flush":
 		note, err = doFlush(ctx, hc, input)
+	case "artifact":
+		note, err = doArtifact(ctx, hc, input)
 	}
 	logHook(verb, started, err, note)
 	return nil
@@ -228,6 +238,7 @@ func httpPost(ctx context.Context, hc *hostConfig, path string, body, dst any) e
 type sessionStartResp struct {
 	Facts        []factMin       `json:"facts"`
 	Experiences  []experienceMin `json:"experiences"`
+	Artifacts    []artifactMin   `json:"artifacts,omitempty"`
 	PersonaBlock string          `json:"persona_block,omitempty"`
 	Hint         string          `json:"hint,omitempty"`
 }
@@ -288,6 +299,12 @@ func doSessionStart(ctx context.Context, w io.Writer, hc *hostConfig, ev hookEve
 			fmt.Fprintf(w, "- %s\n", title)
 		}
 	}
+	if len(resp.Artifacts) > 0 {
+		fmt.Fprintln(w, "\n**Artifacts**")
+		for _, a := range resp.Artifacts {
+			fmt.Fprintf(w, "- %s\n  %s\n", a.label(), a.URL)
+		}
+	}
 	return note, nil
 }
 
@@ -296,6 +313,22 @@ func doSessionStart(ctx context.Context, w io.Writer, hc *hostConfig, ev hookEve
 type retrieveResp struct {
 	Hits         []retrieveHit     `json:"hits"`
 	CrossProject []crossProjectHit `json:"cross_project,omitempty"`
+	Artifacts    []artifactMin     `json:"artifacts,omitempty"`
+}
+
+// artifactMin is a published page, rendered as a link rather than as
+// content: the page is the content, and it is one click away.
+type artifactMin struct {
+	URL         string `json:"url"`
+	Title       string `json:"title,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+func (a artifactMin) label() string {
+	if a.Title != "" {
+		return a.Title
+	}
+	return trimLine(a.Description, 80)
 }
 
 type crossProjectHit struct {
@@ -326,8 +359,9 @@ func doRetrieve(ctx context.Context, w io.Writer, hc *hostConfig, ev hookEvent) 
 	if err := httpPost(ctx, hc, "/v1/retrieve", ev, &resp); err != nil {
 		return "", err
 	}
-	note := fmt.Sprintf("%d hits, %d cross-project", len(resp.Hits), len(resp.CrossProject))
-	if len(resp.Hits) == 0 && len(resp.CrossProject) == 0 {
+	note := fmt.Sprintf("%d hits, %d cross-project, %d artifacts",
+		len(resp.Hits), len(resp.CrossProject), len(resp.Artifacts))
+	if len(resp.Hits) == 0 && len(resp.CrossProject) == 0 && len(resp.Artifacts) == 0 {
 		return note, nil
 	}
 	if len(resp.Hits) > 0 {
@@ -362,6 +396,12 @@ func doRetrieve(ctx context.Context, w io.Writer, hc *hostConfig, ev hookEvent) 
 				label += " · " + c.Recency
 			}
 			fmt.Fprintf(w, "- %s [%s]\n", c.Title, label)
+		}
+	}
+	if len(resp.Artifacts) > 0 {
+		fmt.Fprintln(w, "\n## Artifacts you published on this")
+		for _, a := range resp.Artifacts {
+			fmt.Fprintf(w, "- %s\n  %s\n", a.label(), a.URL)
 		}
 	}
 	return note, nil

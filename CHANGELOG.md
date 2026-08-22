@@ -7,6 +7,22 @@ were rebuilt around being verifiable.
 
 ### Fixed
 
+- **An embedding column could sit at the wrong width behind a green health
+  check.** `migrate --dims` re-dimensions the tables named in
+  `embeddingTables`, and `EmbeddingDims` read `facts.embedding` alone as
+  representative of all of them. A table added to the schema and left off
+  that list therefore kept the old width, rejected every embedding write,
+  and reported healthy throughout, because the check was reading a
+  different column from the one the writes were failing against.
+
+  `EmbeddingDims` now reads every registered column and refuses to answer
+  when they disagree, naming the table and the repair. A test holds the
+  list against the live schema, so leaving a new table off it fails on the
+  migration that adds it rather than months later. The same test caught two
+  more places a new project-scoped table has to be registered: `project
+  move` would have stranded artifacts under the old slug, and `project
+  prune` would have deleted a project that held nothing but them.
+
 - **A session whose transcript was gone counted as a broken hook.**
   `SessionEnd` fires for sessions whose transcript was never written or has
   already been removed, and the checkpoint reported "no such file or
@@ -231,6 +247,71 @@ were rebuilt around being verifiable.
   it out plus a margin, whatever it is set to.
 
 ### Added
+
+- **Artifacts are remembered, as links rather than as copies.** Publishing
+  a page to claude.ai produced a URL that nothing kept. It was never lost,
+  because the URL is in the transcript, but nothing went back for it:
+  measured on one install, 31 artifacts existed across 9 projects and
+  memory held none of them.
+
+  A `PostToolUse` hook matched to the `Artifact` tool now records each one
+  as it is made. This is the one path that deliberately skips extraction.
+  Everything else reaches memory through a surprise gate that defaults to
+  NOOP, because most of what passes through a session is noise; a URL is
+  the case that gate is wrong for, since there is nothing to judge and an
+  identifier that is only probably remembered is not an identifier. The
+  hook parses the tool's own response, reads the published file while it
+  still exists, strips the markup, and writes the row. No source, no gate,
+  no model. Tool hooks fire inside subagents too, so a page an agent
+  published is captured like any other.
+
+  Artifacts are their own table rather than facts or experiences, because
+  both do something wrong to a durable pointer. Facts are listed wholesale
+  into every session up to a 50 row budget, so artifacts would crowd out
+  the project configuration that block exists for. Experiences decay and
+  are consolidated, and a consolidation pass that merged two artifacts
+  would take the URL with it. Identity is the artifact's own id, so
+  republishing a file updates the row instead of adding one.
+
+  They surface two ways. `anamnesia artifacts` lists them, newest first,
+  and there is an `anamnesia_artifacts_list` MCP tool. And a prompt that
+  matches one is offered it alongside the answer, on a budget of three
+  that is separate from the fused results: adding a fourth domain to the
+  shared pool was measured once on the lexical channel and crowded the
+  graph channel out of the top-20 while changing recall by nothing, and an
+  artifact should be a link beside an answer rather than one displacing a
+  memory that would have answered the question.
+
+  Relevance is an absolute bar, not a rank. A fused RRF score cannot
+  express "this actually matches", because it gives the best of an
+  irrelevant pool exactly what it gives the best of a relevant one, and
+  the lexical channel cannot stand in either, since `plainto_tsquery` ANDs
+  every term and a natural-language prompt therefore matches nothing. So
+  artifacts are searched on their own and filtered by cosine distance.
+  `retrieval.artifact_max_distance` defaults to 0.60, measured over 33
+  real artifacts with `openai/text-embedding-3-small`: relevant matches
+  scored 0.32 to 0.63 and the closest match for an unrelated prompt scored
+  0.759. Set it to 0 to leave artifacts to the listing alone.
+
+- **`anamnesia artifacts backfill`, for everything published before the
+  hook existed.** It reads every transcript, pairs each Artifact tool call
+  with its result, and records what it finds. On the install this was
+  built against: 2,502 transcripts in 8 seconds, 32 artifacts recovered
+  across 5 projects, 9 of them with their page text.
+
+  It is not part of `anamnesia recover`, which is offset-driven and feeds
+  the extractor. Both are wrong here: every artifact worth recovering sits
+  in bytes that were already read, so an offset sweep skips them by
+  construction, and there are 49 offset files against 2,502 transcripts.
+
+  Only the pointer survives for most of them. A published file lives in a
+  session scratchpad that is cleaned up, so 23 of the 32 recovered as a
+  URL, a description, a project and a date with no page text; those are
+  marked `body_missing` and a later republish fills them in. URLs that
+  appear only as prose, with no tool call to describe them, are reported
+  rather than dropped silently. Being keyed by artifact id makes the whole
+  thing idempotent, which also makes it the repair path for anything the
+  live hook missed because the server was down.
 
 - **Tab completion for commands, flags, and the values that go with them.**
   Cobra has generated a completion script all along and nothing ever

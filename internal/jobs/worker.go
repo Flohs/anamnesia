@@ -204,11 +204,40 @@ func (w *Worker) tickEmbed(ctx context.Context) (string, error) {
 		}
 		w.Log.Info("embedded entities", "n", len(ents))
 	}
-	if len(facts) == 0 && len(exps) == 0 && len(ents) == 0 {
+	// Backfill artifacts. The text is the label plus the page's own
+	// content, so retrieval matches what the artifact says rather than
+	// only the sentence it was published with. An artifact recovered from
+	// a transcript has no body and is embedded on its label alone, which
+	// is thin but still findable.
+	arts, err := w.Store.ArtifactsMissingEmbedding(ctx, w.Cfg.EmbedBatch)
+	if err != nil {
+		return "", fmt.Errorf("fetch artifacts: %w", err)
+	}
+	if len(arts) > 0 {
+		texts := make([]string, len(arts))
+		for i, a := range arts {
+			texts[i] = expText(a.Label(), a.Body)
+		}
+		vecs, err := w.Embedder.Embed(ctx, texts)
+		if err != nil {
+			return "", fmt.Errorf("embed artifacts: %w", err)
+		}
+		for i, a := range arts {
+			if i >= len(vecs) || vecs[i] == nil {
+				continue
+			}
+			if err := w.Store.SetArtifactEmbedding(ctx, a.ID, vecs[i], w.Embedder.Model()); err != nil {
+				w.Log.Warn("set artifact embedding", "id", a.ID, "err", err)
+			}
+		}
+		w.Log.Info("embedded artifacts", "n", len(arts))
+	}
+	if len(facts) == 0 && len(exps) == 0 && len(ents) == 0 && len(arts) == 0 {
 		return "nothing to embed", nil
 	}
 	w.publishQueues(ctx)
-	return fmt.Sprintf("embedded %d facts, %d experiences, %d entities", len(facts), len(exps), len(ents)), nil
+	return fmt.Sprintf("embedded %d facts, %d experiences, %d entities, %d artifacts",
+		len(facts), len(exps), len(ents), len(arts)), nil
 }
 
 func (w *Worker) tickForget(ctx context.Context) (string, error) {

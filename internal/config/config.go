@@ -73,7 +73,11 @@ type Config struct {
 	// value above 1 is unreachable by any cosine and would switch
 	// consolidation off while still reporting healthy passes, which is
 	// the failure this setting exists to make visible.
-	ConsolidateSimilarity float64       // ANAMNESIA_CONSOLIDATE_SIMILARITY (default 0.65)
+	ConsolidateSimilarity float64 // ANAMNESIA_CONSOLIDATE_SIMILARITY (default 0.65)
+	// ArtifactMaxDistance is the cosine distance a published artifact
+	// must be within to be offered beside an answer. Zero switches the
+	// prompt-driven surface off.
+	ArtifactMaxDistance   float64       // ANAMNESIA_ARTIFACT_MAX_DISTANCE (default 0.60)
 	ConsolidateMaxCluster int           // ANAMNESIA_CONSOLIDATE_MAX_CLUSTER (default 8)
 	ForgetEvery           time.Duration // ANAMNESIA_FORGET_EVERY (default 1h)
 	DecayEvery            time.Duration // ANAMNESIA_DECAY_EVERY (default 1h)
@@ -241,6 +245,7 @@ func Load() (*Config, error) {
 		// Defaults repeated from jobs.DefaultConsolidate*; the agreement
 		// is held by TestConsolidateDefaultsAgreeWithTheClusterer.
 		ConsolidateSimilarity: fraction("ANAMNESIA_CONSOLIDATE_SIMILARITY", 0.65),
+		ArtifactMaxDistance:   fraction("ANAMNESIA_ARTIFACT_MAX_DISTANCE", 0.60),
 		ConsolidateMaxCluster: num("ANAMNESIA_CONSOLIDATE_MAX_CLUSTER", 8),
 		ForgetEvery:           dur("ANAMNESIA_FORGET_EVERY", time.Hour),
 		DecayEvery:            dur("ANAMNESIA_DECAY_EVERY", time.Hour),

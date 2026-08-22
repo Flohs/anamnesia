@@ -122,7 +122,7 @@ func (s *Store) MarkFailed(ctx context.Context, id uuid.UUID, errMsg string) err
 
 // QueuePending returns the number of sources awaiting extraction
 // (extraction_state='pending') and the number of facts + experiences +
-// entities still missing an embedding, both scoped to userID. A caller
+// entities + artifacts still missing an embedding, both scoped to userID. A caller
 // can poll this between ingest and retrieve to know when retrieval is
 // fully warm: extract pending → facts are written, embed pending →
 // vector retrieval ranking is meaningful.
@@ -137,6 +137,8 @@ func (s *Store) QueuePending(ctx context.Context, userID uuid.UUID) (extract, em
 			  WHERE user_id = $1 AND embedding IS NULL AND deleted_at IS NULL)
 			+ (SELECT count(*) FROM entities
 			  WHERE user_id = $1 AND embedding IS NULL)
+			+ (SELECT count(*) FROM artifacts
+			  WHERE user_id = $1 AND embedding IS NULL AND deleted_at IS NULL)
 	`, userID).Scan(&extract, &embed)
 	return extract, embed, err
 }

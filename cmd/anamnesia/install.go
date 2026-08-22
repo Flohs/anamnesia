@@ -42,6 +42,10 @@ type hookSpec struct {
 	event   string
 	verb    string
 	timeout int // seconds; keeps a wedged hook from stalling a session
+	// matcher restricts a tool event to one tool. Empty means every
+	// invocation of the event, which is what the session-level hooks
+	// want and what a tool-level hook must never do.
+	matcher string
 }
 
 // anamnesiaHooks is the hook layout.
@@ -73,6 +77,12 @@ var anamnesiaHooks = []hookSpec{
 	// ingest.flush_after decide when it does anything at all, and setting
 	// both to zero returns to checkpointing only at the end.
 	{event: "Stop", verb: "flush", timeout: 30},
+	// Publishing an artifact produces a URL that nothing else keeps.
+	// PostToolUse is the only place it can be caught at the moment it
+	// exists, while the source file is still on disk; a transcript read
+	// later has the URL but not the page. Matched to the one tool, so it
+	// does not fire on every Bash call in the session.
+	{event: "PostToolUse", verb: "artifact", timeout: 10, matcher: "Artifact"},
 }
 
 type installFlags struct {
@@ -334,7 +344,7 @@ func managedEntry(h hookSpec, self string) map[string]any {
 	return map[string]any{
 		managedKey:        true,
 		managedVersionKey: version,
-		"matcher":         "",
+		"matcher":         h.matcher,
 		"hooks": []any{
 			map[string]any{
 				"type":    "command",

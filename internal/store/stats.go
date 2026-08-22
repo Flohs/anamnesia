@@ -193,6 +193,7 @@ func (s *Store) QueuePendingAll(ctx context.Context) (extract, embed int, err er
 		  (SELECT count(*) FROM facts WHERE embedding IS NULL AND deleted_at IS NULL)
 		  + (SELECT count(*) FROM experiences WHERE embedding IS NULL AND deleted_at IS NULL)
 		  + (SELECT count(*) FROM entities WHERE embedding IS NULL)
+		  + (SELECT count(*) FROM artifacts WHERE embedding IS NULL AND deleted_at IS NULL)
 	`).Scan(&extract, &embed)
 	return extract, embed, err
 }

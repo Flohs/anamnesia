@@ -233,6 +233,19 @@ func (e *Engine) Search(ctx context.Context, q Query) ([]anamnesia.SearchHit, er
 				return nil, fmt.Errorf("lex skills: %w", err)
 			}
 			add(d, hits, false)
+		case anamnesia.DomainArtifact:
+			if qvec != nil {
+				hits, err := e.vectorArtifacts(ctx, q.Scope, qvec, q.VectorK)
+				if err != nil {
+					return nil, fmt.Errorf("vector artifacts: %w", err)
+				}
+				add(d, hits, true)
+			}
+			hits, err := e.lexicalArtifacts(ctx, q.Scope, q.Text, q.LexicalK)
+			if err != nil {
+				return nil, fmt.Errorf("lex artifacts: %w", err)
+			}
+			add(d, hits, false)
 		}
 	}
 
@@ -564,6 +577,102 @@ func scopeDetail(scope anamnesia.Scope) map[string]any {
 		d["project_id"] = scope.ProjectID.String()
 	}
 	return d
+}
+
+// ─── artifacts ───────────────────────────────────────────────────────
+//
+// Artifacts are not in the default domain set. They are asked for
+// explicitly and given their own budget, so they are ranked among
+// themselves rather than competing with facts and experiences for the
+// fused top-K. Adding a fourth domain to the shared pool was measured
+// once on the lexical channel and crowded the graph channel out of the
+// top-20 while changing recall by nothing; there is no reason to repeat
+// that here, and every reason for an artifact to be a link offered
+// beside the answer rather than one displacing it.
+
+// SearchArtifacts ranks artifacts among themselves and reports how close
+// each one actually is, which is what a caller needs to decide whether to
+// put a link in front of someone who did not ask for one.
+//
+// It deliberately does not go through Search. Fused RRF scores are
+// rank-based, so the best of an irrelevant pool scores exactly what the
+// best of a relevant one does, and nothing downstream can tell "this
+// matches" from "this was the least bad". The lexical channel cannot
+// stand in either: plainto_tsquery ANDs every term, so a
+// natural-language prompt matches nothing, which is measured in
+// docs/longmemeval-retrieval-baseline.md. The cosine distance is the only
+// absolute number available, so this returns it and lets the caller set
+// the bar.
+//
+// With no embedder there is nothing absolute to report, and the honest
+// answer is no artifacts rather than three arbitrary ones.
+func (e *Engine) SearchArtifacts(ctx context.Context, scope anamnesia.Scope, text string, k int) ([]store.ScoredArtifact, error) {
+	if e.Embedder == nil || strings.TrimSpace(text) == "" {
+		return nil, nil
+	}
+	if k <= 0 {
+		k = 3
+	}
+	vecs, err := e.Embedder.Embed(ctx, []string{text})
+	if err != nil {
+		return nil, fmt.Errorf("embed artifact query: %w", err)
+	}
+	if len(vecs) != 1 || len(vecs[0]) == 0 {
+		return nil, nil
+	}
+	args := []any{scope.UserID, pgvector.NewVector(vecs[0])}
+	where := []string{"artifacts.user_id = $1", "artifacts.deleted_at IS NULL", "artifacts.embedding IS NOT NULL"}
+	if scope.ProjectID != nil {
+		args = append(args, *scope.ProjectID)
+		where = append(where, fmt.Sprintf("(artifacts.project_id = $%d OR artifacts.project_id IS NULL)", len(args)))
+	}
+	args = append(args, k)
+	q := fmt.Sprintf(`SELECT %s, artifacts.embedding <=> $2 AS distance
+		FROM artifacts WHERE %s ORDER BY distance ASC LIMIT $%d`,
+		store.ArtifactColumns(), strings.Join(where, " AND "), len(args))
+	return e.Store.QueryScoredArtifacts(ctx, q, args)
+}
+
+func (e *Engine) vectorArtifacts(ctx context.Context, scope anamnesia.Scope, qvec []float32, k int) ([]anamnesia.SearchHit, error) {
+	args := []any{scope.UserID, pgvector.NewVector(qvec)}
+	where := []string{"user_id = $1", "deleted_at IS NULL", "embedding IS NOT NULL"}
+	if scope.ProjectID != nil {
+		args = append(args, *scope.ProjectID)
+		where = append(where, fmt.Sprintf("(project_id = $%d OR project_id IS NULL)", len(args)))
+	}
+	args = append(args, k)
+	q := fmt.Sprintf(`SELECT %s FROM artifacts WHERE %s ORDER BY embedding <=> $2 ASC LIMIT $%d`,
+		store.ArtifactColumns(), strings.Join(where, " AND "), len(args))
+	return e.scanArtifactHits(ctx, q, args)
+}
+
+func (e *Engine) lexicalArtifacts(ctx context.Context, scope anamnesia.Scope, text string, k int) ([]anamnesia.SearchHit, error) {
+	if strings.TrimSpace(text) == "" {
+		return nil, nil
+	}
+	args := []any{scope.UserID, text}
+	where := []string{"user_id = $1", "deleted_at IS NULL", "tsv @@ plainto_tsquery('english', $2)"}
+	if scope.ProjectID != nil {
+		args = append(args, *scope.ProjectID)
+		where = append(where, fmt.Sprintf("(project_id = $%d OR project_id IS NULL)", len(args)))
+	}
+	args = append(args, k)
+	q := fmt.Sprintf(`SELECT %s FROM artifacts WHERE %s
+		ORDER BY ts_rank_cd(tsv, plainto_tsquery('english', $2)) DESC LIMIT $%d`,
+		store.ArtifactColumns(), strings.Join(where, " AND "), len(args))
+	return e.scanArtifactHits(ctx, q, args)
+}
+
+func (e *Engine) scanArtifactHits(ctx context.Context, q string, args []any) ([]anamnesia.SearchHit, error) {
+	arts, err := e.Store.QueryArtifacts(ctx, q, args)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]anamnesia.SearchHit, len(arts))
+	for i, a := range arts {
+		out[i] = anamnesia.SearchHit{Domain: anamnesia.DomainArtifact, Artifact: a}
+	}
+	return out, nil
 }
 
 // noVectorReason explains a search that ran without the vector channel.

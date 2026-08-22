@@ -220,6 +220,17 @@ func registerTools(s *server.MCPServer, d Deps) {
 	)
 
 	s.AddTool(
+		mcp.NewTool("anamnesia_artifacts_list",
+			mcp.WithDescription("List the artifacts published in scope, newest first. "+
+				"An artifact is a page Claude Code published to claude.ai; this returns "+
+				"its URL, what it was, and when it was made."),
+			mcp.WithString("user"), mcp.WithString("project"),
+			mcp.WithNumber("limit"),
+		),
+		d.artifactsList,
+	)
+
+	s.AddTool(
 		mcp.NewTool("anamnesia_working_append",
 			mcp.WithDescription("Append an entry to working memory for the given session."),
 			mcp.WithString("session_id", mcp.Required()),
@@ -758,6 +769,19 @@ func (d Deps) skillsList(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		return bad(err)
 	}
 	out, err := d.Store.ListSkills(ctx, scope, argInt(args, "limit", 50))
+	if err != nil {
+		return bad(err)
+	}
+	return ok(out)
+}
+
+func (d Deps) artifactsList(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := argsFromRequest(req)
+	scope, err := d.resolveScope(ctx, args)
+	if err != nil {
+		return bad(err)
+	}
+	out, err := d.Store.ListArtifacts(ctx, scope, argInt(args, "limit", 25))
 	if err != nil {
 		return bad(err)
 	}

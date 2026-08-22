@@ -28,11 +28,12 @@ image.
 
 ## What it does
 
-Six hooks: `SessionStart` loads memory into the session,
+Seven hooks: `SessionStart` loads memory into the session,
 `UserPromptSubmit` retrieves for the prompt, `PreCompact` and
 `SessionEnd` checkpoint the conversation, `Stop` flushes mid-session once
-enough has accumulated, and `SubagentStop` records what a subagent
-concluded. Checkpoints are **incremental**: a per-session byte offset in
+enough has accumulated, `SubagentStop` records what a subagent
+concluded, and `PostToolUse` (matched to the `Artifact` tool) records
+every page Claude Code publishes. Checkpoints are **incremental**: a per-session byte offset in
 `~/.anamnesia/offsets/` means each one sends only what was added since
 the last.
 
@@ -58,13 +59,24 @@ UPDATE_FACT / DELETE_FACT / ADD_EXPERIENCE / NOOP` operations, and executes
 them. Default is NOOP, because most chat is noise; we don't save the conversation,
 we extract what matters. Raw `sources.raw_content` TTLs out in 7 days.
 
-Memory model — five typed domains:
+Memory model — six typed domains:
 - `facts` — keyed claims (preferences, project config).
 - `experiences` — time-stamped narratives with `abstraction` level,
   `occurred_at`, `participants`, `topic`, `parent_id`, `provenance`.
 - `skills` — callable registry.
 - `working_memory` — in-session entries, TTL'd.
 - `entities` + `edges` — bitemporal graph for multi-hop reasoning.
+- `artifacts` — the pages Claude Code published, kept as pointers.
+
+Artifacts are the one thing that does **not** go through extraction. The
+URL is in the transcript either way, so nothing is at risk of being lost;
+what the extractor would add is a judgement about whether it was
+interesting, applied to an identifier that is either exactly right or
+useless. The `PostToolUse` hook parses the tool's own response, reads the
+published file while it still exists, and writes the row: no source, no
+surprise gate, no model. `anamnesia artifacts backfill` recovers the ones
+published before the hook existed, and doubles as the repair path for any
+the hook missed because the server was down.
 
 Retrieval: pgvector ANN + tsvector lexical, RRF-fused, optional Cohere rerank,
 decay-aware scoring on experiences (`relevance` recomputed hourly).
@@ -82,6 +94,18 @@ decay-aware scoring on experiences (`relevance` recomputed hourly).
 - **Hooks never break a session**: they exit 0 whatever happens, and record
   the outcome in `hooks.log` so `doctor` can report a hook that silently
   fails every turn.
+- **A new table with an embedding column must join `embeddingTables`.**
+  `migrate --dims` re-dimensions only the tables on that list, and
+  `EmbeddingDims` used to read `facts.embedding` alone as representative,
+  so an unregistered column kept the old width, rejected every embedding
+  write, and reported green throughout. `EmbeddingDims` now reads all of
+  them and refuses to answer when they disagree, and
+  `TestEmbeddingTablesListsEveryEmbeddingColumn` holds the list against
+  the live schema so the omission fails on the migration that causes it.
+  The same shape applies to `projectScopedTables`: a project-scoped table
+  left off it is silently stranded by `project move` and deleted as empty
+  by `project prune`. Both lists have tests that introspect the schema
+  rather than trusting the list.
 - **Never default silently.** A bad config value is an error naming the
   setting, not a quiet fallback.
 - **`/v1/health` must be able to fail.** It checks the database, schema

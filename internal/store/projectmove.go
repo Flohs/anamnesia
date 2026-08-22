@@ -30,6 +30,7 @@ import (
 // TestTheMoverCoversEveryTableThatNamesAProject checks this against the
 // live schema rather than trusting the list.
 var projectScopedTables = []string{
+	"artifacts",
 	"audit_log",
 	"commitments",
 	"entities",

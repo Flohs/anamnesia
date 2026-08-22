@@ -65,6 +65,7 @@ func TestEveryProjectScopedTableProtectsAProject(t *testing.T) {
 		"working_memory": `INSERT INTO working_memory (user_id, project_id, session_id, position, role, body) VALUES ($1,$2,gen_random_uuid(),1,'observation','b')`,
 		"commitments":    `INSERT INTO commitments (user_id, project_id, owner, beneficiary, body) VALUES ($1,$2,'me','you','b')`,
 		"audit_log":      `INSERT INTO audit_log (user_id, project_id, op, target) VALUES ($1,$2,'op','t')`,
+		"artifacts":      `INSERT INTO artifacts (user_id, project_id, artifact_uuid, url) VALUES ($1,$2,gen_random_uuid(),'https://claude.ai/code/artifact/seed')`,
 	}
 	for _, tbl := range projectScopedTables {
 		q, ok := inserts[tbl]

@@ -186,7 +186,7 @@ func TestInstallReplacesALegacyStopHook(t *testing.T) {
 }
 
 // TestInstallRemovesRetiredEvents checks that hooks on events this
-// version no longer uses are swept, not left firing forever. PostToolUse
+// version no longer uses are swept, not left firing forever. PreToolUse
 // stands in for any event dropped from the layout: it fires constantly,
 // so one left behind would be both useless and expensive.
 func TestInstallRemovesRetiredEvents(t *testing.T) {
@@ -194,7 +194,7 @@ func TestInstallRemovesRetiredEvents(t *testing.T) {
 	settings := filepath.Join(dir, "settings.json")
 	writeJSONFile(t, settings, map[string]any{
 		"hooks": map[string]any{
-			"PostToolUse": []any{map[string]any{
+			"PreToolUse": []any{map[string]any{
 				managedKey: true,
 				"matcher":  "",
 				"hooks":    []any{map[string]any{"type": "command", "command": "anamnesia hook retrieve"}},
@@ -205,11 +205,58 @@ func TestInstallRemovesRetiredEvents(t *testing.T) {
 	installInto(t, dir)
 	obj := readSettings(t, settings)
 
-	if entries := hookEntries(t, obj, "PostToolUse"); len(entries) != 0 {
-		t.Errorf("PostToolUse still has %d entries; retired events must be removed", len(entries))
+	if entries := hookEntries(t, obj, "PreToolUse"); len(entries) != 0 {
+		t.Errorf("PreToolUse still has %d entries; retired events must be removed", len(entries))
 	}
 	if entries := hookEntries(t, obj, "UserPromptSubmit"); len(entries) != 1 {
 		t.Errorf("UserPromptSubmit has %d entries, want 1", len(entries))
+	}
+}
+
+// A tool-level hook has to carry its matcher, or it fires on every tool
+// call in the session instead of on the one tool it is for.
+func TestToolHooksCarryTheirMatcher(t *testing.T) {
+	dir := t.TempDir()
+	installInto(t, dir)
+	obj := readSettings(t, filepath.Join(dir, "settings.json"))
+
+	entries := hookEntries(t, obj, "PostToolUse")
+	if len(entries) != 1 {
+		t.Fatalf("PostToolUse has %d entries, want 1", len(entries))
+	}
+	entry, _ := entries[0].(map[string]any)
+	if got := entry["matcher"]; got != "Artifact" {
+		t.Errorf("matcher = %v, want Artifact; an empty matcher fires on every tool call", got)
+	}
+	// The session-level hooks must stay unmatched.
+	for _, event := range []string{"SessionStart", "UserPromptSubmit", "SessionEnd"} {
+		e, _ := hookEntries(t, obj, event)[0].(map[string]any)
+		if got := e["matcher"]; got != "" {
+			t.Errorf("%s matcher = %v, want empty", event, got)
+		}
+	}
+}
+
+// An entry from an older version on an event that is now live must be
+// replaced, not joined. This is the doubling bug in the shape it takes
+// once PostToolUse carries a hook of our own.
+func TestAStalePostToolUseEntryIsReplaced(t *testing.T) {
+	dir := t.TempDir()
+	settings := filepath.Join(dir, "settings.json")
+	writeJSONFile(t, settings, map[string]any{
+		"hooks": map[string]any{
+			"PostToolUse": []any{map[string]any{
+				"matcher": "",
+				"hooks":   []any{map[string]any{"type": "command", "command": "anamnesia hook artifact"}},
+			}},
+		},
+	})
+
+	installInto(t, dir)
+	obj := readSettings(t, settings)
+
+	if entries := hookEntries(t, obj, "PostToolUse"); len(entries) != 1 {
+		t.Errorf("PostToolUse has %d entries, want 1; an unmarked entry was joined rather than replaced", len(entries))
 	}
 }
 

@@ -277,16 +277,18 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		DefaultProject: cfg.DefaultProject,
 		ServerToken:    cfg.ServerToken,
 		Log:            log,
-		Version:        version,
-		Activity:       recorder,
-		Started:        time.Now().UTC(),
-		Config:         configSnapshot(hc),
-		HookLogPath:    hookLog,
-		EmbedProvider:  cfg.EmbedProvider,
-		EmbedModel:     cfg.EmbedModel,
-		EmbedDims:      cfg.EmbedDims,
-		LLMProvider:    cfg.LLMProvider,
-		LLMModel:       cfg.LLMModel,
+
+		ArtifactMaxDistance: cfg.ArtifactMaxDistance,
+		Version:             version,
+		Activity:            recorder,
+		Started:             time.Now().UTC(),
+		Config:              configSnapshot(hc),
+		HookLogPath:         hookLog,
+		EmbedProvider:       cfg.EmbedProvider,
+		EmbedModel:          cfg.EmbedModel,
+		EmbedDims:           cfg.EmbedDims,
+		LLMProvider:         cfg.LLMProvider,
+		LLMModel:            cfg.LLMModel,
 	})
 
 	var workerErr chan error

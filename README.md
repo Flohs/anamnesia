@@ -97,7 +97,7 @@ and tells you whether it worked:
 ```
 Setting up Anamnesia
   created ~/.anamnesia/config.toml
-  wired 4 hooks in ~/.claude/settings.json
+  wired 7 hooks in ~/.claude/settings.json
   wired MCP server in ~/.claude.json (http://127.0.0.1:8181/mcp)
   hooks call /usr/local/bin/anamnesia
   wrote zsh completion to ~/.anamnesia/completions/anamnesia.zsh (~/.zshrc updated)
@@ -112,7 +112,7 @@ Your configuration
   state: ~/.anamnesia
   ...
 
-  ready on http://127.0.0.1:8181 (schema v8, embed stub/1536)
+  ready on http://127.0.0.1:8181 (schema v11, embed stub/1536)
 ```
 
 `setup` is idempotent. Run it again any time; it repairs whatever has drifted
@@ -150,10 +150,11 @@ anamnesia doctor
   [ ok ] docker      engine 29.4.0
   [ ok ] postgres    container anamnesia-postgres running on 127.0.0.1:5434
   [ ok ] server      responding on http://127.0.0.1:8181
-  [ ok ] schema      v8, vector(1536), database ok
+  [ ok ] schema      v11, vector(1536), database ok
   [ ok ] queue       0 sources awaiting extraction, 0 rows awaiting embedding
-  [ ok ] hooks       4 entries in ~/.claude/settings.json
+  [ ok ] hooks       7 entries in ~/.claude/settings.json
   [ ok ] mcp         http://127.0.0.1:8181/mcp
+  [ ok ] completion  ~/.anamnesia/completions/anamnesia.zsh
   [warn] hook runs   no hook has run yet
                      → start a Claude Code session, then re-run this
 ```
@@ -239,12 +240,38 @@ anamnesia restart    restart the server, e.g. after changing a setting
 anamnesia status     what is running (--json for scripts)
 anamnesia logs       the server log (-f to follow, -n to change how much)
 anamnesia doctor     verify the install (--json, --deep)
+anamnesia artifacts  the pages Claude Code published (backfill reads old ones)
 anamnesia config     read and write settings
 anamnesia update     update the binary and reconcile the install (--check to look)
 anamnesia migrate    apply migrations (--dims rebuilds the vector columns)
 anamnesia install    (re)wire Claude Code only
 anamnesia uninstall  remove the wiring (--purge also deletes stored memory)
 ```
+
+### Artifacts
+
+Every page Claude Code publishes to claude.ai is recorded as it is made,
+with its URL, what it was, which project it belonged to, and the readable
+text of the page. Subagents are included: tool hooks fire inside them, so
+a page an agent published is captured like any other. A prompt that
+matches one is offered it alongside the answer; `anamnesia artifacts`
+lists them.
+
+```
+$ anamnesia artifacts
+2026-08-21 16:56  zeroploy      Blueprint Update Paths
+                  https://claude.ai/code/artifact/2b8f…
+```
+
+Artifacts published before this existed are still in your transcripts.
+`anamnesia artifacts backfill` reads them out. Most recover as a pointer
+without the page text, because a published file lives in a session
+scratchpad that gets cleaned up. It is idempotent, so it is also the
+repair path if the server was down when something was published.
+
+`retrieval.artifact_max_distance` (default 0.60) is how close a match has
+to be before a link is put in front of you. Set it to 0 to keep the
+listing and stop the prompt-driven surface.
 
 ### Tab completion
 
@@ -367,7 +394,7 @@ automatically; if it cannot, it explains your options.
 
 ## How it works
 
-Anamnesia adds four hooks to Claude Code:
+Anamnesia adds seven hooks to Claude Code:
 
 | Hook | What it does |
 |---|---|
@@ -375,6 +402,9 @@ Anamnesia adds four hooks to Claude Code:
 | `UserPromptSubmit` | retrieves what is relevant to this prompt |
 | `PreCompact` | checkpoints the conversation before context is compacted |
 | `SessionEnd` | checkpoints the conversation when the session ends |
+| `Stop` | checkpoints mid-session once enough has accumulated |
+| `SubagentStop` | records what a subagent concluded |
+| `PostToolUse` | records a published artifact (matched to the `Artifact` tool) |
 
 Checkpoints are incremental: each one sends only what was added since the
 last, so a long session costs no more than a short one. Hooks never block or
@@ -389,13 +419,20 @@ conversation is noise. Anamnesia does not save your conversations; it extracts
 what matters and discards the rest. Raw content in `sources` expires after
 seven days.
 
-What survives lands in five typed domains:
+What survives lands in six typed domains:
 
 - **facts**, keyed claims such as preferences and project configuration
 - **experiences**, time-stamped narratives with an abstraction level
 - **skills**, a registry of callable things
 - **working memory**, in-session entries that expire
 - **entities and edges**, a bitemporal graph for multi-hop questions
+- **artifacts**, the pages Claude Code published, kept as links
+
+Artifacts are the one thing that does not go through the gate above. The
+URL is in the transcript either way, so nothing is at risk of being lost;
+what a model would add is a judgement about whether it was interesting,
+applied to an identifier that is either exactly right or useless. They are
+recorded as they are made and never guessed at.
 
 Facts are versioned rather than overwritten: a changed value supersedes
 the previous one, which keeps its own text, provenance and embedding.
@@ -521,6 +558,9 @@ python scripts/longmemeval/harness.py --dataset ./data/longmemeval_s_cleaned.jso
   offsets/        how far each session's transcript has been read
   completions/    the tab-completion script your shell sources
 ```
+
+Anamnesia reads Claude Code's transcripts under `~/.claude/projects` and
+never writes there.
 
 Your memory itself lives in the Docker volume `anamnesia-pgdata`, so it
 survives restarts, upgrades and `anamnesia uninstall`. Removing that volume

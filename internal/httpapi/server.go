@@ -61,6 +61,10 @@ type Deps struct {
 	DefaultProject string
 	ServerToken    string // empty = no auth required
 	Log            *slog.Logger
+	// ArtifactMaxDistance is the cosine distance a published artifact
+	// must be within before it is offered beside an answer. Zero leaves
+	// artifacts to `anamnesia artifacts` and the session-start list.
+	ArtifactMaxDistance float64
 
 	// Activity is the in-memory recorder. Nil means recording is off,
 	// which is what makes every /v1/activity route a 404.
@@ -115,6 +119,7 @@ func NewServer(addr string, d Deps) *http.Server {
 	mux.Handle("/v1/commitments", d.protect(http.HandlerFunc(d.handleCommitments)))
 	mux.Handle("/v1/commitments/resolve", d.protect(http.HandlerFunc(d.handleCommitmentResolve)))
 	mux.Handle("/v1/audit", d.protect(http.HandlerFunc(d.handleAudit)))
+	mux.Handle("/v1/artifacts", d.protect(http.HandlerFunc(d.handleArtifacts)))
 
 	// Read-only observability. Registered with methods, so a stray write
 	// is a 405 rather than something the handler has to guard against.
@@ -307,7 +312,12 @@ type HookEvent struct {
 	Prompt         string `json:"prompt,omitempty"`
 	MaxFacts       int    `json:"max_facts,omitempty"`
 	MaxExperiences int    `json:"max_experiences,omitempty"`
-	K              int    `json:"k,omitempty"`
+	// MaxArtifacts is a small budget of its own rather than a share of
+	// the others. An artifact is a link offered beside what a session
+	// starts with, not something that should displace the project
+	// configuration it starts with.
+	MaxArtifacts int `json:"max_artifacts,omitempty"`
+	K            int `json:"k,omitempty"`
 	// OnlyRaw on /v1/retrieve restricts experience hits to abstraction=0
 	// (verbatim sources). Set by benchmarks / citation flows; leave
 	// false for context injection where summaries are useful.
@@ -412,6 +422,7 @@ func (d Deps) resolveWriteScope(ctx context.Context, ev *HookEvent) (anamnesia.S
 type SessionStartResp struct {
 	Facts        []*anamnesia.Fact       `json:"facts"`
 	Experiences  []*anamnesia.Experience `json:"experiences"`
+	Artifacts    []*anamnesia.Artifact   `json:"artifacts,omitempty"`
 	PersonaBlock string                  `json:"persona_block,omitempty"`
 	Hint         string                  `json:"hint,omitempty"`
 }
@@ -433,6 +444,9 @@ func (d Deps) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 	if ev.MaxExperiences <= 0 {
 		ev.MaxExperiences = 10
 	}
+	if ev.MaxArtifacts <= 0 {
+		ev.MaxArtifacts = 3
+	}
 	// What a session starts with is worth recording: an empty session
 	// start is the symptom every "is this thing on?" question begins
 	// from, and this says whether it was empty because nothing was found
@@ -452,6 +466,16 @@ func (d Deps) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// There is no prompt yet to match an artifact against, so the most
+	// recent few in this project are what a session starts with. The
+	// prompt-driven, semantic surface is /v1/retrieve.
+	arts, err := d.Store.ListArtifacts(r.Context(), scope, ev.MaxArtifacts)
+	if err != nil {
+		tr.Fail("load", err)
+		tr.End("failed", "Could not load memory for this session")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	id, err := d.Store.GetIdentity(r.Context(), scope)
 	if err != nil {
 		tr.Fail("load", err)
@@ -459,17 +483,21 @@ func (d Deps) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	tr.Step("load", fmt.Sprintf("Loaded %d facts and %d experiences into the session",
-		len(facts), len(exps)), map[string]any{
+	tr.Step("load", fmt.Sprintf("Loaded %d facts, %d experiences and %d artifacts into the session",
+		len(facts), len(exps), len(arts)), map[string]any{
 		"facts":       len(facts),
 		"experiences": len(exps),
+		"artifacts":   len(arts),
 		"persona":     id.SystemPrompt != "",
-		"limits":      map[string]any{"max_facts": ev.MaxFacts, "max_experiences": ev.MaxExperiences},
+		"limits": map[string]any{
+			"max_facts": ev.MaxFacts, "max_experiences": ev.MaxExperiences,
+			"max_artifacts": ev.MaxArtifacts,
+		},
 	})
 	tr.End("ok", fmt.Sprintf("Started a session with %d facts and %d experiences",
 		len(facts), len(exps)))
 	writeJSON(w, http.StatusOK, SessionStartResp{
-		Facts: facts, Experiences: exps, PersonaBlock: id.SystemPrompt,
+		Facts: facts, Experiences: exps, Artifacts: arts, PersonaBlock: id.SystemPrompt,
 	})
 }
 
@@ -501,6 +529,13 @@ func (d Deps) handleIdentity(w http.ResponseWriter, r *http.Request) {
 type RetrieveResp struct {
 	Hits         []anamnesia.SearchHit `json:"hits"`
 	CrossProject []CrossProjectHit     `json:"cross_project,omitempty"`
+	// Artifacts are searched separately and carried in their own field
+	// rather than fused into Hits. Adding a fourth domain to the shared
+	// pool was measured once on the lexical channel: it crowded the
+	// graph channel out of the top-20 and changed recall by nothing. An
+	// artifact should be a link offered beside the answer, never one
+	// displacing a memory that would have answered the question.
+	Artifacts []*anamnesia.Artifact `json:"artifacts,omitempty"`
 }
 
 // CrossProjectHit is a prompt-matching memory from a project other than
@@ -565,13 +600,45 @@ func (d Deps) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 	if scope.ProjectID != nil {
 		resp.CrossProject = d.crossProjectHits(r.Context(), scope, ev.Prompt, ev.OnlyRaw)
 	}
-	tr.Step("result", fmt.Sprintf("Returned %d hits and %d cross-project hits",
-		len(resp.Hits), len(resp.CrossProject)), map[string]any{
+	if ev.MaxArtifacts <= 0 {
+		ev.MaxArtifacts = 3
+	}
+	resp.Artifacts = d.artifactHits(r.Context(), scope, ev.Prompt, ev.MaxArtifacts)
+	tr.Step("result", fmt.Sprintf("Returned %d hits, %d cross-project hits and %d artifacts",
+		len(resp.Hits), len(resp.CrossProject), len(resp.Artifacts)), map[string]any{
 		"hits":          retrieval.HitDetails(resp.Hits),
 		"cross_project": resp.CrossProject,
+		"artifacts":     len(resp.Artifacts),
 	})
 	tr.End("ok", fmt.Sprintf("Returned %d memories for %q", len(resp.Hits), ev.Prompt))
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// artifactHits searches artifacts alone, on their own small budget.
+//
+// A failure here returns nothing rather than failing the prompt: an
+// artifact is a convenience beside the answer, and a session must not
+// lose its memory because a link could not be looked up.
+func (d Deps) artifactHits(ctx context.Context, scope anamnesia.Scope, prompt string, k int) []*anamnesia.Artifact {
+	if d.ArtifactMaxDistance <= 0 {
+		return nil // switched off deliberately
+	}
+	scored, err := d.Retrieval.SearchArtifacts(ctx, scope, prompt, k)
+	if err != nil {
+		// An artifact is a convenience beside the answer, so a session
+		// must not lose its memory because a link could not be looked up.
+		if d.Log != nil {
+			d.Log.Warn("artifact search failed", "err", err)
+		}
+		return nil
+	}
+	var out []*anamnesia.Artifact
+	for _, s := range scored {
+		if s.Distance <= d.ArtifactMaxDistance {
+			out = append(out, s.Artifact)
+		}
+	}
+	return out
 }
 
 // crossProjectHits runs a second, user-wide search (no project filter)

@@ -101,6 +101,7 @@ func init() {
 	root.AddCommand(evalCmd)
 	root.AddCommand(projectCmd)
 	root.AddCommand(recoverCmd)
+	root.AddCommand(artifactsCmd)
 	root.AddCommand(installCmd)
 	root.AddCommand(uninstallCmd)
 
