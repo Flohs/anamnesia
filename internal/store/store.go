@@ -43,12 +43,47 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 
 func (s *Store) Close() { s.Pool.Close() }
 
-// Migrate applies the embedded SQL migrations using goose.
+// migrationLockKey is an arbitrary fixed key. Every process that migrates
+// this database takes the same advisory lock, so concurrent migrations
+// queue instead of colliding.
+const migrationLockKey int64 = 5_713_204_918_775_311
+
+// Migrate applies the embedded SQL migrations using goose, one process at
+// a time.
 func (s *Store) Migrate(ctx context.Context) error {
 	goose.SetBaseFS(migrations)
 	if err := goose.SetDialect("postgres"); err != nil {
 		return err
 	}
+
+	// Migrations are DDL and goose serialises nothing, so two processes
+	// migrating the same empty database collide: one creates a type or an
+	// index the other is halfway through creating, and the loser reports
+	// "already exists" from the middle of a migration file. It is not
+	// hypothetical — `serve` migrates at boot, `anamnesia migrate` can be
+	// run by hand at the same moment, and postgres.url lets several
+	// servers share one database.
+	//
+	// The lock is held on one connection for the whole migration, because
+	// an advisory lock belongs to the session that took it. goose runs on
+	// other connections from the same pool, which is why the lock has to
+	// be taken here rather than around the pool.
+	conn, err := s.Pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire a connection for the migration lock: %w", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationLockKey); err != nil {
+		return fmt.Errorf("take the migration lock: %w", err)
+	}
+	defer func() {
+		// Released on its own context: a cancelled migration still has to
+		// give the lock back, or the next process waits forever for a
+		// session that has gone away.
+		_, _ = conn.Exec(context.WithoutCancel(ctx),
+			"SELECT pg_advisory_unlock($1)", migrationLockKey)
+	}()
+
 	db := stdlibadapter.OpenDBFromPool(s.Pool)
 	defer db.Close()
 	return goose.UpContext(ctx, db, "migrations")

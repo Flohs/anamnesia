@@ -7,6 +7,33 @@ were rebuilt around being verifiable.
 
 ### Fixed
 
+- **Two processes migrating the same database at once could collide.**
+  Migrations are DDL and goose serialises nothing, so two processes
+  running `Migrate` against the same *empty* database raced: one created a
+  type or an index the other was halfway through creating, and the loser
+  reported "already exists" from the middle of a migration file. `serve`
+  migrates at boot, `anamnesia migrate` can be run by hand at the same
+  moment, and `postgres.url` lets several servers share one database, so
+  this was reachable in normal use. `Migrate` now holds a Postgres
+  advisory lock for its duration, and concurrent migrations queue.
+
+  It stayed hidden because it is invisible in exactly the place people
+  look. A long-lived local test database is already migrated, so goose
+  does nothing and there is no race to lose; CI starts from an empty
+  database every time and runs `go test ./...` as concurrent per-package
+  processes against one database, which is the failing shape.
+  `TestConcurrentMigrateIsSafe` reproduces it against a throwaway
+  database in a fraction of a second.
+
+- **The release workflow could not fail the way CI does.** It ran `go test
+  -race ./...` with no database, so every DB-backed test called `t.Skip`
+  and the step reported success having run dozens fewer tests than it
+  appeared to — the exact gate `ci.yml`'s own comment describes as one
+  that cannot turn red, sitting under a comment promising to "never
+  publish a build that does not pass what CI enforces". rc13 and rc14 both
+  published green from it while CI was red on the same commit. It now runs
+  against pgvector like CI does.
+
 - **An embedding column could sit at the wrong width behind a green health
   check.** `migrate --dims` re-dimensions the tables named in
   `embeddingTables`, and `EmbeddingDims` read `facts.embedding` alone as

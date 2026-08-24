@@ -106,6 +106,21 @@ decay-aware scoring on experiences (`relevance` recomputed hourly).
   left off it is silently stranded by `project move` and deleted as empty
   by `project prune`. Both lists have tests that introspect the schema
   rather than trusting the list.
+- **`Migrate` is serialised by a Postgres advisory lock, and has to be.**
+  Migrations are DDL and goose serialises nothing, so two processes
+  migrating the same *empty* database collide with "already exists" from
+  the middle of a migration file. This is invisible locally, because a
+  long-lived test database is already migrated and goose does nothing;
+  it is reliable on CI, which always starts empty and runs `go test ./...`
+  as concurrent per-package processes against one database. `serve`
+  migrating at boot while someone runs `anamnesia migrate` is the same
+  race in production. `TestConcurrentMigrateIsSafe` reproduces it in a
+  fraction of a second against a throwaway database.
+- **A gate that cannot fail is not a gate.** `release.yml` ran `go test`
+  without a database, so every DB-backed test skipped and two releases
+  published green while CI was red on the same commit. Both workflows now
+  run against pgvector. Before trusting any green check, ask what it would
+  take for it to go red.
 - **Never default silently.** A bad config value is an error naming the
   setting, not a quiet fallback.
 - **`/v1/health` must be able to fail.** It checks the database, schema
