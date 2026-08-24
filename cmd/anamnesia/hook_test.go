@@ -919,8 +919,7 @@ func TestGraphSourceIsPostedAfterTheSegments(t *testing.T) {
 // runGraph records mentions against whatever ids the graph source's
 // metadata names, and this is the hook's half of that bridge — without
 // it, the graph source carries no way back to the sources a search hit
-// actually returns. See
-// docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md.
+// actually returns.
 func TestGraphSourceMetadataCarriesSegmentSourceIDs(t *testing.T) {
 	hc, got := captureIngests(t)
 	hc.values["graph.extract"] = "true"

@@ -49,5 +49,4 @@ Nothing leaves your machine except the model calls you configure.
 
 - [SECURITY.md](../../SECURITY.md), what is stored and what leaves the machine
 - [CONTRIBUTING.md](../../CONTRIBUTING.md), working against a throwaway install
-- [CLAUDE.md](../../CLAUDE.md), instructions for an agent working on this codebase
 - [The LongMemEval baseline](../longmemeval-retrieval-baseline.md), the full measurement record

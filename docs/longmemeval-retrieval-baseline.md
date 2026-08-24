@@ -4,7 +4,7 @@ Recorded 2026-08-21, on a corpus ingested with **session segmentation**
 (`--segment-bytes 4000`), the way `cmd/anamnesia/hook.go` cuts a
 checkpoint. Earlier entries posted whole sessions, which is a path
 production never takes. Machine-readable copy:
-[`superpowers/plans/lme-retrieval-baseline-2026-08-21.json`](./superpowers/plans/lme-retrieval-baseline-2026-08-21.json).
+[`lme-retrieval-baseline-2026-08-21.json`](./lme-retrieval-baseline-2026-08-21.json).
 
 This is **not** a LongMemEval score. It measures retrieval alone: whether
 the sessions holding a question's evidence come back in the top K. There
@@ -227,7 +227,8 @@ that a *single-token* query produces no conjunction, so the AND defect
 never affected this case: exact lookup was working the whole time.
 
 The fix was therefore **not merged**. The channel is left dead, and
-`CLAUDE.md` records why, along with the two reasons it cannot simply be
+[the wiki](wiki/retrieval.md#the-lexical-channel) records why, along with the
+two reasons it cannot simply be
 deleted: `DomainSkill` has no vector channel and is served only by
 `lexicalSkills`, and the entire `internal/retrieval` test suite runs
 without an embedder, so lexical is the only channel those tests can

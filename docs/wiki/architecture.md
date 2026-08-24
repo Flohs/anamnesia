@@ -174,5 +174,4 @@ so forgetting fails on the migration that causes it rather than months later.
 ## See also
 
 - [CONTRIBUTING.md](../../CONTRIBUTING.md)
-- [CLAUDE.md](../../CLAUDE.md), the same invariants, addressed to an agent
 - [SECURITY.md](../../SECURITY.md)

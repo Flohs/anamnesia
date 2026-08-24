@@ -28,3 +28,11 @@ __pycache__/
 
 # Compiled example agent binary
 /examples/cli-companion/cli-companion
+
+# Superpowers working documents (specs, plans, agent scratch). Kept out of
+# the repository: they are process artifacts of how a change was arrived at,
+# not documentation of the app. docs/wiki/ is that.
+/docs/superpowers/
+
+# Agent instructions for this codebase. Local, not inherited by clones.
+/CLAUDE.md

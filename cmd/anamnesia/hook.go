@@ -496,8 +496,7 @@ func doCheckpoint(ctx context.Context, hc *hostConfig, input claudeHookInput, ki
 	// segmentSourceIDs collects each segment's source id as it lands, so
 	// the graph source posted below can carry them: it is the only thing
 	// that lets a later hit on a segment seed a walk into the entities
-	// that segment's checkpoint mentioned. See
-	// docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md.
+	// that segment's checkpoint mentioned.
 	segmentSourceIDs := make([]string, 0, len(segs))
 	for i, seg := range segs {
 		at := seg.At

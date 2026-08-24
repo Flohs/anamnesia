@@ -445,8 +445,9 @@ Retrieval fuses three channels with reciprocal-rank fusion — pgvector
 similarity, Postgres full-text search, and a walk over the entity graph —
 and optionally reranks the result. (On extracted memory the full-text
 channel earns almost nothing; that is measured, and written down in
-`CLAUDE.md` so nobody spends a day rediscovering it.) A decay worker recomputes
-per-experience relevance hourly; a daily consolidation worker clusters similar
+the [wiki](docs/wiki/retrieval.md#the-lexical-channel) so nobody spends a day
+rediscovering it.) A decay worker recomputes per-experience relevance hourly;
+a daily consolidation worker clusters similar
 experiences and distills each cluster into one higher-abstraction record, so
 memory gets shorter as it gets older rather than growing without bound.
 

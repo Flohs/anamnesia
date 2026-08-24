@@ -191,8 +191,7 @@ func TestRunGraphAgainstRealStore(t *testing.T) {
 }
 
 // TestGraphBridgeConnectsSegmentSourcesToEntities proves the property that
-// was false before the fix in
-// docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md: given a
+// was false before the graph-bridge fix: given a
 // checkpoint whose segments produced facts, after runGraph executes,
 // EntitiesForSources on those SEGMENT source ids — not the graph source's
 // own id — returns the entities the graph pass found. That is exactly the
@@ -326,9 +325,8 @@ func newGraphTestStore(t *testing.T, userPrefix string) (*store.Store, anamnesia
 }
 
 // TestEntityResolutionMergesTwoSpellingsOfOneName is the regression this
-// whole plan exists for:
-// docs/superpowers/specs/2026-08-19-entity-identity-does-not-hold.md
-// found two real sessions discussing one person land as two
+// whole plan exists for: entity identity did not hold.
+// Two real sessions discussing one person landed as two
 // disconnected subgraphs — "priha-raman" in one session, "priya-raman"
 // in the next — because entity identity was exact string equality on a
 // model-produced name. Session 2's "priha-raman" recalls priya-raman as
@@ -546,8 +544,7 @@ func TestIdentityCallFailureFallsBackToCreatingSeparately(t *testing.T) {
 
 // TestEntityCandidatesForNameFindsARealVariant guards against exactly
 // the failure the graph-bridge incident already taught this project
-// once (docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md
-// — a hand-built fixture proved a mechanism production could never
+// once (a hand-built fixture proved a mechanism production could never
 // assemble): every other test in this file injects candidates via
 // fakeEmbedder, so none of them can observe an empty candidate list. An
 // earlier version of this design embedded the whole checkpoint's
@@ -998,8 +995,7 @@ func TestEntityPropsSurviveARedeclarationWithoutProps(t *testing.T) {
 
 // TestGraphTraceCountsMentionsAndFlagsMissingSegmentSources: an empty
 // segment_source_ids list is the exact defect that already shipped on
-// this branch once (docs/superpowers/specs/2026-08-19-the-graph-bridge-
-// is-broken.md). Nothing observed it: the trace's graph step reported
+// this branch once. Nothing observed it: the trace's graph step reported
 // entities and edges but never mentions, and the helper only warned on a
 // wrong SHAPE, never on an absent or empty list. The channel could go
 // inert again and every trace would still read "ok".

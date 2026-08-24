@@ -1,6 +1,5 @@
 // The graph pass: a second, separate extraction that reads the WHOLE
-// checkpoint's text once (not per segment — see the "Revised 2026-08-19"
-// note in docs/superpowers/specs/2026-08-18-graph-extraction-design.md)
+// checkpoint's text once (not per segment)
 // and asks only for ADD_ENTITY / ADD_EDGE / NOOP. It never runs the
 // fact/experience pass, the surprise gate, or the candidate fetch: it is
 // a different job on the same queue, reached via the graphSourceKind
@@ -726,8 +725,7 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 	// not only the graph source itself: those are the sources a search
 	// hit actually carries, and EntitiesForSources joins on source_id
 	// exactly (store/graph.go). The graph source keeps a mention too, for
-	// provenance, but it must not be the only one — see
-	// docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md.
+	// provenance, but it must not be the only one.
 	segmentSources := e.segmentSourceIDsFromMetadata(src.Metadata)
 	mentionSources := append([]uuid.UUID{src.ID}, segmentSources...)
 	// Every entity this checkpoint touched: the ones its ADD_ENTITY ops
@@ -798,8 +796,7 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 //
 // Every path that yields nothing warns, including an absent or empty
 // list. Coming back empty is not a shape error, so it used to pass in
-// silence — and it is exactly the state the bridge shipped in
-// (docs/superpowers/specs/2026-08-19-the-graph-bridge-is-broken.md):
+// silence — and it is exactly the state the bridge shipped in:
 // mentions land only on the graph source, which no search hit ever
 // carries, so the graph is populated and unreachable and nothing says
 // so.
