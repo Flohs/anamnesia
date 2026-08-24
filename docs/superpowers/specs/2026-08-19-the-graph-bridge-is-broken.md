@@ -108,4 +108,4 @@ morning: recall@5 of 0.38 / 0.54 / 0.80 across identical corpora, against a
 varying 14/18/16/16. `regressionTolerance` is currently 0.05, set from a
 standard deviation of 0.021 that no longer holds. Nothing on this branch
 touches the eval path. See
-[the eval follow-up](./2026-08-18-eval-drain-and-variance-followup.md).
+the eval follow-up.
