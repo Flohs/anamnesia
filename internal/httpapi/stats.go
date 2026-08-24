@@ -82,6 +82,7 @@ type statsTotals struct {
 	Edges         int `json:"edges"`
 	Sources       int `json:"sources"`
 	Commitments   int `json:"commitments"`
+	Artifacts     int `json:"artifacts"`
 }
 
 type statsResponse struct {
@@ -116,6 +117,7 @@ func (d Deps) handleStats(w http.ResponseWriter, r *http.Request) {
 			Edges:         stats.Edges,
 			Sources:       stats.Sources,
 			Commitments:   stats.Commitments,
+			Artifacts:     stats.Artifacts,
 		},
 		SourcesByState: stats.SourcesByState,
 		Queues: QueuePendingResponse{

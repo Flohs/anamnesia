@@ -36,6 +36,7 @@ type StatsResult struct {
 	Edges         int
 	Sources       int
 	Commitments   int
+	Artifacts     int
 
 	SourcesByState           map[string]int
 	ExperiencesByAbstraction map[int]int
@@ -94,6 +95,7 @@ func (s *Store) Stats(ctx context.Context, scope anamnesia.Scope) (*StatsResult,
 		{"entities", "", &out.Entities},
 		{"sources", "", &out.Sources},
 		{"commitments", "", &out.Commitments},
+		{"artifacts", "deleted_at IS NULL", &out.Artifacts},
 	}
 	for _, c := range counts {
 		q := "SELECT count(*) FROM " + c.table + " WHERE " + where
@@ -163,7 +165,10 @@ func (s *Store) Stats(ctx context.Context, scope anamnesia.Scope) (*StatsResult,
 		return nil, err
 	}
 
-	for _, domain := range []string{"facts", "experiences", "entities"} {
+	// Driven by embeddingTables rather than a list written out here: a
+	// domain missing from coverage does not read as missing, it reads as
+	// everything being covered, because whatever is listed sits at 100%.
+	for _, domain := range embeddingTables {
 		var cov Coverage
 		q := "SELECT count(*), count(embedding) FROM " + domain + " WHERE " + where
 		if domain != "entities" {
