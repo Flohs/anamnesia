@@ -227,7 +227,7 @@ that a *single-token* query produces no conjunction, so the AND defect
 never affected this case: exact lookup was working the whole time.
 
 The fix was therefore **not merged**. The channel is left dead, and
-[the wiki](wiki/retrieval.md#the-lexical-channel) records why, along with the
+[the wiki](https://github.com/Flohs/anamnesia/wiki/retrieval#the-lexical-channel) records why, along with the
 two reasons it cannot simply be
 deleted: `DomainSkill` has no vector channel and is served only by
 `lexicalSkills`, and the entire `internal/retrieval` test suite runs

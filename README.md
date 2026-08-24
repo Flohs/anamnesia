@@ -15,9 +15,10 @@ write and no image to build.
 
 Nothing leaves your machine except the model calls you configure.
 
-Full documentation is in the [wiki](docs/wiki/README.md): configuration,
-hooks, the memory model, extraction, retrieval, troubleshooting, and complete
-reference pages for the settings, the CLI, the MCP tools and the HTTP API.
+Full documentation is in the
+[wiki](https://github.com/Flohs/anamnesia/wiki): configuration, hooks, the
+memory model, extraction, retrieval, troubleshooting, and complete reference
+pages for the settings, the CLI, the MCP tools and the HTTP API.
 
 ## What makes it different
 
@@ -445,7 +446,7 @@ Retrieval fuses three channels with reciprocal-rank fusion — pgvector
 similarity, Postgres full-text search, and a walk over the entity graph —
 and optionally reranks the result. (On extracted memory the full-text
 channel earns almost nothing; that is measured, and written down in
-the [wiki](docs/wiki/retrieval.md#the-lexical-channel) so nobody spends a day
+the [wiki](https://github.com/Flohs/anamnesia/wiki/retrieval#the-lexical-channel) so nobody spends a day
 rediscovering it.) A decay worker recomputes per-experience relevance hourly;
 a daily consolidation worker clusters similar
 experiences and distills each cluster into one higher-abstraction record, so
