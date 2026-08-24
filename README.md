@@ -15,6 +15,10 @@ write and no image to build.
 
 Nothing leaves your machine except the model calls you configure.
 
+Full documentation is in the [wiki](docs/wiki/README.md): configuration,
+hooks, the memory model, extraction, retrieval, troubleshooting, and complete
+reference pages for the settings, the CLI, the MCP tools and the HTTP API.
+
 ## What makes it different
 
 **It does not store your conversations.** Most memory layers keep the
