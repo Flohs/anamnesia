@@ -36,3 +36,6 @@ __pycache__/
 
 # Agent instructions for this codebase. Local, not inherited by clones.
 /CLAUDE.md
+
+# scripts/publish-wiki.sh --dry-run output
+/.wiki-preview/
