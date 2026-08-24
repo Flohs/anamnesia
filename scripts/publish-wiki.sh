@@ -97,7 +97,7 @@ cat > "$staged/_Sidebar.md" <<EOF
 EOF
 
 cat > "$staged/_Footer.md" <<EOF
-Generated from [\`docs/wiki/\`](${BLOB}/docs/wiki) by \`scripts/publish-wiki.sh\`. Edit there, not here: edits made in this wiki are overwritten on the next publish.
+Source: [\`docs/wiki/\`](${BLOB}/docs/wiki)
 EOF
 
 echo "  (generated _Sidebar.md, _Footer.md)"
