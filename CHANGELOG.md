@@ -301,8 +301,8 @@ were rebuilt around being verifiable.
   console without a session answers 401 naming the command that fixes it,
   rather than rendering a console whose every call fails.
 
-  `anamnesia-ui` is archived and its image is no longer published. If you
-  run that container, drop it and use `anamnesia ui`.
+  This supersedes the separate `anamnesia-ui` image, which is no longer part
+  of a release. If you run that container, stop it and use `anamnesia ui`.
 
 - **Artifacts are remembered, as links rather than as copies.** Publishing
   a page to claude.ai produced a URL that nothing kept. It was never lost,
