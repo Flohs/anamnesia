@@ -140,12 +140,12 @@ func TestExecuteOps(t *testing.T) {
 		Store: st,
 		LLM:   fake,
 	}
-	n, err := ex.Run(ctx, src)
+	out, err := ex.Run(ctx, src)
 	if err != nil {
 		t.Fatalf("extract: %v", err)
 	}
-	if n != 2 {
-		t.Fatalf("expected 2 executed ops, got %d", n)
+	if out.Ops != 2 {
+		t.Fatalf("expected 2 executed ops, got %d", out.Ops)
 	}
 	if fake.Calls != 1 {
 		t.Fatalf("expected 1 LLM call, got %d", fake.Calls)
@@ -209,12 +209,12 @@ func TestExecuteOps(t *testing.T) {
 			Trust: 0.95,
 		},
 	}
-	n, err = ex.Run(ctx, src2)
+	out, err = ex.Run(ctx, src2)
 	if err != nil {
 		t.Fatalf("extract 2: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("expected 1 op, got %d", n)
+	if out.Ops != 1 {
+		t.Fatalf("expected 1 op, got %d", out.Ops)
 	}
 	// UPDATE_FACT versions the fact since migration 0010: factID is now
 	// the superseded row, and the updated value lives on the current one.

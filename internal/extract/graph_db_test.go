@@ -79,11 +79,11 @@ func TestRunGraphAgainstRealStore(t *testing.T) {
 	}
 	run := func(src *anamnesia.Source, ops []graphOperation) int {
 		ex := &Extractor{Cfg: Config{ExtractGraph: true}, Store: st, LLM: &fakeLLM{RawOps: marshalGraphOps(t, ops)}}
-		n, err := ex.Run(ctx, src)
+		out, err := ex.Run(ctx, src)
 		if err != nil {
 			t.Fatalf("run: %v", err)
 		}
-		return n
+		return out.Ops
 	}
 
 	// First checkpoint: two entities and the edge between them.
@@ -243,11 +243,11 @@ func TestGraphBridgeConnectsSegmentSourcesToEntities(t *testing.T) {
 		{Op: "ADD_FACT", Key: "reconciliation.source", Value: json.RawMessage(`"rotterdam warehouse"`)},
 	}}}
 	for _, seg := range []*anamnesia.Source{seg1, seg2} {
-		n, err := factExtractor.Run(ctx, seg)
+		out, err := factExtractor.Run(ctx, seg)
 		if err != nil {
 			t.Fatalf("run segment %s: %v", seg.ID, err)
 		}
-		if n == 0 {
+		if out.Ops == 0 {
 			t.Fatalf("segment %s produced no facts; test setup is invalid", seg.ID)
 		}
 	}
@@ -521,11 +521,11 @@ func TestIdentityCallFailureFallsBackToCreatingSeparately(t *testing.T) {
 		VerdictsErr: errors.New("the judge model is unavailable"),
 	}
 	ex2 := &Extractor{Cfg: Config{ExtractGraph: true, GraphCandidateDistance: 0.45}, Store: st, Embedder: emb, LLM: fake2}
-	n, err := ex2.Run(ctx, src2)
+	out, err := ex2.Run(ctx, src2)
 	if err != nil {
 		t.Fatalf("run must not fail even though the disambiguation call errored: %v", err)
 	}
-	if n == 0 {
+	if out.Ops == 0 {
 		t.Error("executed = 0; priha-raman should still have been created, not dropped")
 	}
 
@@ -724,7 +724,7 @@ func TestTwoSameNameKindsBothLandWithTheirOwnMentions(t *testing.T) {
 		{Op: "ADD_EDGE", From: "stock-reconciliation", To: "rotterdam", Kind: "reads_from", Trust: 0.8},
 	})}
 	ex := &Extractor{Cfg: Config{ExtractGraph: true}, Store: st, LLM: fake}
-	n, err := ex.Run(ctx, src)
+	out, err := ex.Run(ctx, src)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -735,8 +735,8 @@ func TestTwoSameNameKindsBothLandWithTheirOwnMentions(t *testing.T) {
 	// different kinds this pass, and an ADD_EDGE endpoint carries no
 	// kind, so the edge is dropped rather than pointed at whichever one
 	// happened to be written last.
-	if n != 3 {
-		t.Errorf("executed = %d, want 3 (three entities, and an ambiguous edge dropped rather than guessed)", n)
+	if out.Ops != 3 {
+		t.Errorf("executed = %d, want 3 (three entities, and an ambiguous edge dropped rather than guessed)", out.Ops)
 	}
 	all, err := st.ListEntities(ctx, scope, "", 50)
 	if err != nil {

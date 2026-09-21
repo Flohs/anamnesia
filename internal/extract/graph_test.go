@@ -49,12 +49,12 @@ func TestGraphSourceIsIgnoredWhenTheFlagIsOff(t *testing.T) {
 		OccurredAt: time.Now().UTC(),
 		RawContent: "Some content long enough to clear the min-content gate.",
 	}
-	n, err := ex.Run(ctx, src)
+	out, err := ex.Run(ctx, src)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if n != 0 {
-		t.Errorf("wrote %d operations with graph.extract off, want 0", n)
+	if out.Ops != 0 {
+		t.Errorf("wrote %d operations with graph.extract off, want 0", out.Ops)
 	}
 	if fake.Calls != 0 {
 		t.Errorf("made %d model calls with graph.extract off, want 0", fake.Calls)

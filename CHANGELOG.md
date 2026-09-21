@@ -7,6 +7,20 @@ were rebuilt around being verifiable.
 
 ### Fixed
 
+- **A source the model read and found nothing in looked exactly like one
+  the model never read.** Both execute zero operations, and the worker
+  marked both `skipped`, so the database could not answer how often the
+  model is called and produces nothing. That is the number that decides
+  whether a cheaper triage pass in front of extraction would pay for
+  itself, and the only way to get it was to infer it from a weekly trend.
+
+  `Extract.Run` now reports whether the model ran, and the worker records a
+  short-circuit (the surprise gate, content under the minimum length, the
+  graph pass switched off) as `skipped`, and a model that looked and found
+  nothing as `done` with `ops_produced = 0`, which is what that column was
+  documented to mean. Rows written before this keep the old conflated
+  state, so the distinction starts from here rather than being backfilled.
+
 - **Two processes migrating the same database at once could collide.**
   Migrations are DDL and goose serialises nothing, so two processes
   running `Migrate` against the same *empty* database raced: one created a

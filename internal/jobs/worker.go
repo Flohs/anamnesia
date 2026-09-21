@@ -298,7 +298,7 @@ func (w *Worker) tickExtract(ctx context.Context) (string, error) {
 	}
 	outcomes := make([]outcome, len(pending))
 	forEachLimited(ctx, pending, w.Cfg.ExtractConcurrency, func(ctx context.Context, i int, src *anamnesia.Source) {
-		ops, err := ex.Run(ctx, src)
+		out, err := ex.Run(ctx, src)
 		if err != nil {
 			outcomes[i] = outcome{failed: true}
 			if w.Log != nil {
@@ -307,11 +307,16 @@ func (w *Worker) tickExtract(ctx context.Context) (string, error) {
 			_ = w.Store.MarkFailed(ctx, src.ID, err.Error())
 			return
 		}
-		if ops == 0 {
+		// Skipped means the model never saw it; done with zero operations
+		// means it looked and found nothing. Marking both as skipped made
+		// the two indistinguishable in the database, which is the only
+		// place the question outlives a restart.
+		if !out.ModelCalled {
 			_ = w.Store.MarkSkipped(ctx, src.ID)
 		} else {
-			_ = w.Store.MarkExtracted(ctx, src.ID, ops)
+			_ = w.Store.MarkExtracted(ctx, src.ID, out.Ops)
 		}
+		ops := out.Ops
 		outcomes[i] = outcome{ops: ops}
 		if w.Log != nil && ops > 0 {
 			w.Log.Info("extracted", "source", src.ID, "kind", src.Kind, "ops", ops)

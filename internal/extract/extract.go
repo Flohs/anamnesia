@@ -181,9 +181,21 @@ func bytesTrimSpace(b []byte) []byte {
 	return b[i:j]
 }
 
-// Run extracts one sources row. Returns the number of operations
-// executed (0 if the gate skipped or LLM returned NOOPs).
-func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (int, error) {
+// Outcome is what one extraction run did.
+//
+// ModelCalled is the distinction the operations count alone cannot make.
+// A source the gate skipped and a source the model read and found nothing
+// in are both zero operations, but only the second one cost a model call,
+// and the worker recorded them as the same state for long enough that the
+// question "how often do we pay the model to say nothing" could only be
+// estimated.
+type Outcome struct {
+	Ops         int  // operations executed
+	ModelCalled bool // false when the gate or a config switch short-circuited first
+}
+
+// Run extracts one sources row.
+func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (Outcome, error) {
 	cfg := e.Cfg.applyDefaults()
 	content := strings.TrimSpace(src.RawContent)
 
@@ -203,7 +215,7 @@ func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (int, error)
 
 	if len(content) < cfg.MinContentLen {
 		tr.End("skipped", fmt.Sprintf("Nothing to extract from %d characters", len(content)))
-		return 0, nil
+		return Outcome{}, nil
 	}
 
 	// A graph source carries the whole checkpoint's text, posted once
@@ -213,9 +225,12 @@ func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (int, error)
 	if src.Kind == graphSourceKind {
 		if !cfg.ExtractGraph {
 			tr.End("skipped", "Graph extraction is off")
-			return 0, nil
+			return Outcome{}, nil
 		}
-		return e.runGraph(ctx, src, tr)
+		ops, err := e.runGraph(ctx, src, tr)
+		// runGraph calls the model before it can decide anything, so
+		// reaching it at all means the model ran.
+		return Outcome{Ops: ops, ModelCalled: true}, err
 	}
 
 	// Step 1: surprise gate. The gate is intentionally cheap — one
@@ -254,7 +269,7 @@ func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (int, error)
 				"score":   score,
 			})
 			tr.End("skipped", "Already covered by an existing memory")
-			return 0, nil
+			return Outcome{}, nil
 		default:
 			tr.Step("gate", "Kept: "+reason, map[string]any{
 				"verdict": "keep",
@@ -318,7 +333,7 @@ func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (int, error)
 	}, captured); err != nil {
 		tr.Fail("llm", err)
 		tr.End("failed", "The model call failed, so the source stays pending")
-		return 0, fmt.Errorf("llm extract: %w", err)
+		return Outcome{}, fmt.Errorf("llm extract: %w", err)
 	}
 	resp := captured.resp
 	tr.Step("llm", fmt.Sprintf("%s returned %d operations", e.LLM.Model(), len(resp.Operations)),
@@ -396,7 +411,7 @@ func (e *Extractor) Run(ctx context.Context, src *anamnesia.Source) (int, error)
 		tr.End("ok", fmt.Sprintf("Extracted %d operations from a %s %s source",
 			executed, humanBytes(len(content)), src.Kind))
 	}
-	return executed, nil
+	return Outcome{Ops: executed, ModelCalled: true}, nil
 }
 
 // capturedOps decodes the operations envelope while keeping the exact
