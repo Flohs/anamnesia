@@ -94,6 +94,7 @@ func init() {
 	root.AddCommand(restartCmd)
 	root.AddCommand(statusCmd)
 	root.AddCommand(logsCmd)
+	root.AddCommand(uiCmd)
 
 	// Maintenance.
 	root.AddCommand(updateCmd)

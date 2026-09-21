@@ -24,7 +24,33 @@ permissions:
   contents: write # required to create the release
 
 jobs:
+  # The binary embeds the console, so a bundle that was never rebuilt from
+  # ui/ ships a release whose console silently lags its own source. release
+  # needs this, so that cannot happen quietly.
+  console:
+    runs-on: ubuntu-latest
+    container: node:22-alpine
+    steps:
+      - run: apk add --no-cache git
+      - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Verify the console
+        run: |
+          set -eu
+          npm --prefix ui ci
+          npm --prefix ui run typecheck
+          npm --prefix ui run lint
+          npm --prefix ui test
+          npm --prefix ui run build
+          if ! git diff --quiet --exit-code internal/ui/dist; then
+            echo "::error::internal/ui/dist is stale. Run 'make ui-build' and commit the result."
+            git --no-pager diff --stat internal/ui/dist
+            exit 1
+          fi
+
   release:
+    needs: console
     runs-on: ubuntu-latest
     # The same database CI uses. Without one every DB-backed test calls
     # t.Skip and the Verify step below reports success having run dozens

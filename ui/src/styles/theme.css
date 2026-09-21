@@ -1,0 +1,122 @@
+@import "tailwindcss";
+
+/* The palette, type and radii are anamnesia.dev's own design tokens, lifted
+   verbatim so the console and the marketing site cannot drift apart. Declaring
+   them in @theme turns each one into a utility: --color-surface gives
+   bg-surface, text-surface, border-surface, and so on. */
+@theme {
+  --color-bg: #08080b;
+  --color-bg-2: #0d0d12;
+  --color-surface: #131319;
+  --color-surface-2: #1a1a22;
+  --color-surface-3: #22222d;
+
+  --color-border: #26262f;
+  --color-border-2: #2e2e39;
+  --color-border-bright: #3a3a47;
+
+  --color-text: #f6f6f8;
+  --color-text-2: #d4d4dc;
+  --color-text-3: #9c9ca8;
+  --color-text-4: #65656f;
+  --color-text-5: #43434c;
+
+  /* Coral is the brand accent. The rest are semantic: the mapping from a
+     domain state to one of these lives in src/lib/tone.ts and nowhere else. */
+  --color-coral: #ff7a45;
+  --color-coral-dim: #b35730;
+  --color-sky: #7cc7f0;
+  --color-mint: #8fe4b8;
+  --color-amber: #f5c969;
+  --color-lilac: #c4a3f5;
+  --color-rose: #f08b9c;
+
+  --font-sans: "Bricolage Grotesque", -apple-system, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-serif: "Instrument Serif", Georgia, serif;
+
+  --radius-sm: 6px;
+  --radius-DEFAULT: 8px;
+  --radius-md: 12px;
+  --radius-lg: 20px;
+
+  --shadow-glow: 0 0 14px rgb(255 122 69 / 0.6);
+}
+
+/* Uppercase monospace labels appear on nearly every surface. One utility keeps
+   their size and tracking identical everywhere instead of five near-misses. */
+@utility label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.4;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+@utility label-lg {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+/* Monospace data that is read as a value, not as a label: ids, durations,
+   counts. Tabular figures so columns of numbers line up. */
+@utility data {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The only animation in the console: a dot that pulses while a loop is
+   genuinely mid-tick. Everything else stays still, because motion in a
+   monitoring tool should mean something is happening. */
+@keyframes dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgb(255 122 69 / 0.5);
+  }
+  50% {
+    opacity: 0.55;
+    box-shadow: 0 0 0 5px rgb(255 122 69 / 0);
+  }
+}
+
+@layer base {
+  html {
+    background-color: var(--color-bg);
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--color-bg);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.55;
+    letter-spacing: -0.08px;
+    font-optical-sizing: auto;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-coral);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}

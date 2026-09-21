@@ -6,6 +6,12 @@
 *.out
 .DS_Store
 
+# The console's Node toolchain. The built bundle is NOT ignored: it lives in
+# internal/ui/dist/ and is committed, because go:embed needs it at compile
+# time and `go install` must keep working without Node.
+/ui/node_modules/
+*.tsbuildinfo
+
 # IDEs
 /.idea/
 /.vscode/

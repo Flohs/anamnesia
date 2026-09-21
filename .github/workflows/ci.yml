@@ -72,6 +72,49 @@ jobs:
       - name: build
         run: go build ./...
 
+  # The console's own suite, and the check that the bundle the binary
+  # embeds was actually rebuilt from it. Without the second one, a UI change
+  # ships a binary serving the previous console and every check stays green.
+  #
+  # This runs in node:22-alpine rather than through setup-go's Node, because
+  # that is the image `make ui-build` uses on a developer's machine, and the
+  # staleness check only means anything if both produce the same bytes.
+  console:
+    runs-on: ubuntu-latest
+    container: node:22-alpine
+    steps:
+      # checkout needs git, and git refuses a tree it thinks belongs to
+      # someone else, which is every checkout inside a container.
+      - run: apk add --no-cache git
+      - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: install
+        working-directory: ui
+        run: npm ci
+
+      - name: typecheck
+        working-directory: ui
+        run: npm run typecheck
+
+      - name: lint
+        working-directory: ui
+        run: npm run lint
+
+      - name: test
+        working-directory: ui
+        run: npm test
+
+      - name: the committed bundle must match the source
+        run: |
+          set -eu
+          npm --prefix ui run build
+          if ! git diff --quiet --exit-code internal/ui/dist; then
+            echo "::error::internal/ui/dist is stale. Run 'make ui-build' and commit the result."
+            git --no-pager diff --stat internal/ui/dist
+            exit 1
+          fi
+
   # Bring the real thing up the way a user does, and let doctor decide
   # whether it worked. This is the check that would have caught the schema
   # shipping at a width the default embedder could not write.

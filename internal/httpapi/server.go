@@ -47,6 +47,7 @@ import (
 	"github.com/flohs/anamnesia/internal/pii"
 	"github.com/flohs/anamnesia/internal/retrieval"
 	"github.com/flohs/anamnesia/internal/store"
+	"github.com/flohs/anamnesia/internal/ui"
 	"github.com/flohs/anamnesia/pkg/anamnesia"
 )
 
@@ -91,6 +92,10 @@ type Deps struct {
 	// NewServer sets it, so a Deps built by hand leaves it nil, and a nil
 	// channel in a select simply never fires.
 	shuttingDown <-chan struct{}
+
+	// console holds the browser sessions the embedded console
+	// authenticates with. NewServer allocates it when the caller has not.
+	console *consoleAuth
 }
 
 // NewServer returns a configured *http.Server bound to addr.
@@ -103,6 +108,9 @@ func NewServer(addr string, d Deps) *http.Server {
 	// otherwise hold every stop open for the whole shutdown budget.
 	stopping := make(chan struct{})
 	d.shuttingDown = stopping
+	if d.console == nil {
+		d.console = &consoleAuth{}
+	}
 	mux := http.NewServeMux()
 
 	mux.Handle("/v1/health", http.HandlerFunc(d.handleHealth))
@@ -120,6 +128,7 @@ func NewServer(addr string, d Deps) *http.Server {
 	mux.Handle("/v1/commitments/resolve", d.protect(http.HandlerFunc(d.handleCommitmentResolve)))
 	mux.Handle("/v1/audit", d.protect(http.HandlerFunc(d.handleAudit)))
 	mux.Handle("/v1/artifacts", d.protect(http.HandlerFunc(d.handleArtifacts)))
+	mux.Handle("/v1/console/session", d.protect(http.HandlerFunc(d.handleConsoleSession)))
 
 	// Read-only observability. Registered with methods, so a stray write
 	// is a 405 rather than something the handler has to guard against.
@@ -143,6 +152,16 @@ func NewServer(addr string, d Deps) *http.Server {
 		mux.Handle("/mcp/", d.protect(d.MCPHandler))
 	}
 
+	// The console calls /api/v1/..., which the container's Node proxy used
+	// to rewrite. Keeping the prefix means `make dev` and this binary
+	// present the same shape, so the dev server stays a faithful rehearsal.
+	// Each pass strips one prefix, so this terminates.
+	mux.Handle("/api/", http.StripPrefix("/api", mux))
+	// Everything else is the console. It is last because it matches
+	// anything, and it is told which prefixes belong to the API so a typo'd
+	// endpoint is a 404 rather than a web page returned with a 200.
+	mux.Handle("/", d.consoleGate(ui.Handler("/v1/", "/api/", "/mcp")))
+
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           withLogging(d.Log, mux),
@@ -164,7 +183,9 @@ func (d Deps) protect(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		want := "Bearer " + d.ServerToken
-		if auth != want {
+		// EventSource cannot send a header, so the console proves itself
+		// with the cookie consoleGate issued it instead.
+		if auth != want && !d.hasConsoleSession(r) {
 			http.Error(w, "unauthorised", http.StatusUnauthorized)
 			return
 		}

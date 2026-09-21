@@ -275,6 +275,35 @@ were rebuilt around being verifiable.
 
 ### Added
 
+- **The console ships inside the binary: `anamnesia ui`.** It used to be a
+  second container, published separately to Docker Hub, that you pointed at
+  the server with `ANAMNESIA_URL` and `ANAMNESIA_TOKEN`. Its Node server did
+  two things, and served from the same process both of them disappear: there
+  is nothing to proxy, and no token to attach on the way through. `anamnesia
+  ui` brings the stack up if it is down and opens a browser; `--no-open`
+  prints the URL instead, which is what you want over SSH. The console is
+  served by `anamnesia serve` itself, so there is no second port and no
+  second process, and it cannot end up on a different version from the
+  server it is reading.
+
+  The console's source now lives in `ui/`, and the bundle it builds is
+  committed under `internal/ui/dist` because `go:embed` needs it at compile
+  time and `go install` has to keep working on a machine with no Node. CI
+  rebuilds it and fails if it differs from what is committed, so a console
+  that silently lags its own source is not a thing that can ship. The binary
+  grows by about 350 KB.
+
+  Where `server.token` is set, a browser cannot send it, so `anamnesia ui`
+  spends the token on a single-use link that the server exchanges for an
+  HttpOnly session cookie. This is not only tidiness: the activity feed is
+  an `EventSource`, which cannot set an `Authorization` header at all, and
+  previously worked only because the Node proxy injected one. Opening the
+  console without a session answers 401 naming the command that fixes it,
+  rather than rendering a console whose every call fails.
+
+  `anamnesia-ui` is archived and its image is no longer published. If you
+  run that container, drop it and use `anamnesia ui`.
+
 - **Artifacts are remembered, as links rather than as copies.** Publishing
   a page to claude.ai produced a URL that nothing kept. It was never lost,
   because the URL is in the transcript, but nothing went back for it:

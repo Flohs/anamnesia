@@ -26,7 +26,8 @@ TEST_PG_IMAGE     ?= pgvector/pgvector:pg16
 ANAMNESIA_TEST_DATABASE_URL ?= postgres://anamnesia:anamnesia-test@127.0.0.1:$(TEST_PG_PORT)/anamnesia?sslmode=disable
 export ANAMNESIA_TEST_DATABASE_URL
 
-.PHONY: help build install test test-db test-db-stop fmt vet lint tidy clean release
+.PHONY: help build install test test-db test-db-stop fmt vet lint tidy clean release \
+        ui-install ui-dev ui-check ui-build ui-verify
 
 help:
 	@echo "Targets:"
@@ -41,6 +42,11 @@ help:
 	@echo "  tidy       go mod tidy"
 	@echo "  release    cross-compile into ./dist for the supported platforms"
 	@echo "  clean      remove ./bin and ./dist"
+	@echo "The console (all of these run node in a container):"
+	@echo "  ui-dev     vite dev server on http://localhost:$(UI_PORT)"
+	@echo "  ui-check   typecheck + eslint + vitest"
+	@echo "  ui-build   rebuild the bundle the binary embeds"
+	@echo "  ui-verify  fail if the committed bundle is stale"
 
 build:
 	mkdir -p bin
@@ -106,3 +112,55 @@ release:
 
 clean:
 	rm -rf bin dist
+
+# ── the console ───────────────────────────────────────────────────────
+#
+# Node never runs on the host: every install, build and test goes through a
+# container, so a compromised package cannot reach this machine. The built
+# bundle is committed under internal/ui/dist because go:embed needs it at
+# compile time and `go install` has to keep working without Node.
+#
+# None of the Go targets depend on these. Building the binary compiles
+# whatever bundle is committed, so a Go-only change needs no Node at all.
+NODE_IMAGE    ?= node:22-alpine
+UI_PORT       ?= 5173
+ANAMNESIA_URL ?= http://host.docker.internal:8181
+
+NODE_RUN = docker run --rm -u $(shell id -u):$(shell id -g) -e HOME=/tmp \
+	-v $(CURDIR):/repo -w /repo/ui $(NODE_IMAGE)
+
+# A sentinel rather than a phony target, so the install runs when the
+# lockfile moves and not on every single build.
+ui/node_modules: ui/package-lock.json ui/package.json
+	$(NODE_RUN) npm ci
+	@touch ui/node_modules
+
+# Updates package-lock.json too; ui/node_modules alone does not.
+ui-install:
+	$(NODE_RUN) npm install
+
+ui-dev: ui/node_modules
+	docker run --rm -it -u $(shell id -u):$(shell id -g) -e HOME=/tmp \
+	  -e ANAMNESIA_URL=$(ANAMNESIA_URL) -v $(CURDIR):/repo -w /repo/ui \
+	  -p $(UI_PORT):5173 $(NODE_IMAGE) npm run dev
+
+ui-check: ui/node_modules
+	$(NODE_RUN) npm run typecheck
+	$(NODE_RUN) npm run lint
+	$(NODE_RUN) npm test
+
+ui-build: ui/node_modules
+	$(NODE_RUN) npm run build
+
+# The committed bundle is what the binary ships, so a source change that was
+# never rebuilt is a console silently lagging its own code. Vite's output is
+# byte-reproducible for a fixed lockfile and node image, which is what makes
+# rebuilding and diffing a gate that can actually fail.
+ui-verify: ui-build
+	@if ! git diff --quiet --exit-code internal/ui/dist; then \
+	  echo "internal/ui/dist is stale: run 'make ui-build' and commit the result" >&2; \
+	  git --no-pager diff --stat internal/ui/dist >&2; \
+	  exit 1; \
+	fi
+	@echo "the committed console matches ui/"
+
