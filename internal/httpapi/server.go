@@ -155,8 +155,18 @@ func NewServer(addr string, d Deps) *http.Server {
 	// The console calls /api/v1/..., which the container's Node proxy used
 	// to rewrite. Keeping the prefix means `make dev` and this binary
 	// present the same shape, so the dev server stays a faithful rehearsal.
-	// Each pass strips one prefix, so this terminates.
-	mux.Handle("/api/", http.StripPrefix("/api", mux))
+	//
+	// Stripped exactly once. Handing the mux to itself would let /api/api/…
+	// nest a stack frame per prefix, and since routing happens before
+	// protect, an unauthenticated caller would be choosing the depth.
+	mux.Handle("/api/", http.StripPrefix("/api", http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				http.Error(w, "No such endpoint.", http.StatusNotFound)
+				return
+			}
+			mux.ServeHTTP(w, r)
+		})))
 	// Everything else is the console. It is last because it matches
 	// anything, and it is told which prefixes belong to the API so a typo'd
 	// endpoint is a 404 rather than a web page returned with a 200.

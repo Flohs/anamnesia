@@ -246,3 +246,17 @@ func TestLinksAndSessionsExpire(t *testing.T) {
 		}
 	})
 }
+
+// The /api/ route re-enters the mux, so each nested prefix in a crafted URL
+// would be another stack frame. A request line can carry ~200k of them, and
+// routing happens before protect, so an unauthenticated caller must not be
+// able to choose how deep the server recurses.
+func TestNestedAPIPrefixesDoNotNest(t *testing.T) {
+	h := serverFor(t, "")
+
+	rec := do(t, h, httptest.NewRequest(http.MethodGet, "/api/api/v1/health", nil))
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET /api/api/v1/health = %d, want 404: the prefix is being stripped more than once", rec.Code)
+	}
+}
