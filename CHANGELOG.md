@@ -9,6 +9,10 @@ the commit that added it.
 
 ## Unreleased
 
+Nothing yet.
+
+## v0.1.0-rc19 (2026-09-22)
+
 ### Added
 
 - **The console says how often retrieval actually recalled something.** The
