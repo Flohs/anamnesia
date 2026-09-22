@@ -280,6 +280,19 @@ type SearchHit struct {
 	LexicalRank  int     `json:"lexical_rank,omitempty"`
 	GraphRank    int     `json:"graph_rank,omitempty"`
 	RerankerRank int     `json:"reranker_rank,omitempty"`
+
+	// Distance is the cosine distance the vector channel ranked this hit
+	// by, 0 (identical) to 1. It is the only absolute number a search
+	// produces: Score is a fused RRF value, which is rank-based and so
+	// gives the best of an irrelevant pool exactly what it gives the best
+	// of a relevant one.
+	//
+	// A pointer because an exact match is distance 0, which a plain
+	// float64 cannot tell apart from a hit the vector channel never
+	// ranked. Nil means there is nothing absolute to judge this hit by:
+	// it came from the lexical or graph channel, or no embedder is
+	// configured at all.
+	Distance *float64 `json:"distance,omitempty"`
 }
 
 func (h SearchHit) ID() uuid.UUID {

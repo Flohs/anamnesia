@@ -9,7 +9,42 @@ the commit that added it.
 
 ## Unreleased
 
-Nothing yet.
+### Added
+
+- **The console says how often retrieval actually recalled something.** The
+  Now page carried six cells about what is stored and nothing about whether
+  any of it ever came back, and the only record of a retrieval lived in the
+  in-memory activity recorder, which a restart empties. A seventh cell now
+  reads `412 recalled / 632 prompts · 7 days`, from a `recall_daily` table
+  written on every `/v1/retrieve` and kept indefinitely, so the question is
+  answerable weeks later rather than only while the tab is open.
+
+  What it counts is the part worth being careful about. A retrieval returns
+  its top K rows whether or not any of them match, and a fused RRF score is
+  rank-based, so counting non-empty results would have counted the corpus
+  being non-empty and reported close to 100% forever. A retrieval is only
+  tallied as a recall when a hit clears an absolute bar: the reranker's
+  relevance score where one ran, otherwise the cosine distance, which the
+  vector channel already sorted by and now keeps on the hit
+  (`SearchHit.Distance`, a pointer, because an exact match is distance 0 and
+  a lexical hit has none at all). Retrievals with nothing absolute to judge
+  by are recorded as unmeasured and left out of what the count is measured
+  against, rather than counted as failures. That covers the default install:
+  with no API key the embedder is the stub, which hashes text into a random
+  unit vector, so grading it would have reported a permanent nothing-recalled
+  caused by configuration and not by retrieval.
+
+  Two new settings, `retrieval.recall_max_distance` (0.60) and
+  `retrieval.recall_min_score` (0.50), set the bars. Both are measurement
+  only: neither changes which memories a session is given. The cell carries
+  no status dot, because a prompt about something never discussed has nothing
+  to recall, so there is no target for this number to fall short of.
+
+  `recall_daily` has no `project_id` on purpose. The column alone would put
+  it into `projectScopedTables`, and `project prune` treats a row in any of
+  those as "this project still holds something", so a project you opened once
+  and never stored memory in would have been kept alive by its own tally of
+  its emptiness.
 
 ## v0.1.0-rc18 (2026-09-22)
 

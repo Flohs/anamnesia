@@ -441,11 +441,20 @@ func (e *Engine) vectorFacts(ctx context.Context, scope anamnesia.Scope, qvec []
 	q := fmt.Sprintf(`
 		SELECT id, user_id, project_id, source_id, fact_scope, key, value, source, trust, pii_tags,
 		       embed_model, valid_from, valid_to, ingested_at, invalidated_at,
-		       superseded_by, deleted_at
+		       superseded_by, deleted_at, embedding <=> $2 AS distance
 		FROM facts WHERE %s
-		ORDER BY embedding <=> $2 ASC
+		ORDER BY distance ASC
 		LIMIT $%d`, strings.Join(where, " AND "), len(args))
-	return e.scanFactHits(ctx, q, args)
+	scored, err := e.Store.QueryScoredFacts(ctx, q, args)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]anamnesia.SearchHit, len(scored))
+	for i, s := range scored {
+		d := s.Distance
+		out[i] = anamnesia.SearchHit{Domain: anamnesia.DomainFact, Fact: s.Fact, Distance: &d}
+	}
+	return out, nil
 }
 
 func (e *Engine) lexicalFacts(ctx context.Context, scope anamnesia.Scope, text string, k int, includeHistory bool) ([]anamnesia.SearchHit, error) {
@@ -498,10 +507,19 @@ func (e *Engine) vectorExperiences(ctx context.Context, scope anamnesia.Scope, q
 	q := fmt.Sprintf(`SELECT id, user_id, project_id, source_id, kind, abstraction, title, body, outcome, meta,
 		trust, importance, relevance, pii_tags, use_count, last_used_at, embed_model,
 		valid_from, valid_to, ingested_at, invalidated_at, superseded_by, deleted_at,
-		occurred_at, participants, topic, parent_id, provenance
-		FROM experiences WHERE %s ORDER BY embedding <=> $2 ASC LIMIT $%d`,
+		occurred_at, participants, topic, parent_id, provenance, embedding <=> $2 AS distance
+		FROM experiences WHERE %s ORDER BY distance ASC LIMIT $%d`,
 		strings.Join(where, " AND "), len(args))
-	return e.scanExperienceHits(ctx, q, args)
+	scored, err := e.Store.QueryScoredExperiences(ctx, q, args)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]anamnesia.SearchHit, len(scored))
+	for i, s := range scored {
+		d := s.Distance
+		out[i] = anamnesia.SearchHit{Domain: anamnesia.DomainExperience, Experience: s.Experience, Distance: &d}
+	}
+	return out, nil
 }
 
 func (e *Engine) lexicalExperiences(ctx context.Context, scope anamnesia.Scope, text string, k int, onlyRaw bool) ([]anamnesia.SearchHit, error) {

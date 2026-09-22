@@ -92,6 +92,9 @@ type statsResponse struct {
 	Queues                   QueuePendingResponse      `json:"queues"`
 	ExperiencesByAbstraction map[int]int               `json:"experiences_by_abstraction"`
 	EmbeddingCoverage        map[string]store.Coverage `json:"embedding_coverage"`
+	// Recall is kept per user rather than per project, so it is the same
+	// window whether or not the request narrowed to one project.
+	Recall store.RecallCounts `json:"recall"`
 }
 
 func (d Deps) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -100,6 +103,11 @@ func (d Deps) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stats, err := d.Store.Stats(r.Context(), rs.Scope)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	recall, err := d.Store.RecallWindow(r.Context(), rs.Scope.UserID, recallWindowDays)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -126,5 +134,6 @@ func (d Deps) handleStats(w http.ResponseWriter, r *http.Request) {
 		},
 		ExperiencesByAbstraction: stats.ExperiencesByAbstraction,
 		EmbeddingCoverage:        stats.EmbeddingCoverage,
+		Recall:                   recall,
 	})
 }

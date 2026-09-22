@@ -207,6 +207,22 @@ export interface EmbeddingCoverage {
   embedded: number;
 }
 
+/**
+ * How often retrieval came back with something, over a window of days.
+ *
+ * `recalled` counts the retrievals that returned a hit clearing an
+ * absolute bar, and `ungraded` the ones there was no absolute number to
+ * judge by, because a fused rank cannot tell a match from the least bad
+ * row of an irrelevant pool. Misses are the remainder. Kept per user, so
+ * it is the same window whether or not the request named a project.
+ */
+export interface RecallCounts {
+  days: number;
+  prompts: number;
+  recalled: number;
+  ungraded: number;
+}
+
 export interface Stats {
   scope: { user: string; project: string | null };
   totals: DomainTotals;
@@ -214,6 +230,7 @@ export interface Stats {
   queues: QueueDepths;
   experiences_by_abstraction: Record<string, number>;
   embedding_coverage: Record<string, EmbeddingCoverage>;
+  recall: RecallCounts;
 }
 
 export interface ActivityBucket {

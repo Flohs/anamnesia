@@ -67,6 +67,14 @@ type Deps struct {
 	// artifacts to `anamnesia artifacts` and the session-start list.
 	ArtifactMaxDistance float64
 
+	// RecallMinScore and RecallMaxDistance are the bars a hit has to
+	// clear for a retrieval to be tallied as a recall: a reranker
+	// relevance score where one ran, a cosine distance otherwise. Both
+	// are absolute, which a fused RRF score is not. Measurement only:
+	// neither changes which memories a session is given.
+	RecallMinScore    float64
+	RecallMaxDistance float64
+
 	// Activity is the in-memory recorder. Nil means recording is off,
 	// which is what makes every /v1/activity route a 404.
 	Activity *activity.Recorder
@@ -635,6 +643,11 @@ func (d Deps) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 		ev.MaxArtifacts = 3
 	}
 	resp.Artifacts = d.artifactHits(r.Context(), scope, ev.Prompt, ev.MaxArtifacts)
+	// Tallied on the primary hits alone. Cross-project hits and
+	// artifacts are offered beside an answer and clear bars of their own,
+	// so counting them here would say memory was recalled when what came
+	// back was a link.
+	d.recordRecall(r.Context(), scope.UserID, gradeRecall(resp.Hits, d.recallBars()))
 	tr.Step("result", fmt.Sprintf("Returned %d hits, %d cross-project hits and %d artifacts",
 		len(resp.Hits), len(resp.CrossProject), len(resp.Artifacts)), map[string]any{
 		"hits":          retrieval.HitDetails(resp.Hits),

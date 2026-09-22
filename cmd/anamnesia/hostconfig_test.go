@@ -729,3 +729,38 @@ func TestZeroableSettingsStillRejectNegative(t *testing.T) {
 		t.Error("ingest.segment_max_bytes accepted a negative number")
 	}
 }
+
+// TestRecallSettingsReachTheServer walks the path the two recall bars
+// take from the config file to the configuration the server reads back
+// out of its own environment, for the same reason the graph settings
+// have one: a bar that is declared, documented and defaulted but never
+// wired grades every retrieval against zero.
+func TestRecallSettingsReachTheServer(t *testing.T) {
+	home := isolatedHome(t)
+	writeConfig(t, filepath.Join(home, "config.toml"), `
+[retrieval]
+recall_max_distance = "0.42"
+recall_min_score = "0.75"
+`)
+	hc, err := loadHostConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range hc.ServerEnv() {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			t.Fatalf("server environment entry %q is not key=value", kv)
+		}
+		t.Setenv(k, v)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RecallMaxDistance != 0.42 {
+		t.Errorf("RecallMaxDistance = %v, want 0.42", cfg.RecallMaxDistance)
+	}
+	if cfg.RecallMinScore != 0.75 {
+		t.Errorf("RecallMinScore = %v, want 0.75", cfg.RecallMinScore)
+	}
+}

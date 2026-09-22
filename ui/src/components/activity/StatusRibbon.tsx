@@ -1,4 +1,4 @@
-import type { Health } from "@/api/types";
+import type { Health, RecallCounts } from "@/api/types";
 import { StatusDot } from "@/components/ui/StatusDot";
 import { shortModel } from "@/lib/trace";
 import { formatUptime, joinMeta } from "@/lib/format";
@@ -24,17 +24,55 @@ interface StatusRibbonProps {
   factCount: number;
   entityCount: number;
   user: string;
+  /** Null while the tally is still loading. */
+  recall: RecallCounts | null;
 }
 
 /**
- * The six things worth knowing before anything else.
+ * The recall cell, derived rather than asserted.
+ *
+ * It carries no tone. A cell turns amber or red where a state is good or
+ * bad, and there is no defensible target here: a prompt about something
+ * never discussed has nothing to recall, so a low count is as likely to
+ * describe the questions as the retrieval.
+ *
+ * Ungraded prompts are left out of what the count is measured against
+ * rather than counted as failures. On an install with no embedder every
+ * prompt is ungraded, and "0 recalled" would read as broken retrieval
+ * instead of as a setup with no absolute number to judge by.
+ */
+function recallCell(recall: RecallCounts | null): RibbonCell {
+  const label = "recall";
+  if (!recall) {
+    return { label, value: "...", detail: "" };
+  }
+  if (recall.prompts === 0) {
+    return { label, value: "no prompts yet", detail: `last ${recall.days} days` };
+  }
+  // Terse because this is the seventh cell in a row that truncates at
+  // 168px: "of 632 prompts · last 7 days" is cut mid-word, and a window
+  // the reader cannot see makes the count unreadable.
+  const days = `${recall.days} days`;
+  const graded = recall.prompts - recall.ungraded;
+  if (graded <= 0) {
+    return { label, value: "not measured", detail: joinMeta(`${recall.prompts} prompts`, days) };
+  }
+  return {
+    label,
+    value: `${recall.recalled} recalled`,
+    detail: joinMeta(`${graded} prompts`, days),
+  };
+}
+
+/**
+ * The seven things worth knowing before anything else.
  *
  * Derived rather than decorative: the embeddings cell turns amber precisely
  * when an ANN index is missing, because that is the difference between a
  * vector search and a full table scan.
  */
 function buildRibbon(props: StatusRibbonProps): RibbonCell[] {
-  const { health, startedAt, projectCount, experienceCount, factCount, entityCount, user } = props;
+  const { health, startedAt, projectCount, experienceCount, factCount, entityCount, user, recall } = props;
   const annMissing = (health.missing_ann_indexes ?? []).length > 0;
 
   return [
@@ -71,6 +109,7 @@ function buildRibbon(props: StatusRibbonProps): RibbonCell[] {
       value: `${experienceCount} experiences`,
       detail: joinMeta(`${factCount} facts`, `${entityCount} entities`),
     },
+    recallCell(recall),
   ];
 }
 

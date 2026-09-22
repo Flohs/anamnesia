@@ -80,7 +80,12 @@ type Config struct {
 	// ArtifactMaxDistance is the cosine distance a published artifact
 	// must be within to be offered beside an answer. Zero switches the
 	// prompt-driven surface off.
-	ArtifactMaxDistance   float64       // ANAMNESIA_ARTIFACT_MAX_DISTANCE (default 0.60)
+	ArtifactMaxDistance float64 // ANAMNESIA_ARTIFACT_MAX_DISTANCE (default 0.60)
+	// RecallMaxDistance and RecallMinScore are the bars a hit clears for
+	// a retrieval to be tallied as a recall. They are measurement only:
+	// neither changes which memories a session is given.
+	RecallMaxDistance     float64       // ANAMNESIA_RECALL_MAX_DISTANCE (default 0.60)
+	RecallMinScore        float64       // ANAMNESIA_RECALL_MIN_SCORE (default 0.50)
 	ConsolidateMaxCluster int           // ANAMNESIA_CONSOLIDATE_MAX_CLUSTER (default 8)
 	ForgetEvery           time.Duration // ANAMNESIA_FORGET_EVERY (default 1h)
 	DecayEvery            time.Duration // ANAMNESIA_DECAY_EVERY (default 1h)
@@ -250,6 +255,8 @@ func Load() (*Config, error) {
 		// is held by TestConsolidateDefaultsAgreeWithTheClusterer.
 		ConsolidateSimilarity: fraction("ANAMNESIA_CONSOLIDATE_SIMILARITY", 0.65),
 		ArtifactMaxDistance:   fraction("ANAMNESIA_ARTIFACT_MAX_DISTANCE", 0.60),
+		RecallMaxDistance:     fraction("ANAMNESIA_RECALL_MAX_DISTANCE", 0.60),
+		RecallMinScore:        fraction("ANAMNESIA_RECALL_MIN_SCORE", 0.50),
 		ConsolidateMaxCluster: num("ANAMNESIA_CONSOLIDATE_MAX_CLUSTER", 8),
 		ForgetEvery:           dur("ANAMNESIA_FORGET_EVERY", time.Hour),
 		DecayEvery:            dur("ANAMNESIA_DECAY_EVERY", time.Hour),

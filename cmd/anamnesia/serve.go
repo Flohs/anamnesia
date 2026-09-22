@@ -280,6 +280,8 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		Log:            log,
 
 		ArtifactMaxDistance: cfg.ArtifactMaxDistance,
+		RecallMaxDistance:   cfg.RecallMaxDistance,
+		RecallMinScore:      cfg.RecallMinScore,
 		Version:             version,
 		Activity:            recorder,
 		Started:             time.Now().UTC(),

@@ -37,6 +37,7 @@ export function NowView({ snapshot, onOpenTrace }: NowViewProps) {
               factCount={stats.data?.totals.facts ?? 0}
               entityCount={stats.data?.totals.entities ?? 0}
               user={stats.data?.scope.user ?? "default"}
+              recall={stats.data?.recall ?? null}
             />
           )}
         </QueryBoundary>
