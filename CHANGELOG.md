@@ -34,11 +34,21 @@ the commit that added it.
   unit vector, so grading it would have reported a permanent nothing-recalled
   caused by configuration and not by retrieval.
 
-  Two new settings, `retrieval.recall_max_distance` (0.60) and
-  `retrieval.recall_min_score` (0.50), set the bars. Both are measurement
-  only: neither changes which memories a session is given. The cell carries
-  no status dot, because a prompt about something never discussed has nothing
-  to recall, so there is no target for this number to fall short of.
+  One new setting, `retrieval.recall_max_distance` (0.60), sets the bar, and
+  it is measurement only: it never changes which memories a session is given.
+  A reranker is deliberately not consulted even where one runs, because its
+  scores are relative to the model and no fixed bar travels between them.
+  Measured on openai/text-embedding-3-small with cohere/rerank-v3.5: a
+  paraphrased question matched the memory answering it at distance 0.528 and
+  score 0.252, a near-verbatim one at 0.153 and 0.603, and unrelated
+  questions at 0.747 and up against 0.011. The distances separate cleanly at
+  0.60; the scores separate just as well but on a scale where the 0.50 floor
+  borrowed from cross-project hits reads that first, genuinely relevant match
+  as a miss. Using the distance also keeps installs comparable, since two
+  holding the same memory now report the same thing whether or not one of
+  them reranks. The cell carries no status dot, because a prompt about
+  something never discussed has nothing to recall, so there is no target for
+  this number to fall short of.
 
   `recall_daily` has no `project_id` on purpose. The column alone would put
   it into `projectScopedTables`, and `project prune` treats a row in any of

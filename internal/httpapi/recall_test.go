@@ -28,33 +28,34 @@ func hitAt(d *float64) anamnesia.SearchHit {
 
 func TestGradeRecallCountsAHitInsideTheDistanceBar(t *testing.T) {
 	hits := []anamnesia.SearchHit{hitAt(dist(0.9)), hitAt(dist(0.41))}
-	if got := gradeRecall(hits, recallBars{MinScore: 0.5, MaxDistance: 0.6, TrustDistance: true}); got != store.RecallHit {
+	if got := gradeRecall(hits, recallBars{MaxDistance: 0.6, TrustDistance: true}); got != store.RecallHit {
 		t.Errorf("got %q, want %q: 0.41 is inside a 0.60 bar", got, store.RecallHit)
 	}
 }
 
 func TestGradeRecallCountsAMissWhenEveryHitIsOutsideTheBar(t *testing.T) {
 	hits := []anamnesia.SearchHit{hitAt(dist(0.71)), hitAt(dist(0.95))}
-	if got := gradeRecall(hits, recallBars{MinScore: 0.5, MaxDistance: 0.6, TrustDistance: true}); got != store.RecallMiss {
+	if got := gradeRecall(hits, recallBars{MaxDistance: 0.6, TrustDistance: true}); got != store.RecallMiss {
 		t.Errorf("got %q, want %q: nothing is inside a 0.60 bar", got, store.RecallMiss)
 	}
 }
 
-// The reranker's score is absolute relevance on its own scale, so where
-// one ran it is the better judge and the distance is beside the point.
-func TestGradeRecallPrefersTheRerankerScoreWhenOneRan(t *testing.T) {
-	far := hitAt(dist(0.95))
-	far.RerankerRank = 1
-	far.Score = 0.82
-	if got := gradeRecall([]anamnesia.SearchHit{far}, recallBars{MinScore: 0.5, MaxDistance: 0.6, TrustDistance: true}); got != store.RecallHit {
-		t.Errorf("got %q, want %q: a reranker score of 0.82 clears a 0.50 bar", got, store.RecallHit)
-	}
-
-	near := hitAt(dist(0.05))
-	near.RerankerRank = 1
-	near.Score = 0.2
-	if got := gradeRecall([]anamnesia.SearchHit{near}, recallBars{MinScore: 0.5, MaxDistance: 0.6, TrustDistance: true}); got != store.RecallMiss {
-		t.Errorf("got %q, want %q: the reranker judged it at 0.20", got, store.RecallMiss)
+// Measured against openai/text-embedding-3-small with cohere/rerank-v3.5
+// on: a paraphrased question matched its memory at distance 0.528 and
+// reranker score 0.252, while an unrelated question scored 0.011. The
+// reranker separates just as well, but on a scale of its own that no
+// fixed bar travels across models, and a 0.50 bar borrowed from the
+// cross-project floor called that 0.528 match a miss. The distance is
+// the one instrument this project has already calibrated, and it is
+// present whenever a reranker ran, because reranking re-orders what the
+// vector channel found.
+func TestGradeRecallJudgesByDistanceEvenWhenARerankerScoredLow(t *testing.T) {
+	h := hitAt(dist(0.528))
+	h.RerankerRank = 1
+	h.Score = 0.252
+	bars := recallBars{MaxDistance: 0.6, TrustDistance: true}
+	if got := gradeRecall([]anamnesia.SearchHit{h}, bars); got != store.RecallHit {
+		t.Errorf("got %q, want %q: an uncalibrated score overruled a measured distance", got, store.RecallHit)
 	}
 }
 
@@ -62,14 +63,14 @@ func TestGradeRecallPrefersTheRerankerScoreWhenOneRan(t *testing.T) {
 // would blame retrieval for a question nobody can answer.
 func TestGradeRecallIsUngradedWhenNoHitCarriesAnAbsoluteNumber(t *testing.T) {
 	hits := []anamnesia.SearchHit{hitAt(nil), hitAt(nil)}
-	if got := gradeRecall(hits, recallBars{MinScore: 0.5, MaxDistance: 0.6, TrustDistance: true}); got != store.RecallUngraded {
+	if got := gradeRecall(hits, recallBars{MaxDistance: 0.6, TrustDistance: true}); got != store.RecallUngraded {
 		t.Errorf("got %q, want %q", got, store.RecallUngraded)
 	}
 }
 
 // Nothing came back at all, which is knowable without any bar.
 func TestGradeRecallCountsNoHitsAsAMiss(t *testing.T) {
-	if got := gradeRecall(nil, recallBars{MinScore: 0.5, MaxDistance: 0.6, TrustDistance: true}); got != store.RecallMiss {
+	if got := gradeRecall(nil, recallBars{MaxDistance: 0.6, TrustDistance: true}); got != store.RecallMiss {
 		t.Errorf("got %q, want %q", got, store.RecallMiss)
 	}
 }
@@ -156,7 +157,6 @@ func recallDeps(st *store.Store, handle string, emb embed.Embedder) Deps {
 		Retrieval:         &retrieval.Engine{Store: st, Embedder: emb},
 		Activity:          activity.New(4),
 		DefaultUser:       handle,
-		RecallMinScore:    0.5,
 		RecallMaxDistance: 0.6,
 	}
 }
@@ -310,21 +310,21 @@ func TestRetrieveStillAnswersWhenTheTallyCannotBeWritten(t *testing.T) {
 // default one.
 func TestGradeRecallDoesNotJudgeByAStubsDistances(t *testing.T) {
 	hits := []anamnesia.SearchHit{hitAt(dist(0.0))}
-	bars := recallBars{MinScore: 0.5, MaxDistance: 0.6, TrustDistance: false}
+	bars := recallBars{MaxDistance: 0.6, TrustDistance: false}
 	if got := gradeRecall(hits, bars); got != store.RecallUngraded {
 		t.Errorf("got %q, want %q: a stub's distance is not evidence", got, store.RecallUngraded)
 	}
 }
 
-// A reranker scores the text, not the embedding, so it is still a
-// judgement even where the distances are not.
-func TestGradeRecallStillUsesTheRerankerWithoutTrustworthyDistances(t *testing.T) {
+// With no distance worth trusting there is nothing left to judge by, a
+// reranker score included: it is not on a scale this can read.
+func TestGradeRecallIsUngradedWithoutTrustworthyDistancesEvenWhenReranked(t *testing.T) {
 	h := hitAt(dist(0.0))
 	h.RerankerRank = 1
 	h.Score = 0.9
-	bars := recallBars{MinScore: 0.5, MaxDistance: 0.6, TrustDistance: false}
-	if got := gradeRecall([]anamnesia.SearchHit{h}, bars); got != store.RecallHit {
-		t.Errorf("got %q, want %q", got, store.RecallHit)
+	bars := recallBars{MaxDistance: 0.6, TrustDistance: false}
+	if got := gradeRecall([]anamnesia.SearchHit{h}, bars); got != store.RecallUngraded {
+		t.Errorf("got %q, want %q", got, store.RecallUngraded)
 	}
 }
 

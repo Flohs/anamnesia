@@ -67,12 +67,10 @@ type Deps struct {
 	// artifacts to `anamnesia artifacts` and the session-start list.
 	ArtifactMaxDistance float64
 
-	// RecallMinScore and RecallMaxDistance are the bars a hit has to
-	// clear for a retrieval to be tallied as a recall: a reranker
-	// relevance score where one ran, a cosine distance otherwise. Both
-	// are absolute, which a fused RRF score is not. Measurement only:
-	// neither changes which memories a session is given.
-	RecallMinScore    float64
+	// RecallMaxDistance is the cosine distance a hit has to be within
+	// for a retrieval to be tallied as a recall. Absolute, which a fused
+	// RRF score is not. Measurement only: it never changes which
+	// memories a session is given.
 	RecallMaxDistance float64
 
 	// Activity is the in-memory recorder. Nil means recording is off,

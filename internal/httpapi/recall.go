@@ -32,7 +32,6 @@ import (
 // would report a permanent nothing-recalled caused by configuration
 // rather than by retrieval.
 type recallBars struct {
-	MinScore      float64
 	MaxDistance   float64
 	TrustDistance bool
 }
@@ -40,34 +39,29 @@ type recallBars struct {
 // recallBars reads the bars this server judges by.
 func (d Deps) recallBars() recallBars {
 	return recallBars{
-		MinScore:      d.RecallMinScore,
 		MaxDistance:   d.RecallMaxDistance,
 		TrustDistance: d.EmbedProvider != "stub",
 	}
 }
 
-// gradeRecall judges one retrieval's hits against the absolute bars.
+// gradeRecall judges one retrieval's hits against the absolute bar.
 //
-// The reranker wins where it ran: it scored these exact hits against
-// this exact query, which is a better judgement than the distance
-// between two embeddings, and it stays a judgement even where the
-// embeddings are not one. Only when nothing was reranked does the
-// distance decide.
+// The distance decides, even where a reranker ran and scored the same
+// hits. A reranker is the better judge of relevance and the worse
+// instrument for measuring it: its scores are relative to the model, so
+// no fixed bar travels between them. Measured on
+// openai/text-embedding-3-small with cohere/rerank-v3.5, a paraphrased
+// question matched its memory at distance 0.528 and score 0.252, while
+// an unrelated question scored 0.011 — the same clean separation, on a
+// scale where the 0.50 floor borrowed from cross-project hits called
+// that match a miss. Using the distance also keeps the number
+// comparable: two installs holding the same memory report the same
+// thing whether or not one of them reranks.
+//
+// Nothing is lost by the choice. Reranking re-orders what the vector
+// channel found, so wherever a reranker ran there is a distance to read.
 func gradeRecall(hits []anamnesia.SearchHit, bars recallBars) store.RecallOutcome {
 	if len(hits) == 0 {
-		return store.RecallMiss
-	}
-	reranked := false
-	for _, h := range hits {
-		if h.RerankerRank == 0 {
-			continue
-		}
-		reranked = true
-		if h.Score >= bars.MinScore {
-			return store.RecallHit
-		}
-	}
-	if reranked {
 		return store.RecallMiss
 	}
 	if !bars.TrustDistance {
