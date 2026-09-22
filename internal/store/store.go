@@ -8,6 +8,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -48,9 +49,28 @@ func (s *Store) Close() { s.Pool.Close() }
 // queue instead of colliding.
 const migrationLockKey int64 = 5_713_204_918_775_311
 
+// gooseMu serialises Migrate inside one process.
+//
+// The advisory lock below is what stops two *processes* colliding, and it
+// cannot help here: SetBaseFS and SetDialect write goose's package
+// globals, and goose reads them for the whole run, so two goroutines
+// migrating at once race on memory no lock in Postgres can reach. It is
+// held across the whole call rather than around the two setters, because
+// the run is what reads them.
+//
+// TestConcurrentMigrateIsSafe is exactly that shape and has been failing
+// under -race about one run in three since long before it was noticed:
+// the release workflow caught it once, CI passed on the same commit, and
+// the tag before this one shipped green on the same code. A test that
+// fails a third of the time is a gate nobody can read.
+var gooseMu sync.Mutex
+
 // Migrate applies the embedded SQL migrations using goose, one process at
 // a time.
 func (s *Store) Migrate(ctx context.Context) error {
+	gooseMu.Lock()
+	defer gooseMu.Unlock()
+
 	goose.SetBaseFS(migrations)
 	if err := goose.SetDialect("postgres"); err != nil {
 		return err

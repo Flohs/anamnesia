@@ -13,6 +13,21 @@ Nothing yet.
 
 ## v0.1.0-rc19 (2026-09-22)
 
+### Fixed
+
+- **`Migrate` raced with itself inside one process, and the gate that should
+  have said so failed only a third of the time.** The advisory lock
+  serialises the database, which is what stops two processes colliding, and
+  it cannot reach goose's package globals: `SetBaseFS` and `SetDialect` write
+  them, and goose reads them for the whole run, so two goroutines migrating
+  at once race on memory no lock in Postgres can touch.
+  `TestConcurrentMigrateIsSafe` is exactly that shape and has been catching
+  it under `-race` in roughly one run in three, which is a rate at which a
+  red check reads as bad luck: rc18 shipped green on the same code, and the
+  rc19 release run went red while CI passed on the same commit. `Migrate`
+  now holds a package mutex for the whole call. Thirty consecutive `-race`
+  runs pass where three in ten failed before.
+
 ### Added
 
 - **The console says how often retrieval actually recalled something.** The
