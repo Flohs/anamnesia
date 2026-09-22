@@ -7,6 +7,30 @@ were rebuilt around being verifiable.
 
 ### Fixed
 
+- **Every extraction failed on a newer OpenAI model.** `operationSchema`
+  left its objects open and its `value` field untyped, which older models
+  tolerated. Newer ones validate a `response_format` schema whether or not
+  `strict` is requested, and answer 400 before generating a token, so
+  `gpt-5-nano` and `gpt-4.1-nano` failed **all 40** sources of the eval
+  corpus while `gpt-4o-mini` passed all 40. Anamnesia was quietly locked
+  out of the entire modern OpenAI line.
+
+  Both operation schemas are now shaped for strict validation: every object
+  closed, every property listed in `required`, nothing untyped. `value`
+  became a JSON-encoded string, because strict validation cannot express
+  free-form JSON at all; `valueToMap` unwraps it, and still accepts the raw
+  forms, since the Anthropic path ignores the schema and sends whatever the
+  prompt asked for. Measured against a real store first: 91% of stored fact
+  values are scalars but 9% are objects or arrays, so a scalar-only field
+  would have lost information.
+
+  `TestOperationSchemasAreAcceptedByStrictValidators` walks both schemas and
+  fails on an object left open or a property left untyped, so the next field
+  added cannot reintroduce this. Verified against the live API on
+  2026-09-22: all three models now accept both schemas. On the eval corpus
+  the change costs `gpt-4o-mini` nothing (MRR 0.872 to 0.889, recall@5 0.92
+  to 0.96), though it does shift the fact/experience split noticeably.
+
 - **A source the model read and found nothing in looked exactly like one
   the model never read.** Both execute zero operations, and the worker
   marked both `skipped`, so the database could not answer how often the

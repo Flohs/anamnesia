@@ -151,6 +151,21 @@ func valueToMap(raw json.RawMessage) map[string]any {
 	if len(trimmed) == 0 || string(trimmed) == "null" {
 		return map[string]any{}
 	}
+	// The schema asks for a JSON-encoded string, so unwrap it once and read
+	// what it was carrying. Prose stays the string it is: "ships on Friday"
+	// is not JSON and must not become one. The raw forms below still work,
+	// because the Anthropic path ignores the schema and sends whatever the
+	// prompt asked for.
+	if trimmed[0] == '"' {
+		var unwrapped string
+		if err := json.Unmarshal(trimmed, &unwrapped); err == nil {
+			inner := bytesTrimSpace([]byte(unwrapped))
+			if len(inner) > 0 && inner[0] != '"' && string(inner) != "null" && json.Valid(inner) {
+				return valueToMap(json.RawMessage(inner))
+			}
+			return map[string]any{"v": unwrapped}
+		}
+	}
 	switch trimmed[0] {
 	case '{':
 		var m map[string]any
@@ -694,29 +709,42 @@ func (e *Extractor) userPrompt(src *anamnesia.Source, content string, cands []ca
 // response_format=json_schema so the model literally cannot return a
 // shape we can't decode. Kept in sync with the Operation struct above
 // by hand; if you add a field there, add it here too.
+// Both schemas are shaped for strict response validation: every object
+// closed with additionalProperties:false, every property listed in
+// required, and nothing left untyped. Newer OpenAI models enforce that
+// whether or not `strict` is set (see internal/llm), and reject anything
+// looser with a 400 before a single token is generated. gpt-4o-mini accepts
+// either shape, so this is simply the shape that works everywhere.
+//
+// `value` is a JSON-encoded string rather than free-form JSON, which strict
+// validation cannot express at all. valueToMap unwraps it. Everything that
+// does not apply to a given op is nullable, because required means the model
+// must emit the key, not that it must invent a value for it.
 var operationSchema = json.RawMessage(`{
   "type": "object",
+  "additionalProperties": false,
   "properties": {
     "operations": {
       "type": "array",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "op":         {"type": "string", "enum": ["ADD_FACT","UPDATE_FACT","DELETE_FACT","ADD_EXPERIENCE","NOOP"]},
-          "id":         {"type": "string"},
-          "fact_scope": {"type": "string", "enum": ["user","project","environment"]},
-          "key":        {"type": "string"},
-          "value":      {},
-          "source":     {"type": "string"},
-          "trust":      {"type": "number"},
-          "kind":       {"type": "string", "enum": ["case","strategy","hybrid"]},
-          "title":      {"type": "string"},
-          "body":       {"type": "string"},
-          "outcome":    {"type": "string"},
-          "importance": {"type": "number"},
-          "topic":      {"type": "string"}
+          "id":         {"type": ["string","null"]},
+          "fact_scope": {"type": ["string","null"], "enum": ["user","project","environment",null]},
+          "key":        {"type": ["string","null"]},
+          "value":      {"type": ["string","null"]},
+          "source":     {"type": ["string","null"]},
+          "trust":      {"type": ["number","null"]},
+          "kind":       {"type": ["string","null"], "enum": ["case","strategy","hybrid",null]},
+          "title":      {"type": ["string","null"]},
+          "body":       {"type": ["string","null"]},
+          "outcome":    {"type": ["string","null"]},
+          "importance": {"type": ["number","null"]},
+          "topic":      {"type": ["string","null"]}
         },
-        "required": ["op"]
+        "required": ["op","id","fact_scope","key","value","source","trust","kind","title","body","outcome","importance","topic"]
       }
     }
   },
@@ -729,30 +757,32 @@ var operationSchema = json.RawMessage(`{
 // the default schema is untouched.
 var operationSchemaWithCommitments = json.RawMessage(`{
   "type": "object",
+  "additionalProperties": false,
   "properties": {
     "operations": {
       "type": "array",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
-          "op":          {"type": "string", "enum": ["ADD_FACT","UPDATE_FACT","DELETE_FACT","ADD_EXPERIENCE","ADD_COMMITMENT","NOOP"]},
-          "id":          {"type": "string"},
-          "fact_scope":  {"type": "string", "enum": ["user","project","environment"]},
-          "key":         {"type": "string"},
-          "value":       {},
-          "source":      {"type": "string"},
-          "trust":       {"type": "number"},
-          "kind":        {"type": "string", "enum": ["case","strategy","hybrid"]},
-          "title":       {"type": "string"},
-          "body":        {"type": "string"},
-          "outcome":     {"type": "string"},
-          "importance":  {"type": "number"},
-          "topic":       {"type": "string"},
-          "owner":       {"type": "string"},
-          "beneficiary": {"type": "string"},
-          "due_at":      {"type": "string"}
+          "op":         {"type": "string", "enum": ["ADD_FACT","UPDATE_FACT","DELETE_FACT","ADD_EXPERIENCE","ADD_COMMITMENT","NOOP"]},
+          "id":         {"type": ["string","null"]},
+          "fact_scope": {"type": ["string","null"], "enum": ["user","project","environment",null]},
+          "key":        {"type": ["string","null"]},
+          "value":      {"type": ["string","null"]},
+          "source":     {"type": ["string","null"]},
+          "trust":      {"type": ["number","null"]},
+          "kind":       {"type": ["string","null"], "enum": ["case","strategy","hybrid",null]},
+          "title":      {"type": ["string","null"]},
+          "body":       {"type": ["string","null"]},
+          "outcome":    {"type": ["string","null"]},
+          "importance": {"type": ["number","null"]},
+          "topic":      {"type": ["string","null"]},
+          "owner":       {"type": ["string","null"]},
+          "beneficiary": {"type": ["string","null"]},
+          "due_at":      {"type": ["string","null"]}
         },
-        "required": ["op"]
+        "required": ["op","id","fact_scope","key","value","source","trust","kind","title","body","outcome","importance","topic","owner","beneficiary","due_at"]
       }
     }
   },
@@ -777,6 +807,8 @@ You can emit these operations:
 - DELETE_FACT: invalidate an existing fact. Provide its id.
 - ADD_EXPERIENCE: a noteworthy event, trajectory, strategy, or insight worth remembering as a narrative. Use kind=case|strategy|hybrid. Provide a "title" and a 1-2 sentence "body". The title is a short noun phrase, under 60 characters, no trailing full stop, naming the conclusion rather than the activity: "Hook ordering is guaranteed by the client", not "Discussion about hooks".
 - NOOP: nothing worth keeping.
+
+Send "value" as a JSON-encoded string, not as raw JSON: "42", "true", "Munich", or "{\"host\":\"db1\",\"port\":5432}". Every field that does not apply to an operation must still be present, with the value null.
 
 Rules:
 - Default to NOOP. Most chat content is noise — only extract when there's something durable or noteworthy.
@@ -806,6 +838,8 @@ You can emit these operations:
 - DELETE_FACT: invalidate an existing fact when the source explicitly retracts it.
 - ADD_EXPERIENCE: a multi-claim narrative or strategy worth remembering as one unit. Provide a "title" and a 1-3 sentence "body". The title is a short noun phrase, under 60 characters, no trailing full stop, naming the conclusion rather than the activity: "Hook ordering is guaranteed by the client", not "Discussion about hooks".
 - NOOP: only when there is genuinely nothing concrete to extract (rare here).
+
+Send "value" as a JSON-encoded string, not as raw JSON: "42", "true", "Munich", or "{\"host\":\"db1\",\"port\":5432}". Every field that does not apply to an operation must still be present, with the value null.
 
 Rules:
 - Bias toward EXTRACTION, not NOOP. If the content names a preference, a plan, a fact about the user, an assistant recommendation, or a piece of structured information (a schedule, a list, a count), extract it.

@@ -342,15 +342,18 @@ func (o *openaiLLM) chat(ctx context.Context, messages []oaiMsg, maxTok int, sch
 				Name: name,
 				// Strict is deliberately NOT set. It would make a
 				// non-conforming response impossible instead of merely
-				// unlikely, but OpenAI rejects a strict schema unless
-				// every object carries additionalProperties:false and
-				// every property is listed in required. The operations
-				// schema has a dozen fields that only apply to some ops,
-				// so enabling it means rewriting the schema to demand
-				// nulls for all of them, which changes what the model
-				// emits. Verified against the live API on 2026-08-21:
-				// setting it returns 400 "Invalid schema for
-				// response_format". See TestStructuredOutputIsNotStrict.
+				// unlikely, and since 2026-09-22 the operations schema
+				// is compliant enough to allow it, so this is now a
+				// choice rather than a constraint: not every provider
+				// behind this OpenAI-shaped endpoint honours the flag,
+				// and a caller passing a looser schema of their own
+				// would start getting 400s. See
+				// TestStructuredOutputIsNotStrict.
+				//
+				// Note that omitting it buys less than it used to.
+				// Newer OpenAI models validate the schema regardless,
+				// which is why internal/extract's schemas are shaped
+				// for strict validation whether or not it is requested.
 				Schema: schema,
 			},
 		}
