@@ -11,6 +11,21 @@ the commit that added it.
 
 Nothing yet.
 
+## v0.1.0-rc18 (2026-09-22)
+
+No code changes: the binary is identical to rc17.
+
+### Changed
+
+- **This file is split into the releases things actually shipped in.** Every
+  entry lived under one `Unreleased` heading across seventeen release
+  candidates, so the changelog could not answer what a release contained
+  that the previous one did not, and the release notes link to it at each
+  tag. The 73 entries now sit under the tag each first shipped in, recovered
+  from the commit that introduced the entry rather than assigned by hand.
+  rc17's own notes still point at the old shape, which is what this release
+  exists to correct.
+
 ## v0.1.0-rc17 (2026-09-22)
 
 ### Fixed
