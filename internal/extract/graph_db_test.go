@@ -964,7 +964,7 @@ func TestEntityPropsSurviveARedeclarationWithoutProps(t *testing.T) {
 
 	run("the stock-reconciliation service runs as a nightly job against the warehouse.",
 		[]graphOperation{{Op: "ADD_ENTITY", Kind: "service", Name: "stock-reconciliation",
-			Props: map[string]any{"role": "nightly job", "owner": "ops"}}})
+			Props: mustJSON(map[string]any{"role": "nightly job", "owner": "ops"})}})
 	if got := props(); got["role"] != "nightly job" {
 		t.Fatalf("props after the first checkpoint = %v, want role recorded; test setup is invalid", got)
 	}
@@ -980,7 +980,7 @@ func TestEntityPropsSurviveARedeclarationWithoutProps(t *testing.T) {
 	// wins per key, and the key nobody mentioned survives.
 	run("stock-reconciliation now runs hourly and is owned by the platform team.",
 		[]graphOperation{{Op: "ADD_ENTITY", Kind: "service", Name: "stock-reconciliation",
-			Props: map[string]any{"owner": "platform", "schedule": "hourly"}}})
+			Props: mustJSON(map[string]any{"owner": "platform", "schedule": "hourly"})}})
 	got := props()
 	if got["owner"] != "platform" {
 		t.Errorf("props[owner] = %v, want the newer value to win", got["owner"])

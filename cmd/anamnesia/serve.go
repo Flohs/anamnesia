@@ -224,11 +224,12 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		llmKey = cfg.OpenRouterAPIKey
 	}
 	llmc, err := llm.New(llm.Config{
-		Provider: cfg.LLMProvider,
-		Model:    cfg.LLMModel,
-		APIKey:   llmKey,
-		BaseURL:  cfg.OpenAIBaseURL,
-		Timeout:  cfg.LLMHTTPTimeout,
+		Provider:        cfg.LLMProvider,
+		Model:           cfg.LLMModel,
+		APIKey:          llmKey,
+		BaseURL:         cfg.OpenAIBaseURL,
+		Timeout:         cfg.LLMHTTPTimeout,
+		ReasoningEffort: cfg.LLMReasoningEffort,
 	})
 	if err != nil {
 		return err

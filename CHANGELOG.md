@@ -7,6 +7,23 @@ were rebuilt around being verifiable.
 
 ### Fixed
 
+- **The graph pass had the same schema defect as the fact pass.**
+  `graphOperationSchema` and `identityVerdictSchema` were left open and
+  untyped in the same way, so the fix a commit earlier unblocked the
+  fact/experience pass and left the graph pass, 29% of ingest volume, still
+  failing on the same models. Both are now compliant, `props` is
+  JSON-encoded like a fact value, and the test no longer takes a list of
+  schemas to check: it scans the package for every schema declared and
+  fails if one is not covered, which is the omission that caused this.
+
+- **`anamnesia eval` exited 0 when every source failed to extract.** It
+  reported the failures honestly in the corpus block and then scored
+  retrieval over a store that was never built, so the summary read recall
+  0.000 and the exit code read success. Only a `--baseline` run would have
+  caught it, and it would have said "retrieval regressed", which is the
+  wrong explanation. It now exits non-zero naming the count, and still
+  writes the report, because the report is the evidence.
+
 - **Every extraction failed on a newer OpenAI model.** `operationSchema`
   left its objects open and its `value` field untyped, which older models
   tolerated. Newer ones validate a `response_format` schema whether or not
@@ -312,6 +329,15 @@ were rebuilt around being verifiable.
   it out plus a margin, whatever it is set to.
 
 ### Added
+
+- **`llm.reasoning_effort`, because a reasoning model left alone never
+  answers.** Measured on `openai/gpt-5-nano`, one extraction call: with no
+  effort set it spent 1472 tokens thinking, took 24.7s and emitted **zero**
+  operations; at `low` it took 8.7s and emitted four. A model that thinks
+  until its budget is gone looks exactly like a model that found nothing
+  worth remembering, which is the worst way for this to fail. Empty sends
+  nothing, so a model without reasoning keeps its own default, and the
+  anthropic provider ignores it.
 
 - **The console ships inside the binary: `anamnesia ui`.** It used to be a
   second container, published separately to Docker Hub, that you pointed at
@@ -779,6 +805,14 @@ were rebuilt around being verifiable.
   verifies a real stack.
 
 ### Changed
+
+- **Structured output is now strict.** `strict:true` was deliberately off
+  because the operations schema could not satisfy it. Now that every schema
+  in `internal/extract` can, a non-conforming response is impossible rather
+  than merely unlikely. Verified against the live API on 2026-09-22: all
+  four schemas are accepted under strict by gpt-4o-mini, gpt-5-nano,
+  gpt-4.1-nano and gemini-2.5-flash-lite. The cost is that a caller passing
+  a looser schema of its own now gets a 400 rather than a best effort.
 
 - **Consolidation traces one scope at a time.** The activity recorder's
   detail budget is per trace, and a pass opened a single trace covering every

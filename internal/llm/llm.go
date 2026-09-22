@@ -60,6 +60,10 @@ type Config struct {
 	// below, which is generous enough for hosted APIs; a local Ollama
 	// with a cold model can need far more on its first call.
 	Timeout time.Duration
+	// ReasoningEffort caps how much a reasoning model thinks before
+	// answering. Empty sends nothing, leaving the model's own default.
+	// Only the OpenAI-compatible paths carry it.
+	ReasoningEffort string
 }
 
 // defaultLLMTimeout applies when Config.Timeout is unset.
@@ -88,17 +92,19 @@ func New(cfg Config) (Client, error) {
 		if baseURL == "" {
 			baseURL = "https://api.openai.com/v1"
 		}
-		return &openaiLLM{apiKey: cfg.APIKey, baseURL: baseURL, model: cfg.Model, timeout: cfg.timeout()}, nil
+		return &openaiLLM{apiKey: cfg.APIKey, baseURL: baseURL, model: cfg.Model,
+			timeout: cfg.timeout(), reasoningEffort: cfg.ReasoningEffort}, nil
 	case "openrouter":
 		if cfg.APIKey == "" {
 			return nil, errors.New("openrouter: OPENROUTER_API_KEY required")
 		}
 		return &openaiLLM{
-			apiKey:       cfg.APIKey,
-			baseURL:      OpenRouterBaseURL,
-			model:        cfg.Model,
-			extraHeaders: OpenRouterHeaders(),
-			timeout:      cfg.timeout(),
+			apiKey:          cfg.APIKey,
+			baseURL:         OpenRouterBaseURL,
+			model:           cfg.Model,
+			extraHeaders:    OpenRouterHeaders(),
+			timeout:         cfg.timeout(),
+			reasoningEffort: cfg.ReasoningEffort,
 		}, nil
 	case "stub", "":
 		return &stubLLM{model: "stub"}, nil
@@ -275,6 +281,11 @@ type openaiLLM struct {
 	extraHeaders map[string]string
 	timeout      time.Duration
 	hc           *http.Client
+	// reasoningEffort, when set, caps how much a reasoning model thinks
+	// before answering. Extraction is a reading task, not a puzzle, and a
+	// model reasoning at full depth about every checkpoint is what makes
+	// the gpt-5 line an order of magnitude too slow for the ingest queue.
+	reasoningEffort string
 }
 
 func (o *openaiLLM) Model() string { return o.model }
@@ -292,10 +303,19 @@ type oaiMsg struct {
 }
 
 type oaiChatReq struct {
-	Model          string      `json:"model"`
-	Messages       []oaiMsg    `json:"messages"`
-	MaxTokens      int         `json:"max_tokens,omitempty"`
-	ResponseFormat *oaiRespFmt `json:"response_format,omitempty"`
+	Model          string        `json:"model"`
+	Messages       []oaiMsg      `json:"messages"`
+	MaxTokens      int           `json:"max_tokens,omitempty"`
+	ResponseFormat *oaiRespFmt   `json:"response_format,omitempty"`
+	Reasoning      *oaiReasoning `json:"reasoning,omitempty"`
+}
+
+// oaiReasoning is OpenRouter's unified reasoning control, which it
+// translates to whatever the upstream provider expects. Omitted entirely
+// unless configured, because a model with a sensible default of its own
+// should keep it.
+type oaiReasoning struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type oaiRespFmt struct {
@@ -330,6 +350,9 @@ func (o *openaiLLM) chat(ctx context.Context, messages []oaiMsg, maxTok int, sch
 		Messages:  messages,
 		MaxTokens: maxOr(maxTok, 1024),
 	}
+	if o.reasoningEffort != "" {
+		body.Reasoning = &oaiReasoning{Effort: o.reasoningEffort}
+	}
 	switch {
 	case len(schema) > 0:
 		name := schemaName
@@ -340,20 +363,15 @@ func (o *openaiLLM) chat(ctx context.Context, messages []oaiMsg, maxTok int, sch
 			Type: "json_schema",
 			JSONSchema: &oaiJSONSchemaFmt{
 				Name: name,
-				// Strict is deliberately NOT set. It would make a
-				// non-conforming response impossible instead of merely
-				// unlikely, and since 2026-09-22 the operations schema
-				// is compliant enough to allow it, so this is now a
-				// choice rather than a constraint: not every provider
-				// behind this OpenAI-shaped endpoint honours the flag,
-				// and a caller passing a looser schema of their own
-				// would start getting 400s. See
-				// TestStructuredOutputIsNotStrict.
-				//
-				// Note that omitting it buys less than it used to.
-				// Newer OpenAI models validate the schema regardless,
-				// which is why internal/extract's schemas are shaped
-				// for strict validation whether or not it is requested.
+				// Strict makes a non-conforming response impossible
+				// rather than merely unlikely. It was off until
+				// 2026-09-22 because the operations schema could not
+				// satisfy it; now every schema this repository sends
+				// can, and internal/extract has a test walking all of
+				// them so that stays true. The cost it carries is that
+				// a caller passing a looser schema of its own gets a
+				// 400 rather than a best effort.
+				Strict: true,
 				Schema: schema,
 			},
 		}

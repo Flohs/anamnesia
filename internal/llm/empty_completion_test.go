@@ -97,22 +97,21 @@ func TestAGoodCompletionStillParses(t *testing.T) {
 	}
 }
 
-// TestStructuredOutputIsNotStrict pins a deliberate omission, because
-// the flag looks like free correctness and is not.
+// TestStructuredOutputIsStrict pins the flag on.
 //
-// strict:true would make a non-conforming response impossible rather
-// than merely unlikely. But OpenAI rejects a strict schema unless every
-// object carries additionalProperties:false AND every property appears
-// in required. The operations schema has a dozen fields that only apply
-// to some ops. Verified against the live API on 2026-08-21: turning it
-// on returns 400, "Invalid schema for response_format
-// 'anamnesia_operations': 'additionalProperties' is required to be
-// supplied and to be false" — so every extraction call would fail.
+// It was deliberately off until 2026-09-22, because OpenAI rejects a
+// strict schema unless every object carries additionalProperties:false
+// and every property appears in required, and the operations schema had
+// a dozen fields that only applied to some ops. That rewrite has since
+// happened (internal/extract), driven by newer OpenAI models enforcing
+// the same rules whether or not strict is asked for.
 //
-// Enabling it means rewriting the schema so optional fields become
-// nullable-and-required, which changes what the model emits. That is its
-// own piece of work, not a flag flip.
-func TestStructuredOutputIsNotStrict(t *testing.T) {
+// With the schemas compliant, strict is no longer a trade: it makes a
+// non-conforming response impossible rather than merely unlikely. The
+// cost it still carries is that a caller passing a looser schema of its
+// own now gets a 400 instead of a best effort, which is why
+// internal/extract has a test walking every schema it sends.
+func TestStructuredOutputIsStrict(t *testing.T) {
 	var got oaiChatReq
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&got)
@@ -133,7 +132,7 @@ func TestStructuredOutputIsNotStrict(t *testing.T) {
 	if got.ResponseFormat == nil || got.ResponseFormat.JSONSchema == nil {
 		t.Fatal("no json_schema was sent")
 	}
-	if got.ResponseFormat.JSONSchema.Strict {
-		t.Error("strict was enabled: the live API rejects the operations schema under strict with a 400, so every extraction call would fail. Rewrite the schema first (see the comment above).")
+	if !got.ResponseFormat.JSONSchema.Strict {
+		t.Error("strict was not set: a non-conforming response stays merely unlikely instead of impossible, and the schemas have supported it since 2026-09-22")
 	}
 }

@@ -45,10 +45,13 @@ type Config struct {
 	OpenAIBaseURL string // OPENAI_BASE_URL
 
 	// LLM (extraction + consolidation workers)
-	LLMProvider     string        // "anthropic" | "openai" | "openrouter" | "stub"
-	LLMModel        string        // ANAMNESIA_LLM_MODEL
-	LLMHTTPTimeout  time.Duration // ANAMNESIA_LLM_HTTP_TIMEOUT (default 120s)
-	AnthropicAPIKey string        // ANTHROPIC_API_KEY
+	LLMProvider    string        // "anthropic" | "openai" | "openrouter" | "stub"
+	LLMModel       string        // ANAMNESIA_LLM_MODEL
+	LLMHTTPTimeout time.Duration // ANAMNESIA_LLM_HTTP_TIMEOUT (default 120s)
+	// LLMReasoningEffort is ANAMNESIA_LLM_REASONING_EFFORT. Empty sends
+	// nothing, leaving whatever the model does by default.
+	LLMReasoningEffort string
+	AnthropicAPIKey    string // ANTHROPIC_API_KEY
 
 	// Reranker
 	RerankProvider string // "" | "none" | "cohere" | "openrouter"
@@ -219,29 +222,30 @@ func Load() (*Config, error) {
 	rerankProvider := providerDefault(os.Getenv("ANAMNESIA_RERANK_PROVIDER"), hasOR, "openrouter", "none")
 
 	c := &Config{
-		HTTPAddr:         str("ANAMNESIA_HTTP_ADDR", "127.0.0.1:8181"),
-		ServerToken:      os.Getenv("ANAMNESIA_SERVER_TOKEN"),
-		ShutdownWait:     dur("ANAMNESIA_SHUTDOWN_WAIT", DefaultShutdownWait),
-		DatabaseURL:      os.Getenv("ANAMNESIA_DATABASE_URL"),
-		DefaultUser:      str("ANAMNESIA_DEFAULT_USER", "default"),
-		DefaultProject:   os.Getenv("ANAMNESIA_DEFAULT_PROJECT"),
-		EmbedProvider:    embedProvider,
-		EmbedModel:       str("ANAMNESIA_EMBED_MODEL", defaultEmbedModel(embedProvider)),
-		EmbedDims:        num("ANAMNESIA_EMBED_DIMS", DefaultEmbedDims),
-		OpenAIAPIKey:     os.Getenv("OPENAI_API_KEY"),
-		OpenAIBaseURL:    str("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-		LLMProvider:      llmProvider,
-		LLMModel:         str("ANAMNESIA_LLM_MODEL", defaultLLMModel(llmProvider)),
-		LLMHTTPTimeout:   dur("ANAMNESIA_LLM_HTTP_TIMEOUT", 120*time.Second),
-		AnthropicAPIKey:  os.Getenv("ANTHROPIC_API_KEY"),
-		RerankProvider:   rerankProvider,
-		RerankModel:      str("ANAMNESIA_RERANK_MODEL", defaultRerankModel(rerankProvider)),
-		CohereAPIKey:     os.Getenv("COHERE_API_KEY"),
-		OpenRouterAPIKey: orKey,
-		PIIProvider:      str("ANAMNESIA_PII_PROVIDER", "regex"),
-		PIIMode:          str("ANAMNESIA_PII_MODE", "tag"),
-		PresidioURL:      os.Getenv("ANAMNESIA_PRESIDIO_URL"),
-		ConsolidateEvery: dur("ANAMNESIA_CONSOLIDATE_EVERY", 24*time.Hour),
+		HTTPAddr:           str("ANAMNESIA_HTTP_ADDR", "127.0.0.1:8181"),
+		ServerToken:        os.Getenv("ANAMNESIA_SERVER_TOKEN"),
+		ShutdownWait:       dur("ANAMNESIA_SHUTDOWN_WAIT", DefaultShutdownWait),
+		DatabaseURL:        os.Getenv("ANAMNESIA_DATABASE_URL"),
+		DefaultUser:        str("ANAMNESIA_DEFAULT_USER", "default"),
+		DefaultProject:     os.Getenv("ANAMNESIA_DEFAULT_PROJECT"),
+		EmbedProvider:      embedProvider,
+		EmbedModel:         str("ANAMNESIA_EMBED_MODEL", defaultEmbedModel(embedProvider)),
+		EmbedDims:          num("ANAMNESIA_EMBED_DIMS", DefaultEmbedDims),
+		OpenAIAPIKey:       os.Getenv("OPENAI_API_KEY"),
+		OpenAIBaseURL:      str("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+		LLMProvider:        llmProvider,
+		LLMModel:           str("ANAMNESIA_LLM_MODEL", defaultLLMModel(llmProvider)),
+		LLMHTTPTimeout:     dur("ANAMNESIA_LLM_HTTP_TIMEOUT", 120*time.Second),
+		LLMReasoningEffort: str("ANAMNESIA_LLM_REASONING_EFFORT", ""),
+		AnthropicAPIKey:    os.Getenv("ANTHROPIC_API_KEY"),
+		RerankProvider:     rerankProvider,
+		RerankModel:        str("ANAMNESIA_RERANK_MODEL", defaultRerankModel(rerankProvider)),
+		CohereAPIKey:       os.Getenv("COHERE_API_KEY"),
+		OpenRouterAPIKey:   orKey,
+		PIIProvider:        str("ANAMNESIA_PII_PROVIDER", "regex"),
+		PIIMode:            str("ANAMNESIA_PII_MODE", "tag"),
+		PresidioURL:        os.Getenv("ANAMNESIA_PRESIDIO_URL"),
+		ConsolidateEvery:   dur("ANAMNESIA_CONSOLIDATE_EVERY", 24*time.Hour),
 		// Defaults repeated from jobs.DefaultConsolidate*; the agreement
 		// is held by TestConsolidateDefaultsAgreeWithTheClusterer.
 		ConsolidateSimilarity: fraction("ANAMNESIA_CONSOLIDATE_SIMILARITY", 0.65),

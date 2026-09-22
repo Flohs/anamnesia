@@ -104,6 +104,9 @@ var settings = []setting{
 		Doc: "Leave empty for the provider default (anthropic/claude-sonnet-4.6 on openrouter, claude-sonnet-4-6 direct, gpt-4o-mini on openai)."},
 	{Key: "llm.timeout", Kind: kDuration, Def: "120s", Env: "ANAMNESIA_LLM_HTTP_TIMEOUT",
 		Doc: "Per-request HTTP timeout. Raise it a lot for a cold local model."},
+	{Key: "llm.reasoning_effort", Kind: kEnum, Def: "", Env: "ANAMNESIA_LLM_REASONING_EFFORT",
+		Values: []string{"", "minimal", "low", "medium", "high"},
+		Doc:    "How hard a reasoning model thinks before answering. Empty leaves the model's own default. Extraction is a reading task, not a puzzle, so a reasoning model left to think freely can be an order of magnitude too slow for the ingest queue. Ignored by models that do not reason, and by the anthropic provider."},
 
 	// ─── embeddings ──────────────────────────────────────────────────
 	{Key: "embed.provider", Kind: kEnum, Def: "", Env: "ANAMNESIA_EMBED_PROVIDER",

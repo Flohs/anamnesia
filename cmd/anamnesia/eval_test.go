@@ -313,3 +313,41 @@ func TestBaselineWithRealMetricsStillCompares(t *testing.T) {
 		t.Errorf("a well-formed baseline was refused: %v", err)
 	}
 }
+
+// A run where extraction failed is not a measurement of retrieval, it is a
+// measurement of a broken pipeline. Pointed at a model whose schema it
+// could not satisfy, eval reported recall 0.000 over 40 failed sources and
+// exited 0, so only a --baseline run would have caught it, and then with
+// the wrong explanation.
+func TestAFailedCorpusMakesTheRunFail(t *testing.T) {
+	report := evalReport{K: 10, Queries: 25, Corpus: corpusStats{
+		SourcesByState: map[string]int{"done": 0, "failed": 40},
+	}}
+	var out, errOut strings.Builder
+
+	err := writeEvalResult(&out, &errOut, true, report, "")
+
+	if err == nil {
+		t.Fatal("a run whose every source failed to extract exited 0")
+	}
+	if !strings.Contains(err.Error(), "40") {
+		t.Errorf("the error does not say how many failed: %v", err)
+	}
+	// The report is the evidence for the failure, so it still has to land.
+	var decoded evalReport
+	if json.Unmarshal([]byte(out.String()), &decoded) != nil {
+		t.Errorf("the report was not written:\n%s", out.String())
+	}
+}
+
+// Skipped is the gate working, not the pipeline breaking.
+func TestASkippedCorpusIsNotAFailure(t *testing.T) {
+	report := evalReport{K: 10, Queries: 25, Corpus: corpusStats{
+		SourcesByState: map[string]int{"done": 37, "failed": 0, "skipped": 3},
+	}}
+	var out, errOut strings.Builder
+
+	if err := writeEvalResult(&out, &errOut, true, report, ""); err != nil {
+		t.Errorf("a clean run failed: %v", err)
+	}
+}

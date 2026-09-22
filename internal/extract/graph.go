@@ -32,13 +32,16 @@ const graphSourceKind = "claude-session-graph"
 // graphOperation is one ADD_ENTITY / ADD_EDGE / NOOP the model emitted.
 // Edges name entities by name, not id — the model has never seen a uuid.
 type graphOperation struct {
-	Op    string         `json:"op"` // ADD_ENTITY | ADD_EDGE | NOOP
-	Kind  string         `json:"kind,omitempty"`
-	Name  string         `json:"name,omitempty"`
-	From  string         `json:"from,omitempty"`
-	To    string         `json:"to,omitempty"`
-	Props map[string]any `json:"props,omitempty"`
-	Trust float32        `json:"trust,omitempty"`
+	Op   string `json:"op"` // ADD_ENTITY | ADD_EDGE | NOOP
+	Kind string `json:"kind,omitempty"`
+	Name string `json:"name,omitempty"`
+	From string `json:"from,omitempty"`
+	To   string `json:"to,omitempty"`
+	// Props arrives JSON-encoded, like a fact value and for the same
+	// reason: strict response validation cannot express free-form JSON.
+	// valueToMap unwraps it and still accepts the raw object.
+	Props json.RawMessage `json:"props,omitempty"`
+	Trust float32         `json:"trust,omitempty"`
 }
 
 // graphOperationSchema is the JSON Schema for the graph pass's response,
@@ -48,21 +51,23 @@ type graphOperation struct {
 // from one pass can never be mistaken for the other's shape.
 var graphOperationSchema = json.RawMessage(`{
   "type": "object",
+  "additionalProperties": false,
   "properties": {
     "operations": {
       "type": "array",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "op":    {"type": "string", "enum": ["ADD_ENTITY","ADD_EDGE","NOOP"]},
-          "kind":  {"type": "string"},
-          "name":  {"type": "string"},
-          "from":  {"type": "string"},
-          "to":    {"type": "string"},
-          "props": {},
-          "trust": {"type": "number"}
+          "kind":  {"type": ["string","null"]},
+          "name":  {"type": ["string","null"]},
+          "from":  {"type": ["string","null"]},
+          "to":    {"type": ["string","null"]},
+          "props": {"type": ["string","null"]},
+          "trust": {"type": ["number","null"]}
         },
-        "required": ["op"]
+        "required": ["op","kind","name","from","to","props","trust"]
       }
     }
   },
@@ -72,7 +77,7 @@ var graphOperationSchema = json.RawMessage(`{
 const graphSystemPrompt = `You are the graph extraction pass for an agent memory system. You read the FULL TEXT of one checkpoint — not a single topic segment — and decide what durable entities and relationships it describes.
 
 You can emit these operations:
-- ADD_ENTITY: a durable, nameable thing worth its own node — a person, place, project, service, organisation, or system. Provide "kind" (a short noun: person|place|project|service|organisation|system|...) and "name" in lower case. Optional "props" for attributes worth keeping (e.g. {"role": "nightly job"}).
+- ADD_ENTITY: a durable, nameable thing worth its own node — a person, place, project, service, organisation, or system. Provide "kind" (a short noun: person|place|project|service|organisation|system|...) and "name" in lower case. Optional "props" for attributes worth keeping, sent as a JSON-encoded string rather than raw JSON: "{\"role\": \"nightly job\"}". Every field that does not apply to an operation must still be present, with the value null.
 - ADD_EDGE: a durable relationship between two entities. Provide "from" and "to" (entity names, lower case, exactly matching an ADD_ENTITY name), "kind" (a short verb phrase: reads_from|reports_to|owns|prefers|...), and optional "trust" in [0,1].
 - NOOP: this checkpoint describes no relationships worth keeping as graph edges.
 
@@ -102,17 +107,19 @@ Output JSON only, matching: {"verdicts":[{"entity":"...","kind":"...","same_as":
 // graphOperationSchema, same reasoning as that schema's own comment.
 var identityVerdictSchema = json.RawMessage(`{
   "type": "object",
+  "additionalProperties": false,
   "properties": {
     "verdicts": {
       "type": "array",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "entity":  {"type": "string"},
           "kind":    {"type": "string"},
-          "same_as": {"type": "string"}
+          "same_as": {"type": ["string","null"]}
         },
-        "required": ["entity","kind"]
+        "required": ["entity","kind","same_as"]
       }
     }
   },
@@ -509,7 +516,7 @@ func resolveEdges(ops []graphOperation, known map[string]uuid.UUID) (resolved []
 			// kinds (internal/retrieval/graph.go), so this changes no
 			// query — it keeps the graph from describing one edge
 			// three ways.
-			resolved = append(resolved, anamnesia.Edge{From: fromID, To: toID, Kind: normaliseEdgeKind(op.Kind), Props: op.Props, Trust: op.Trust})
+			resolved = append(resolved, anamnesia.Edge{From: fromID, To: toID, Kind: normaliseEdgeKind(op.Kind), Props: valueToMap(op.Props), Trust: op.Trust})
 		}
 	}
 	return resolved, dropped
@@ -620,7 +627,7 @@ func (e *Extractor) runGraph(ctx context.Context, src *anamnesia.Source, tr *act
 		// replacing, so a re-declaration carrying no props — the normal
 		// case — leaves what an earlier checkpoint recorded alone. Merging
 		// here instead would be a read-modify-write two passes could lose.
-		ent := &anamnesia.Entity{Scope: src.Scope, Kind: kind, Name: name, Props: op.Props}
+		ent := &anamnesia.Entity{Scope: src.Scope, Kind: kind, Name: name, Props: valueToMap(op.Props)}
 		// Attach the name's embedding (best-effort; nil on any failure —
 		// UpsertEntity already treats a nil Embedding as "no vector yet")
 		// so THIS entity becomes findable as a candidate the next time

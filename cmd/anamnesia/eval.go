@@ -429,6 +429,17 @@ func writeEvalResult(out, errOut io.Writer, jsonMode bool, report evalReport, ba
 		renderReport(out, report)
 	}
 
+	// A source that failed to extract never reached the store, so every
+	// metric below it is scored against a corpus that was never built.
+	// Reporting that as a pass made a model this could not talk to look
+	// like a model that simply retrieved nothing. Checked before the
+	// baseline comparison, because "retrieval regressed" is the wrong
+	// explanation for a pipeline that did not run.
+	if failed := report.Corpus.SourcesByState["failed"]; failed > 0 {
+		return fmt.Errorf("%d of %d sources failed to extract, so this is not a measurement of retrieval: check `anamnesia logs`",
+			failed, report.Corpus.ingested())
+	}
+
 	if baselinePath == "" {
 		return nil
 	}

@@ -2,9 +2,52 @@ package extract
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
+	"regexp"
+	"strings"
 	"testing"
 )
+
+// everySchema is every schema this package sends to a model. Held against
+// the source by TestEverySchemaInThePackageIsChecked, because the first
+// version of this test covered the two operation schemas and missed the two
+// in graph.go, which left the graph pass still failing on the models the
+// fix was for.
+var everySchema = map[string]json.RawMessage{
+	"operationSchema":                operationSchema,
+	"operationSchemaWithCommitments": operationSchemaWithCommitments,
+	"graphOperationSchema":           graphOperationSchema,
+	"identityVerdictSchema":          identityVerdictSchema,
+}
+
+func TestEverySchemaInThePackageIsChecked(t *testing.T) {
+	declared := regexp.MustCompile(`var (\w*[Ss]chema\w*) = json\.RawMessage\(`)
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := 0
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(filepath.Join(".", e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range declared.FindAllStringSubmatch(string(src), -1) {
+			found++
+			if _, ok := everySchema[m[1]]; !ok {
+				t.Errorf("%s declares %s, which no test checks: add it to everySchema", e.Name(), m[1])
+			}
+		}
+	}
+	if found != len(everySchema) {
+		t.Errorf("found %d schemas in the package but everySchema lists %d", found, len(everySchema))
+	}
+}
 
 // walkObjects visits every JSON-schema object node, naming its path so a
 // failure says which one is wrong rather than that something is.
@@ -32,12 +75,7 @@ func walkObjects(t *testing.T, path string, node map[string]any, visit func(stri
 // on 2026-09-22: as shipped before this, gpt-5-nano and gpt-4.1-nano failed
 // every single extraction with a 400.
 func TestOperationSchemasAreAcceptedByStrictValidators(t *testing.T) {
-	schemas := map[string]json.RawMessage{
-		"operationSchema":                operationSchema,
-		"operationSchemaWithCommitments": operationSchemaWithCommitments,
-	}
-
-	for name, raw := range schemas {
+	for name, raw := range everySchema {
 		t.Run(name, func(t *testing.T) {
 			var root map[string]any
 			if err := json.Unmarshal(raw, &root); err != nil {
